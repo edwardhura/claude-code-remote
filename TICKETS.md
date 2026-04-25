@@ -7,7 +7,7 @@ grep -E '^## CCR-[0-9]+' TICKETS.md
 
 ---
 
-## CCR-001: Python package scaffold [todo]
+## CCR-001: Python package scaffold [done]
 Phase: 1
 Feature: core
 Files:
@@ -21,16 +21,19 @@ Files:
 Out of scope:
   - Any business logic, DB, env loading.
 Acceptance:
-  - [ ] `uv sync` succeeds.
-  - [ ] `python -m ccr --help` exits 0 and lists `serve`, `console`, `pair`, `doctor`, `init-db`.
-  - [ ] `python -m ccr pair list` exits with `NotImplementedError` (proves dispatch works).
-  - [ ] `ruff check src tests` passes.
-  - [ ] `mypy src` passes.
-  - [ ] `pytest` runs `test_cli.py` green.
+  - [x] `uv sync` succeeds.
+  - [x] `python -m ccr --help` exits 0 and lists `serve`, `console`, `pair`, `doctor`, `init-db`.
+  - [x] `python -m ccr pair list` exits with `NotImplementedError` (proves dispatch works).
+  - [x] `ruff check src tests` passes.
+  - [x] `mypy src` passes.
+  - [x] `pytest` runs `test_cli.py` green.
 Notes:
   Split from Phase 1: this ticket owns the Python package itself (pyproject, src tree, tests). CI / pre-commit / README / .env.example are in CCR-002 because Phase 1 touches both source code and `.github/workflows/`, which the workflow rule says to split. Packages to install per plan §8 Phase 1: aiogram, fastapi, uvicorn[standard], httpx, pydantic, pydantic-settings, sqlalchemy[asyncio], aiosqlite, alembic, pyjwt, prompt_toolkit, structlog; dev: pytest, pytest-asyncio, ruff, mypy, pre-commit. Ruff: line length 100, target-version py312, all rules + ignore E501 in tests. Mypy: strict, exclude `alembic/versions`. `[project.scripts] ccr = "ccr.cli:main"`.
 
 ### Review log
+  - 2026-04-26 python-developer: started
+  - 2026-04-26 python-developer: ready for review — pyproject + uv.lock + .gitignore + src/ccr/{__init__,__main__,cli}.py + tests/test_cli.py landed; `uv sync`, `python -m ccr --help`, `python -m ccr pair list` (raises NotImplementedError), `ruff check src tests`, `ruff format --check src tests`, `mypy src`, `pytest` (11 tests) all pass.
+  - 2026-04-26 team-lead: approved — all 6 acceptance criteria verified by execution: `uv sync` resolved 65 packages; `--help` exits 0 listing all 5 subcommands; `pair list` exits 1 with NotImplementedError; `ruff check` and `ruff format --check` clean; `mypy src` strict passes (3 files); `pytest` 11/11 green.
 
 ---
 

@@ -1,0 +1,79 @@
+[project]
+name = "ccr"
+version = "0.1.0"
+description = "Claude Code Remote — self-hosted Telegram bot wrapping a local Claude Code CLI session."
+requires-python = ">=3.12"
+authors = [
+    { name = "Claude Code Remote contributors" },
+]
+dependencies = [
+    "aiogram>=3.13,<4",
+    "fastapi>=0.115,<0.120",
+    "uvicorn[standard]>=0.32,<0.40",
+    "httpx>=0.27,<0.30",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
+    "sqlalchemy[asyncio]>=2.0,<3",
+    "aiosqlite>=0.20,<0.22",
+    "alembic>=1.13,<2",
+    "pyjwt>=2.9,<3",
+    "prompt_toolkit>=3.0,<4",
+    "structlog>=24.4,<26",
+]
+
+[project.scripts]
+ccr = "ccr.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ccr"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.7",
+    "mypy>=1.13",
+    "pre-commit>=4.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "D",       # pydocstyle: not enforcing docstrings project-wide
+    "ANN401",  # allow `typing.Any` where genuinely needed
+    "COM812",  # conflicts with ruff format
+    "ISC001",  # conflicts with ruff format
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "E501",    # long lines tolerated in tests per ticket spec
+    "S101",    # asserts are how pytest works
+    "S603",    # subprocess calls in tests target sys.executable, not user input
+    "S607",    # likewise — invoking python as a partial path is fine in tests
+    "ANN",     # tests don't need full type hints
+    "PLR2004", # magic numbers in assertions are fine
+    "INP001",  # tests dir is not an importable package
+]
+"src/ccr/__main__.py" = [
+    "INP001",
+]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+files = ["src"]
+exclude = ["alembic/versions"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
