@@ -124,3 +124,61 @@ Team lead approves a ticket only after **executing** the acceptance criteria, no
 - Any literal command in the acceptance list runs and produces the expected exit code / output
 
 If any check fails, mark the ticket `in-progress`, append to Review log, return `REJECTED: CCR-NNN — <reason>`.
+
+## Integration: GitHub PR (never merge automatically)
+
+After team lead emits `APPROVED: CCR-NNN`, the orchestrator (or whoever is driving) prepares a GitHub branch and pull request for the user to merge **manually**. Claude must **never** merge a PR, push to `main`, or run `gh pr merge` on the user's behalf.
+
+### Branch naming
+
+Rename the developer's worktree branch from `worktree-agent-<id>` to `ccr-NNN-<short-slug>` where the slug is a 1–4-word kebab-cased summary of the ticket title (e.g. `ccr-001-package-scaffold`, `ccr-002-ci-and-precommit`). The renamed branch is what gets pushed.
+
+### Commit message
+
+One commit per ticket on the renamed branch. Format:
+
+```
+CCR-NNN: <ticket title>
+
+- <bullet: what was added or changed, mirroring the ticket Files list>
+- ...
+
+Acceptance: all <N> criteria verified by team lead (see TICKETS.md Review log).
+```
+
+Include in the commit: every file the ticket scoped, the ticket's own `TICKETS.md` status/Review-log update, and any `CONTEXT.md` change for the feature folder. Do **not** include unrelated edits (other tickets' status changes, stray config tweaks, etc.). If `pre-commit` or CI fails on push, fix the underlying issue and create a NEW commit — never `--amend` a published commit.
+
+### PR body template
+
+```markdown
+## Summary
+<1–3 bullets — what this ticket delivers in plain language>
+
+## Files
+- <path> — <one-line role>
+- ...
+
+## Acceptance
+- [x] <verbatim ticket criterion> — verified by team lead
+- [x] ...
+
+## Ticket
+TICKETS.md → CCR-NNN
+```
+
+### Steps
+
+1. In the worktree, stage only the files this ticket owns (plus the ticket's `TICKETS.md` / `CONTEXT.md` updates): `git add -A` is fine if the worktree is clean of unrelated noise; otherwise stage by path.
+2. Commit using the message format above.
+3. Rename the branch: `git branch -m worktree-agent-<id> ccr-NNN-<slug>`.
+4. Push: `git push -u origin ccr-NNN-<slug>`.
+5. Open the PR: `gh pr create --base main --title "CCR-NNN: <title>" --body "<filled template>"`.
+6. Report the PR URL back to the user.
+7. **Stop.** The user reviews and merges the PR manually. Worktree cleanup (`git worktree remove`, branch delete) happens **after** the user merges, not before.
+
+### Hard rules
+
+- Never run `git merge`, `gh pr merge`, `git push origin main`, or `git push --force` against `main`.
+- Never delete the worktree or its branch before the PR is merged — the user may want to push fixes onto it.
+- If the PR's CI fails after push, push a follow-up commit on the same branch; do not force-push or amend.
+- The user is the only one who decides when a PR lands.
