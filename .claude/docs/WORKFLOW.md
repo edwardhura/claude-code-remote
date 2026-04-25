@@ -67,7 +67,7 @@ returns the title + status without needing the line below.
 
 ## `.claude/docs/<feature>/`
 
-One folder per feature. Slug is lowercase-hyphenated (e.g. `phase-03-pairing-auth`, `phase-12-viewer-frontend`). PM creates the folder + stubs when generating the first ticket for that feature.
+One folder per feature. Slug is lowercase-hyphenated and names a capability, not a phase (e.g. `core`, `auth`, `chat-bot`, `web-viewer`). PM creates the folder + stubs when generating the first ticket for that feature; multiple tickets across phases can share one feature folder.
 
 ### `BRIEF.md` (team lead writes / updates)
 
@@ -76,14 +76,12 @@ Created as a stub by PM, filled in by team lead when the feature's last ticket i
 ```markdown
 # Brief: <feature-name>
 
-## What
-<one short paragraph: capabilities delivered>
+## Overview
+<one short paragraph: what the feature delivers and why it matters>
 
-## Why
-<one short paragraph: motivation, what problem this solves>
-
-## Summary
-- <bullet list of capabilities>
+## Files
+- <path> — <one-line role>
+- ...
 
 Status: COMPLETE | IN PROGRESS
 Tickets: CCR-NNN, CCR-MMM

@@ -9,7 +9,7 @@ grep -E '^## CCR-[0-9]+' TICKETS.md
 
 ## CCR-001: Python package scaffold [todo]
 Phase: 1
-Feature: phase-01-scaffold
+Feature: core
 Files:
   - `pyproject.toml` — project metadata, deps, scripts, ruff/mypy config.
   - `uv.lock` — generated.
@@ -36,7 +36,7 @@ Notes:
 
 ## CCR-002: CI workflow, pre-commit, env template, README placeholder [todo]
 Phase: 1
-Feature: phase-01-scaffold
+Feature: core
 Files:
   - `.env.example` — full template per Section 7.
   - `.pre-commit-config.yaml` — ruff, ruff-format, mypy hooks.
@@ -56,7 +56,7 @@ Notes:
 
 ## CCR-003: Configuration, DB schema, Alembic migrations [todo]
 Phase: 2
-Feature: phase-02-config-db
+Feature: core
 Files:
   - `src/ccr/config.py` — `Settings(BaseSettings)` with all env vars from Section 7, `model_config=SettingsConfigDict(env_file=".env", extra="ignore")`. Field validators: `JWT_SECRET` ≥ 32 chars, `WEB_PORT` 1–65535, `PROXY_PORT_ALLOWLIST` parsed to `set[int] | None`, `TOKEN_TTL_SECONDS` 60–86400.
   - `src/ccr/logging_setup.py` — `configure_logging(level: str)` using structlog with console renderer.
@@ -86,7 +86,7 @@ Notes:
 
 ## CCR-004: Pairing auth — storage, owner model, CLI subcommands [todo]
 Phase: 3
-Feature: phase-03-pairing-auth
+Feature: auth
 Files:
   - `src/ccr/auth/pairing.py`:
     - `async def create_code(db, tg_user_id, tg_username) -> PairingCode` (8-char base32, TTL from settings)
@@ -120,7 +120,7 @@ Notes:
 
 ## CCR-005: Console REPL app [todo]
 Phase: 4
-Feature: phase-04-console-repl
+Feature: console
 Files:
   - `src/ccr/console/app.py` — prompt_toolkit `PromptSession` with:
     - Command parser (split on whitespace, dispatch to handlers).
@@ -148,7 +148,7 @@ Notes:
 
 ## CCR-006: Bot scaffold, allowlist middleware, pairing flow, owner notification [todo]
 Phase: 5
-Feature: phase-05-bot-pairing
+Feature: chat-bot
 Files:
   - `src/ccr/bot/app.py` — `def build_dispatcher(settings, db_factory) -> Dispatcher`; `async def run_polling(...)`.
   - `src/ccr/bot/middlewares.py` — `class AllowlistMiddleware(BaseMiddleware)` injecting `is_paired_user` flag and `last_chat_id` updates; short-circuits non-`/start` updates from non-paired senders with `"Not paired. Send /start to request access."`
@@ -181,7 +181,7 @@ Notes:
 
 ## CCR-007: Claude subprocess wrapper, event bus, JSONL logger [todo]
 Phase: 7
-Feature: phase-07-claude-wrapper
+Feature: claude-runtime
 Files:
   - `src/ccr/events/bus.py` — `class EventBus` with `subscribe(topic) -> AsyncIterator[Event]` and `async publish(topic, payload)`. Uses `asyncio.Queue` per subscriber, drops oldest on slow consumer with a warning.
   - `src/ccr/claude/events.py` — Pydantic discriminated-union `ClaudeEvent = Annotated[Union[SystemInit, UserTurn, AssistantTurn, ResultEvent, PermissionRequest, UnknownEvent], Field(discriminator="type")]`. Includes inner `ContentBlock` union (text/thinking/tool_use/tool_result).
@@ -221,7 +221,7 @@ Notes:
 
 ## CCR-008: Session lifecycle handlers, Telegram formatting, multi-user broadcast [todo]
 Phase: 6
-Feature: phase-06-session-handlers
+Feature: chat-bot
 Files:
   - `src/ccr/bot/formatting.py` — `def event_to_messages(event: ClaudeEvent) -> list[OutboundMessage]`:
     - text/thinking → chunks of ≤ 3500 chars split at sentence/newline boundaries
@@ -258,7 +258,7 @@ Notes:
 
 ## CCR-009: Permission inline-button handling [todo]
 Phase: 8
-Feature: phase-08-permissions
+Feature: chat-bot
 Files:
   - `src/ccr/bot/keyboards.py` — `def permission_kb(session_id, request_id, options) -> InlineKeyboardMarkup` with one button per option; `callback_data=f"perm:{session_id}:{request_id}:{choice}"`.
   - `src/ccr/bot/formatting.py` — augment to return `(text, keyboard)` for `PermissionRequest`. Update return type to `OutboundMessage = (text, keyboard | None)`.
@@ -288,7 +288,7 @@ Notes:
 
 ## CCR-010: Slash-command passthrough whitelist [todo]
 Phase: 9
-Feature: phase-09-slash-passthrough
+Feature: chat-bot
 Files:
   - `src/ccr/bot/handlers/passthrough.py` — `WHITELIST = {"cost", "model", "compact"}`; `BLOCKED_INTERACTIVE = {"agents", "mcp", "init"}`. Handler matches commands not already claimed by other routers.
   - `src/ccr/claude/manager.py` — add `async send_slash(self, name: str, args: str) -> None` that prepends `"/" + name + " " + args` and submits as a normal user turn (Claude Code interprets it the same as if typed in TTY).
@@ -310,7 +310,7 @@ Notes:
 
 ## CCR-011: JWT signed-URL token module [todo]
 Phase: 10
-Feature: phase-10-jwt-tokens
+Feature: auth
 Files:
   - `src/ccr/auth/tokens.py`:
     - `class TokenKind(StrEnum): VIEWER = "viewer"; PREVIEW = "preview"`
@@ -336,7 +336,7 @@ Notes:
 
 ## CCR-012: Web server, auth handoff, sessions REST + SSE [todo]
 Phase: 11
-Feature: phase-11-web-server
+Feature: web-viewer
 Files:
   - `src/ccr/web/app.py` — `def create_app(settings, manager, bus, db_factory) -> FastAPI`; CORS allow `PUBLIC_URL` only.
   - `src/ccr/web/auth.py`:
@@ -373,7 +373,7 @@ Notes:
 
 ## CCR-013: Multi-tab viewer frontend (xterm.js via CDN) [todo]
 Phase: 12
-Feature: phase-12-viewer-frontend
+Feature: web-viewer
 Files:
   - `src/ccr/web/static/viewer.html` — bare scaffold with a tab strip container, terminal container, and:
     ```html
@@ -418,7 +418,7 @@ Notes:
 
 ## CCR-014: Bot handlers `/view`, `/last`, `/preview` [todo]
 Phase: 13
-Feature: phase-13-view-preview
+Feature: chat-bot
 Files:
   - `src/ccr/bot/handlers/view.py`:
     - `/view` → mint VIEWER token; reply `f"{PUBLIC_URL}/auth?token={t}&next=/viewer"` with a "valid 30 min" note.
@@ -440,7 +440,7 @@ Notes:
 
 ## CCR-015: Localhost reverse proxy [todo]
 Phase: 13
-Feature: phase-13-view-preview
+Feature: web-viewer
 Files:
   - `src/ccr/web/proxy.py`:
     - `@app.api_route("/app/{port:int}/{path:path}", methods=["GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"])`
@@ -464,7 +464,7 @@ Notes:
 
 ## CCR-016: Doctor subcommand and serve preflight checks [todo]
 Phase: 14
-Feature: phase-14-bootstrap
+Feature: bootstrap
 Files:
   - `src/ccr/server.py` — preflight checks: Claude CLI present, DB up to date, `PUBLIC_URL` reachable best-effort warning (`httpx.get(public_url, timeout=2)` and log only).
   - `src/ccr/cli.py` — `doctor` subcommand printing all preflight check results.
@@ -483,7 +483,7 @@ Notes:
 
 ## CCR-017: install.sh, submodule, README, final repo polish [todo]
 Phase: 14
-Feature: phase-14-bootstrap
+Feature: bootstrap
 Files:
   - `install.sh`:
     - Check Python ≥ 3.12, `uv` installed (offer one-line installer command), `claude` on PATH.

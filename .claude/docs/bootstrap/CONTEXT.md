@@ -1,4 +1,4 @@
-# Context: phase-03-pairing-auth
+# Context: bootstrap
 
 ## Files
 _(developers list files and their roles as they're created)_

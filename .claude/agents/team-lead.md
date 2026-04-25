@@ -47,9 +47,8 @@ After approving a ticket, check whether *all* tickets for the same `Feature:` sl
 
 1. Open `.claude/docs/<feature>/BRIEF.md`.
 2. Replace each `_(filled in by team lead on feature completion)_` placeholder with content. Be concise:
-   - **What**: one paragraph (~3 sentences) describing capabilities the feature now delivers.
-   - **Why**: one paragraph on motivation — what problem this solves for users of claude-code-remote, in the context of the implementation plan.
-   - **Summary**: 3–6 bullets of concrete capabilities.
+   - **Overview**: one short paragraph (~3 sentences) describing what the feature delivers and why it matters in the context of the implementation plan.
+   - **Files**: list each file in the feature as `- <path> — <one-line role>`, pulled from the feature's `CONTEXT.md`.
 3. Change `Status: IN PROGRESS` to `Status: COMPLETE`.
 4. Make sure the `Tickets:` line lists every ticket for this feature.
 5. Return `FEATURE COMPLETE: <feature-slug>` instead of `APPROVED: CCR-NNN` for that final ticket.

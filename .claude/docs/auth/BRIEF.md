@@ -1,13 +1,10 @@
-# Brief: phase-02-config-db
+# Brief: auth
 
-## What
+## Overview
 _(filled in by team lead on feature completion)_
 
-## Why
-_(filled in by team lead on feature completion)_
-
-## Summary
+## Files
 _(filled in by team lead on feature completion)_
 
 Status: IN PROGRESS
-Tickets: CCR-003
+Tickets: CCR-004, CCR-011

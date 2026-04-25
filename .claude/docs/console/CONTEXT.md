@@ -1,4 +1,4 @@
-# Context: phase-05-bot-pairing
+# Context: console
 
 ## Files
 _(developers list files and their roles as they're created)_
