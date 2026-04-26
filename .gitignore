@@ -67,3 +67,6 @@ dmypy.json
 
 # Project-local data
 data/
+
+# Claude
+.claude/worktrees/

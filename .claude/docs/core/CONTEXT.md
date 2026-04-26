@@ -4,7 +4,10 @@
 - pyproject.toml — project metadata, runtime + dev deps, ruff/mypy/pytest config, `[project.scripts] ccr = "ccr.cli:main"`.
 - uv.lock — generated lockfile produced by `uv sync`.
 - .gitignore — ignores Python build artefacts, `.venv/`, `data/`, `.env`, IDE files, ruff/mypy caches.
-- .env.example — minimal placeholder carrying only the keys CCR-003's Settings needs; CCR-002 will replace it with the full Section 7 template.
+- .env.example — env template matching plan §7 (TELEGRAM_BOT_TOKEN, PUBLIC_URL, JWT_SECRET, plus optional defaults).
+- .pre-commit-config.yaml — ruff, ruff-format, and mypy --strict hooks (mypy scoped to `src/ccr/`).
+- .github/workflows/ci.yml — CI on push/PR: install pinned uv, `uv sync --frozen`, ruff check + format check, mypy, pytest with `--cov-fail-under=80`.
+- README.md — project summary placeholder reserving the "Run locally in 60 seconds" section for CCR-017.
 - src/ccr/__init__.py — exposes `__version__ = "0.1.0"`.
 - src/ccr/__main__.py — `python -m ccr` entrypoint that calls `ccr.cli:main`.
 - src/ccr/cli.py — argparse skeleton; calls `configure_logging` before dispatch; `init-db` programmatically runs `alembic upgrade head` and ensures `DATA_DIR` + `DATA_DIR/logs` exist; remaining handlers still raise `NotImplementedError`. Exposes `build_parser()` for tests.
@@ -27,4 +30,5 @@
 
 ## Change history
 - [CCR-001]: initial Python package scaffold — pyproject with full Phase 1 dep set, `src/ccr/{__init__,__main__,cli}.py`, argparse subcommand tree (NotImplementedError stubs), test suite for CLI dispatch behaviour, `.gitignore`, `uv.lock`.
-- [CCR-003]: Settings + logging_setup, SQLAlchemy 2 models (paired_users / pairing_codes / sessions) with partial-unique owner index, async engine + session maker, hand-written Alembic 0001_initial migration with async env, `init-db` CLI subcommand wiring `alembic upgrade head` programmatically, minimal `.env.example` placeholder (CCR-002 owns the full template), config + db tests.
+- [CCR-002]: dev tooling and CI — `.env.example` (plan §7 template), `.pre-commit-config.yaml` (ruff + ruff-format + mypy --strict), `.github/workflows/ci.yml` (uv sync, ruff, mypy, pytest with 80% coverage gate on Python 3.12), `README.md` placeholder reserving the polished walkthrough for CCR-017.
+- [CCR-003]: Settings + logging_setup, SQLAlchemy 2 models (paired_users / pairing_codes / sessions) with partial-unique owner index, async engine + session maker, hand-written Alembic 0001_initial migration with async env, `init-db` CLI subcommand wiring `alembic upgrade head` programmatically, config + db tests. (`.env.example` superseded by CCR-002's full template.)
