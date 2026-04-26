@@ -52,11 +52,6 @@ def test_pair_without_subcommand_exits_two() -> None:
     assert exc_info.value.code == 2
 
 
-def test_pair_list_raises_not_implemented() -> None:
-    with pytest.raises(NotImplementedError):
-        main(["pair", "list"])
-
-
 def test_serve_raises_not_implemented() -> None:
     with pytest.raises(NotImplementedError):
         main(["serve"])
@@ -66,11 +61,6 @@ def test_pair_approve_requires_code() -> None:
     with pytest.raises(SystemExit) as exc_info:
         main(["pair", "approve"])
     assert exc_info.value.code == 2
-
-
-def test_pair_approve_dispatches() -> None:
-    with pytest.raises(NotImplementedError):
-        main(["pair", "approve", "ABCD1234"])
 
 
 def test_module_help_via_subprocess() -> None:
@@ -83,9 +73,3 @@ def test_module_help_via_subprocess() -> None:
 def test_module_unknown_subcommand_via_subprocess() -> None:
     result = _run_module("does-not-exist")
     assert result.returncode == 2
-
-
-def test_module_pair_list_propagates_not_implemented() -> None:
-    result = _run_module("pair", "list")
-    assert result.returncode != 0
-    assert "NotImplementedError" in result.stderr

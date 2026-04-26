@@ -10,9 +10,8 @@ When the user asks to "implement Phase N" or to add a feature, the plan's Sectio
 
 ## Multi-agent workflow
 
-Implementation is driven by a 6-agent pipeline defined in `.claude/agents/`:
+Implementation is driven by 5 specialist subagents defined in `.claude/agents/`. The **main session (this Claude) is the router** — there is no orchestrator subagent. Subagents in Claude Code cannot invoke other subagents, so routing logic lives in this session, not in a delegated agent.
 
-- **`orchestrator`** — routes work between the other agents; reads `TICKETS.md` to decide what runs next.
 - **`project-manager`** — slices plan phases into tickets in `TICKETS.md`; creates feature folders under `.claude/docs/`; cannot write code.
 - **`team-lead`** — verifies completed tickets by *running* their acceptance criteria; writes `BRIEF.md` on feature completion; cannot write code.
 - **`python-developer`** — owns `src/ccr/{bot,auth,claude,console,db,events}/` + `cli.py` + `server.py` + `config.py`.
@@ -26,7 +25,29 @@ State files:
 - `.claude/docs/<feature>/BRIEF.md` — short feature summary, written by team lead on completion.
 - `.claude/docs/<feature>/CONTEXT.md` — file structure + change history per feature, maintained by developers as they work.
 
-Subagents do **not** chain — only the orchestrator calls other agents. Each subagent ends its turn with a one-line verdict (`READY FOR REVIEW: CCR-N`, `APPROVED: CCR-N`, etc.) that the orchestrator parses to route the next step.
+Subagents do **not** chain. Each ends its turn with a one-line verdict (`READY FOR REVIEW: CCR-N`, `APPROVED: CCR-N`, `REJECTED: CCR-N — ...`, etc.). The main session parses that verdict and dispatches the next agent.
+
+## Routing rules (main session)
+
+When the user says "implement Phase N", "work on CCR-N", "continue project work", or otherwise asks for progress, follow this loop in this session — do not look for or invoke an orchestrator agent.
+
+1. **Read state.** `.claude/docs/WORKFLOW.md` (protocol), `TICKETS.md` (status), the relevant phase section of `claude-code-remote-plan.md` (context).
+2. **Pick the next ticket.** First `[todo]` whose `Depends on:` are all `[done]`.
+3. **Mark it `[in-progress]`** in `TICKETS.md` before dispatching, with a Review log line `<date> main: dispatched to <agent>`.
+4. **Dispatch the developer** based on which files the ticket touches:
+   - `src/ccr/{bot,auth,claude,console,db,events}/` or `cli.py`/`server.py`/`config.py` → `python-developer`
+   - `src/ccr/web/` → `web-developer`
+   - `install.sh`, `.github/workflows/`, `.env.example`, `.pre-commit-config.yaml`, the `doctor` subcommand → `sysops`
+
+   Use `isolation: "worktree"` so the developer works on an isolated copy.
+5. **On `READY FOR REVIEW: CCR-N`**, dispatch `team-lead` without worktree isolation — the lead needs to see the developer's merged changes.
+6. **On `APPROVED: CCR-N`**, prepare the GitHub branch + PR per WORKFLOW.md §Integration. If it was the feature's last ticket, dispatch `team-lead` again with `"write BRIEF.md for <feature>"`. Never `git push` to `main`, never `gh pr merge` — the user merges manually.
+7. **On `REJECTED: CCR-N — ...`**, redispatch the same developer with the rejection notes verbatim.
+8. **For new tickets**, dispatch `project-manager` to slice a plan phase or feature into `TICKETS.md` entries.
+
+When a ticket spans both `src/ccr/{bot|auth|...}` and `src/ccr/web/`, send it back to PM for two tickets — don't let one developer cross the boundary.
+
+Multiple `[todo]` tickets can be dispatched in parallel only if all of these hold: different agent types, no shared files, no `Depends on:` between them. Otherwise serialize. Parallel dispatches go in a single message with multiple Agent tool blocks.
 
 ## Project: Claude Code Remote
 

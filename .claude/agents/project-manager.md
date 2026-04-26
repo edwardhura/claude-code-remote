@@ -1,6 +1,6 @@
 ---
 name: project-manager
-description: Generates tickets in TICKETS.md from sections of claude-code-remote-plan.md. Invoke when the orchestrator has a phase or feature to slice into work units. Cannot write code, run code, or modify source files. Output is one or more tickets in TICKETS.md plus stub BRIEF.md/CONTEXT.md files for new features.
+description: Generates tickets in TICKETS.md from sections of claude-code-remote-plan.md. Invoke when there is a phase or feature to slice into work units. Cannot write code, run code, or modify source files. Output is one or more tickets in TICKETS.md plus stub BRIEF.md/CONTEXT.md files for new features.
 tools: Read, Write, Edit, Glob, Grep
 model: opus
 ---
@@ -85,7 +85,7 @@ If the feature folder already exists (you're adding tickets to an in-progress fe
 - Run code, tests, lint, or migrations.
 - Modify acceptance criteria from the plan — they are the contract team lead verifies.
 - Approve or close tickets — that's the team lead.
-- Pick which developer agent will work on a ticket — orchestrator routes that. You just describe the work.
+- Pick which developer agent will work on a ticket — the main session routes that. You just describe the work.
 
 ## Final-line verdict
 
