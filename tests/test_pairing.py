@@ -13,10 +13,7 @@ Covers the full lifecycle described in CCR-004:
 
 from __future__ import annotations
 
-import os
 import sqlite3
-import subprocess
-import sys
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -43,8 +40,9 @@ from ccr.auth.pairing import (
     list_pending,
     revoke,
 )
+from ccr.cli import main
 from ccr.db.engine import AsyncSessionMaker, get_session
-from ccr.db.models import Base, PairedUser, PairingCode
+from ccr.db.models import Base, PairingCode
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -384,41 +382,23 @@ async def test_list_paired_returns_all_rows(
 
 
 # --------------------------------------------------------------------------- #
-# CLI subcommand tests — drive the real CLI against a temp SQLite DB.
+# CLI subcommand tests — drive the real CLI in-process against a temp SQLite DB.
 # --------------------------------------------------------------------------- #
 
 
-def _run_cli(
-    *args: str,
-    cwd: Path,
-    env_overrides: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    env.update(
-        {
-            "TELEGRAM_BOT_TOKEN": "test-token",
-            "PUBLIC_URL": "https://example.invalid",
-            "JWT_SECRET": "x" * 64,
-            "DATA_DIR": str(cwd / "data"),
-        }
-    )
-    if env_overrides:
-        env.update(env_overrides)
-    return subprocess.run(
-        [sys.executable, "-m", "ccr", *args],
-        capture_output=True,
-        text=True,
-        cwd=REPO_ROOT,
-        env=env,
-        check=False,
-    )
-
-
 @pytest.fixture
-def cli_workspace(tmp_path: Path) -> Path:
-    """Return a temp dir with an initialised `data/ccr.db` on disk."""
-    init = _run_cli("init-db", cwd=tmp_path)
-    assert init.returncode == 0, init.stderr
+def cli_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Configure env + initialised `data/ccr.db` on disk for in-process CLI calls.
+
+    Settings env vars are set via monkeypatch (auto-reverted on test teardown);
+    cwd is pinned to the repo root so ``ccr init-db`` finds ``alembic.ini``.
+    """
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("PUBLIC_URL", "https://example.invalid")
+    monkeypatch.setenv("JWT_SECRET", "x" * 64)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.chdir(REPO_ROOT)
+    main(["init-db"])
     return tmp_path
 
 
@@ -442,76 +422,121 @@ def _seed_pairing_code(workspace: Path, code: str, tg_user_id: int) -> None:
         conn.commit()
 
 
-def test_cli_pair_list_empty_db(cli_workspace: Path) -> None:
-    result = _run_cli("pair", "list", cwd=cli_workspace)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "(empty)"
+@pytest.mark.usefixtures("cli_workspace")
+def test_cli_pair_list_empty_db(capsys: pytest.CaptureFixture[str]) -> None:
+    main(["pair", "list"])
+    assert capsys.readouterr().out.strip() == "(empty)"
 
 
-def test_cli_pair_pending_empty_db(cli_workspace: Path) -> None:
-    result = _run_cli("pair", "pending", cwd=cli_workspace)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "(empty)"
+@pytest.mark.usefixtures("cli_workspace")
+def test_cli_pair_pending_empty_db(capsys: pytest.CaptureFixture[str]) -> None:
+    main(["pair", "pending"])
+    assert capsys.readouterr().out.strip() == "(empty)"
 
 
-def test_cli_full_lifecycle(cli_workspace: Path) -> None:
+def test_cli_pair_pending_shows_seeded_codes(
+    cli_workspace: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _seed_pairing_code(cli_workspace, code="PENDING0", tg_user_id=555)
+    main(["pair", "pending"])
+    out = capsys.readouterr().out
+    assert "PENDING0" in out
+    assert "555" in out
+
+
+@pytest.mark.usefixtures("cli_workspace")
+def test_cli_pair_approve_invalid_code_exits_one(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        main(["pair", "approve", "NOPECODE"])
+    assert exc_info.value.code == 1
+    assert "Code invalid or expired" in capsys.readouterr().err
+
+
+@pytest.mark.usefixtures("cli_workspace")
+def test_cli_pair_revoke_unknown_user_exits_one(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        main(["pair", "revoke", "99999999"])
+    assert exc_info.value.code == 1
+    assert "No paired user" in capsys.readouterr().err
+
+
+@pytest.mark.usefixtures("cli_workspace")
+def test_cli_pair_invite_first_promotes_to_owner(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    main(["pair", "invite", "42", "--label", "me"])
+    assert capsys.readouterr().out.strip() == "Invited Telegram user 42 (owner)"
+
+
+@pytest.mark.usefixtures("cli_workspace")
+def test_cli_pair_invite_subsequent_friend(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    main(["pair", "invite", "42"])
+    capsys.readouterr()
+    main(["pair", "invite", "99", "--label", "friend"])
+    assert capsys.readouterr().out.strip() == "Invited Telegram user 99 (paired)"
+
+
+def test_cli_full_lifecycle(
+    cli_workspace: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     # First approval becomes owner.
     _seed_pairing_code(cli_workspace, code="OWNER001", tg_user_id=123_456_789)
-    approve_owner = _run_cli("pair", "approve", "OWNER001", cwd=cli_workspace)
-    assert approve_owner.returncode == 0, approve_owner.stderr
-    assert approve_owner.stdout.strip() == "Approved Telegram user 123456789 (owner)"
+    main(["pair", "approve", "OWNER001"])
+    assert capsys.readouterr().out.strip() == "Approved Telegram user 123456789 (owner)"
 
-    pair_list = _run_cli("pair", "list", cwd=cli_workspace)
-    assert pair_list.returncode == 0
-    assert "123456789" in pair_list.stdout
-    assert "owner" in pair_list.stdout
+    main(["pair", "list"])
+    pair_list_out = capsys.readouterr().out
+    assert "123456789" in pair_list_out
+    assert "owner" in pair_list_out
 
     # Second approval becomes a paired (non-owner) user.
     _seed_pairing_code(cli_workspace, code="FRIEND01", tg_user_id=987_654_321)
-    approve_friend = _run_cli("pair", "approve", "FRIEND01", cwd=cli_workspace)
-    assert approve_friend.returncode == 0, approve_friend.stderr
-    assert approve_friend.stdout.strip() == "Approved Telegram user 987654321 (paired)"
+    main(["pair", "approve", "FRIEND01"])
+    assert capsys.readouterr().out.strip() == "Approved Telegram user 987654321 (paired)"
 
     # Revoke owner is refused.
-    revoke_owner = _run_cli("pair", "revoke", "123456789", cwd=cli_workspace)
-    assert revoke_owner.returncode == 1
-    assert revoke_owner.stderr.strip() == "Cannot revoke owner."
+    with pytest.raises(SystemExit) as exc_info:
+        main(["pair", "revoke", "123456789"])
+    assert exc_info.value.code == 1
+    assert capsys.readouterr().err.strip() == "Cannot revoke owner."
 
     # Revoke friend succeeds and pair list no longer shows them as active.
-    revoke_friend = _run_cli("pair", "revoke", "987654321", cwd=cli_workspace)
-    assert revoke_friend.returncode == 0, revoke_friend.stderr
-    assert "Revoked Telegram user 987654321" in revoke_friend.stdout
+    main(["pair", "revoke", "987654321"])
+    assert "Revoked Telegram user 987654321" in capsys.readouterr().out
 
-    pair_list_after = _run_cli("pair", "list", cwd=cli_workspace)
-    assert pair_list_after.returncode == 0
+    main(["pair", "list"])
+    pair_list_after = capsys.readouterr().out
     # Still listed (soft-revoke) but flagged "revoked", not "paired"/active.
-    rows = [line for line in pair_list_after.stdout.splitlines() if "987654321" in line]
+    rows = [line for line in pair_list_after.splitlines() if "987654321" in line]
     assert len(rows) == 1
     assert "revoked" in rows[0]
     assert "paired" not in rows[0].split()
 
 
-async def test_paired_users_table_after_lifecycle(
-    cli_workspace: Path,
-) -> None:
+def test_paired_users_table_after_lifecycle(cli_workspace: Path) -> None:
     """Sanity-check that the CLI lifecycle landed the right rows in the DB."""
     _seed_pairing_code(cli_workspace, code="OWNER002", tg_user_id=100)
-    _run_cli("pair", "approve", "OWNER002", cwd=cli_workspace)
+    main(["pair", "approve", "OWNER002"])
     _seed_pairing_code(cli_workspace, code="FRIEND02", tg_user_id=200)
-    _run_cli("pair", "approve", "FRIEND02", cwd=cli_workspace)
-    _run_cli("pair", "revoke", "200", cwd=cli_workspace)
+    main(["pair", "approve", "FRIEND02"])
+    main(["pair", "revoke", "200"])
 
     db_path = cli_workspace / "data" / "ccr.db"
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path.as_posix()}")
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    try:
-        async with factory() as session:
-            users = (await session.execute(select(PairedUser))).scalars().all()
-            by_id = {u.tg_user_id: u for u in users}
-            assert by_id[100].is_owner is True
-            assert by_id[100].approved_by_tg_user_id is None
-            assert by_id[200].is_owner is False
-            assert by_id[200].approved_by_tg_user_id == 100
-            assert by_id[200].revoked_at is not None
-    finally:
-        await engine.dispose()
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT tg_user_id, is_owner, approved_by_tg_user_id, revoked_at FROM paired_users",
+        ).fetchall()
+    by_id = {row[0]: row for row in rows}
+    assert by_id[100][1] == 1
+    assert by_id[100][2] is None
+    assert by_id[200][1] == 0
+    assert by_id[200][2] == 100
+    assert by_id[200][3] is not None
