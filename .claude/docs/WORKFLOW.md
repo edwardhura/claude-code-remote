@@ -4,18 +4,19 @@ This file is the shared protocol for the agents in `.claude/agents/`. Every agen
 
 ## Roles
 
+Routing is owned by the **main session** (the top-level Claude conversation), not a subagent — Claude Code subagents cannot invoke other subagents. The agents below are the only invokable subagents:
+
 | Agent | Writes code? | Primary outputs |
 |---|---|---|
-| `orchestrator` | No | Routing decisions; invokes other agents via the Agent tool |
 | `project-manager` | No | Tickets in `TICKETS.md`; stub `.claude/docs/<feature>/{BRIEF,CONTEXT}.md` |
 | `team-lead` | No | Ticket status updates in `TICKETS.md`; `BRIEF.md` on completion |
 | `python-developer` | Yes | Code under `src/ccr/{bot,auth,claude,console,db,events}/`, tests, `CONTEXT.md` updates |
 | `web-developer` | Yes | Code under `src/ccr/web/` (FastAPI, viewer frontend), tests, `CONTEXT.md` updates |
 | `sysops` | Yes | `install.sh`, `.github/workflows/`, `doctor` subcommand, `.env.example`, `CONTEXT.md` updates |
 
-## Handoffs (orchestrator routes everything)
+## Handoffs (main session routes everything)
 
-Subagents do **not** invoke each other. When a subagent finishes, it returns a structured one-line verdict to the orchestrator. The orchestrator parses it and decides the next agent.
+Subagents do **not** invoke each other. When a subagent finishes, it returns a structured one-line verdict back to the main session. The main session parses it and dispatches the next agent. Routing rules live in `CLAUDE.md` § "Routing rules (main session)".
 
 Required final-line formats:
 
@@ -59,7 +60,7 @@ returns the title + status without needing the line below.
 
 ### Status transitions
 
-- `todo` → `in-progress` (orchestrator marks it when dispatching to a dev)
+- `todo` → `in-progress` (main session marks it when dispatching to a dev)
 - `in-progress` → `in-review` (developer marks it when emitting `READY FOR REVIEW`)
 - `in-review` → `done` (team lead marks it on `APPROVED`)
 - `in-review` → `in-progress` (team lead marks it on `REJECTED`, with a Review log entry)
@@ -127,7 +128,7 @@ If any check fails, mark the ticket `in-progress`, append to Review log, return 
 
 ## Integration: GitHub PR (never merge automatically)
 
-After team lead emits `APPROVED: CCR-NNN`, the orchestrator (or whoever is driving) prepares a GitHub branch and pull request for the user to merge **manually**. Claude must **never** merge a PR, push to `main`, or run `gh pr merge` on the user's behalf.
+After team lead emits `APPROVED: CCR-NNN`, the main session prepares a GitHub branch and pull request for the user to merge **manually**. Claude must **never** merge a PR, push to `main`, or run `gh pr merge` on the user's behalf.
 
 ### Branch naming
 

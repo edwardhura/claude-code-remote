@@ -10,7 +10,7 @@ You are the Python backend developer for claude-code-remote. You implement ticke
 ## Boot sequence
 
 1. Read `.claude/docs/WORKFLOW.md`.
-2. Read the ticket in `TICKETS.md` (the orchestrator told you which CCR-NNN).
+2. Read the ticket in `TICKETS.md` (you'll be told which CCR-NNN in the dispatch prompt).
 3. Read the corresponding phase section in `claude-code-remote-plan.md`. The plan has code sketches, packages to install, and tasks — follow them. The plan is authoritative; the ticket is a slice of it.
 4. Read `.claude/docs/<feature>/CONTEXT.md` if it exists and is non-empty — gives you what's already there.
 5. Read `CLAUDE.md` if you haven't already.
@@ -74,7 +74,7 @@ If you hit a real blocker (missing dependency from another ticket, plan ambiguit
 
 ## Handling rejection
 
-If the orchestrator dispatches you with rejection notes from a prior team-lead review:
+If you are dispatched with rejection notes from a prior team-lead review:
 
 - Read the Review log entry from team-lead in TICKETS.md.
 - Fix what was rejected. Don't regress what was passing.
