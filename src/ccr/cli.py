@@ -1,15 +1,24 @@
 """Argparse skeleton for `python -m ccr` and the `ccr` console script.
 
-All subcommand handlers raise :class:`NotImplementedError`; later phases wire
-each one to its real implementation. The dispatch logic itself is exercised by
-:mod:`tests.test_cli`.
+Most subcommand handlers still raise :class:`NotImplementedError`; later
+phases wire each one to its real implementation. The dispatch logic is
+exercised by :mod:`tests.test_cli`.
+
+CCR-003 wires up:
+
+* ``configure_logging`` is invoked from :func:`main` before dispatch.
+* ``init-db`` programmatically runs ``alembic upgrade head`` and ensures
+  ``DATA_DIR`` and ``DATA_DIR/logs`` exist.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING
+
+from ccr.logging_setup import configure_logging
 
 if TYPE_CHECKING:
     from argparse import _SubParsersAction
@@ -27,6 +36,31 @@ def _stub(name: str) -> Handler:
 
     handler.__name__ = f"_cmd_{name.replace(' ', '_').replace('-', '_')}"
     return handler
+
+
+def _cmd_init_db(_args: argparse.Namespace) -> None:
+    """Ensure data dirs exist and run ``alembic upgrade head`` programmatically."""
+    # Imported lazily so `python -m ccr --help` (and the rest of the CLI)
+    # remains responsive even if Alembic / Settings would fail to import or
+    # validate, e.g. when running on a freshly cloned repo without a `.env`.
+    from alembic import command  # noqa: PLC0415
+    from alembic.config import Config  # noqa: PLC0415
+
+    from ccr.config import Settings  # noqa: PLC0415
+
+    settings = Settings()  # type: ignore[call-arg]
+
+    data_dir: Path = settings.data_dir
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "logs").mkdir(parents=True, exist_ok=True)
+
+    repo_root = Path.cwd()
+    alembic_ini = repo_root / "alembic.ini"
+    cfg = Config(str(alembic_ini))
+    cfg.set_main_option("script_location", str(repo_root / "alembic"))
+    db_path = (data_dir / "ccr.db").resolve()
+    cfg.set_main_option("sqlalchemy.url", f"sqlite+aiosqlite:///{db_path.as_posix()}")
+    command.upgrade(cfg, "head")
 
 
 def _add_pair_subcommands(pair_subparsers: _SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -111,13 +145,25 @@ def build_parser() -> argparse.ArgumentParser:
         "init-db",
         help="Create the SQLite database and run migrations.",
     )
-    init_db_parser.set_defaults(func=_stub("init-db"))
+    init_db_parser.set_defaults(func=_cmd_init_db)
 
     return parser
 
 
+def _initial_log_level() -> str:
+    """Read ``LOG_LEVEL`` from env without forcing full Settings validation.
+
+    `Settings()` requires `TELEGRAM_BOT_TOKEN`, `PUBLIC_URL`, and
+    `JWT_SECRET`; we cannot afford to crash `--help` on a fresh checkout.
+    """
+    import os  # noqa: PLC0415
+
+    return os.environ.get("LOG_LEVEL", "INFO")
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """Parse command-line arguments and dispatch to the chosen handler."""
+    configure_logging(_initial_log_level())
     parser = build_parser()
     args = parser.parse_args(argv)
     handler: Handler = args.func
