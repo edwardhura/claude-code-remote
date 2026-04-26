@@ -93,7 +93,7 @@ Notes:
 
 ---
 
-## CCR-004: Pairing auth — storage, owner model, CLI subcommands [todo]
+## CCR-004: Pairing auth — storage, owner model, CLI subcommands [done]
 Phase: 3
 Feature: auth
 Files:
@@ -113,17 +113,21 @@ Files:
 Out of scope:
   - Bot integration (Phase 5/6); console REPL (Phase 4).
 Acceptance:
-  - [ ] `python -m ccr pair list` prints `(empty)` on a fresh DB.
-  - [ ] After manually inserting a `pairing_codes` row, `python -m ccr pair approve <code>` prints `Approved Telegram user 123456789 (owner)`. A subsequent `pair list` shows the user with `is_owner=True`.
-  - [ ] A second pairing code, when approved, prints `Approved Telegram user 987654321 (paired)` with no owner promotion.
-  - [ ] `python -m ccr pair revoke <owner_id>` exits 1 with `Cannot revoke owner.`
-  - [ ] `python -m ccr pair revoke <friend_id>` succeeds and `pair list` no longer shows that user as active.
-  - [ ] `pytest tests/test_pairing.py` passes.
+  - [x] `python -m ccr pair list` prints `(empty)` on a fresh DB.
+  - [x] After manually inserting a `pairing_codes` row, `python -m ccr pair approve <code>` prints `Approved Telegram user 123456789 (owner)`. A subsequent `pair list` shows the user with `is_owner=True`.
+  - [x] A second pairing code, when approved, prints `Approved Telegram user 987654321 (paired)` with no owner promotion.
+  - [x] `python -m ccr pair revoke <owner_id>` exits 1 with `Cannot revoke owner.`
+  - [x] `python -m ccr pair revoke <friend_id>` succeeds and `pair list` no longer shows that user as active.
+  - [x] `pytest tests/test_pairing.py` passes.
 Depends on: CCR-003
 Notes:
   Code generation: `secrets.token_hex(4).upper()` collision-retried up to 5 times. `approve` is a single transaction. `is_paired` / `is_owner` filter on `revoked_at IS NULL`. Owner-only enforcement for `invite` lives at the CLI/console layer; the pure function trusts its caller. Tests should support manual `now` injection for expiry/reuse cases.
 
 ### Review log
+  - 2026-04-26 main: dispatched to python-developer
+  - 2026-04-26 python-developer: started
+  - 2026-04-26 python-developer: ready for review — src/ccr/auth/{__init__,pairing,allowlist}.py + ccr.cli pair subcommands wired + tests/test_pairing.py (21 tests) landed; pure-function lifecycle (owner auto-promotion, owner-link on second approval, expired/reused/unknown code rejected, owner-revoke refused, invite idempotent) plus subprocess-driven CLI tests against temp DATA_DIR with hand-seeded pairing_codes rows; manual acceptance walk: `pair list` (empty) → seed → `pair approve OWNER001` prints `Approved Telegram user 123456789 (owner)` → `pair approve FRIEND01` prints `Approved Telegram user 987654321 (paired)` → `pair revoke 123456789` exits 1 with `Cannot revoke owner.` → `pair revoke 987654321` succeeds and pair list shows status `revoked`; `ruff check src tests`, `ruff format --check src tests`, `mypy src` (11 files), `pytest tests/test_pairing.py` (21/21), full `pytest` (45/45) all green.
+  - 2026-04-26 team-lead: approved — all 6 acceptance criteria verified by execution: `pair list` prints `(empty)` on fresh DB; `pair approve OWNER001` prints `Approved Telegram user 123456789 (owner)` and `pair list` shows owner status; `pair approve FRIEND01` prints `Approved Telegram user 987654321 (paired)`; `pair revoke 123456789` exits 1 with `Cannot revoke owner.`; `pair revoke 987654321` exits 0 and `pair list` shows status `revoked`; `pytest tests/test_pairing.py` 21/21 green; quality gate: ruff check clean, ruff format clean, mypy strict passes (11 files), full `pytest` 45/45 green.
 
 ---
 
