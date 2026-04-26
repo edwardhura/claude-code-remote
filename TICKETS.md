@@ -37,7 +37,7 @@ Notes:
 
 ---
 
-## CCR-002: CI workflow, pre-commit, env template, README placeholder [todo]
+## CCR-002: CI workflow, pre-commit, env template, README placeholder [done]
 Phase: 1
 Feature: core
 Files:
@@ -48,12 +48,15 @@ Files:
 Out of scope:
   - Any business logic, DB, env loading.
 Acceptance:
-  - [ ] CI workflow file is valid YAML.
+  - [x] CI workflow file is valid YAML.
 Depends on: CCR-001
 Notes:
   Split from Phase 1 per the project-manager rule: phase touches both source code and `.github/workflows/`, so the sysops piece (CI + dev tooling + env template + README placeholder) is its own ticket. `.env.example` should match the env list in plan §7. `README.md` is a placeholder; the polished version comes in Phase 14.
 
 ### Review log
+  - 2026-04-26 sysops: started
+  - 2026-04-26 sysops: ready for review — added .env.example (plan §7 template), .pre-commit-config.yaml (ruff + ruff-format + mypy --strict), .github/workflows/ci.yml (uv sync + ruff + mypy + pytest 80% coverage gate, Python 3.12), and README.md placeholder; both YAML files parse via `yaml.safe_load`.
+  - 2026-04-26 team-lead: approved — CI YAML valid (uv run python yaml.safe_load exit 0); pre-commit YAML valid; .env.example covers all 11 plan §7 vars; README has project summary and "Run locally in 60 seconds" section reserved; ci.yml runs uv sync, ruff check, ruff format --check, mypy src, pytest with 80% coverage gate; .pre-commit-config.yaml has ruff, ruff-format, mypy --strict hooks.
 
 ---
 
