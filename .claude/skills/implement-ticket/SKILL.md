@@ -43,13 +43,19 @@ Run this loop in this session.
 9. **Dispatch `team-lead` (Mode 2).** Pass the developer's full implementation summary, qa's full response, and reviewer's full response. Team-lead either:
    - Returns `APPROVED: CCR-NNN` (or `FEATURE COMPLETE: <feature>` for the feature's last ticket) — proceed to step 10.
    - Returns `DISPATCH: <agent> CCR-NNN` with a `## Fix scope (CCR-NNN)` section in the body — go back to step 7 with a **fresh developer dispatch**, passing the fix scope verbatim. The dev session is new every time; the fix scope must be self-contained.
-10. **On APPROVED — create the PR.** Per `WORKFLOW.md §Integration`:
+10. **On APPROVED — pause for user approval.** This is a hard gate. **Do not** stage, commit, push, or run `gh pr create` until the user explicitly approves. End the turn by:
+    - Posting a short summary: ticket id + title, branch name, files touched, QA + reviewer verdicts, proposed commit subject, and a preview of the PR title + body.
+    - Asking the user to approve the publish, e.g. "Ready to commit, push `ccr-NNN-<slug>`, and open the PR?".
+    - Stopping prompt execution. Wait for the user's reply. **Do not** continue to step 11 in the same turn.
+11. **On user approval — create the PR.** Only after the user says go (e.g. "yes", "ship it", "approved"). Per `WORKFLOW.md §Integration`:
     - Stage the ticket's files plus the team-lead's `TICKETS.md` / `CONTEXT.md` / `BRIEF.md` updates.
     - Commit with the format from WORKFLOW.md.
     - `git push -u origin ccr-NNN-<slug>`.
     - `gh pr create --base main --title "CCR-NNN: <title>" --body "<filled template>"`.
     - Report the PR URL to the user.
     - **Stop.** Never `gh pr merge`, never push to `main`, never force-push. The user merges manually.
+
+    If the user says no, asks for changes, or replies ambiguously, do not publish — address the request, then re-summarize and re-ask. A "yes" approves the current ticket only; subsequent tickets need their own approval.
 
 ## Boundary rules
 

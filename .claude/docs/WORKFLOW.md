@@ -206,6 +206,26 @@ When dispatched with QA + reviewer outputs, team-lead either:
 
 After team-lead emits `APPROVED: CCR-NNN`, the **main session** prepares the GitHub branch and pull request for the user to merge **manually**. Claude must **never** merge a PR, push to `main`, or run `gh pr merge` on the user's behalf.
 
+### User approval gate (mandatory)
+
+The main session **must pause and wait for explicit user approval** between `APPROVED` and the publish steps below. This is a hard rule — staging, committing, pushing, and `gh pr create` all happen *after* the user says go.
+
+When `team-lead` returns `APPROVED: CCR-NNN`:
+
+1. End the prompt execution. Do not call `git add`, `git commit`, `git push`, or `gh pr create` yet.
+2. Post a short summary to the user containing:
+   - Ticket id and title.
+   - Branch name.
+   - Files this ticket touched (one line each).
+   - QA + reviewer verdicts (one line each).
+   - The proposed commit message subject.
+   - The proposed PR title and a preview of the PR body.
+3. End with an explicit ask, e.g. "Ready to commit, push `ccr-NNN-<slug>`, and open the PR?".
+4. **Wait.** Do nothing else until the user replies.
+5. Proceed to the steps below **only** when the user explicitly approves (e.g. "yes", "go", "ship it", "approved"). On "no", a request for changes, or anything ambiguous, do not publish — answer the user's question or apply the requested change instead, then re-summarize and re-ask.
+
+A user approving once approves only this ticket's publish step. The next ticket's publish step needs its own approval.
+
 ### Branch naming
 
 Branch was already created at the start of the ticket as `ccr-NNN-<slug>` where the slug is a 1–4-word kebab-cased summary of the ticket title (e.g. `ccr-005-console-repl`).
@@ -244,6 +264,8 @@ TICKETS.md → CCR-NNN
 ```
 
 ### Steps (main session)
+
+These steps run **only after the user has explicitly approved** the publish (see "User approval gate" above).
 
 1. Stage only the files this ticket owns (plus the ticket's `TICKETS.md` / `CONTEXT.md` / `BRIEF.md` updates): `git add -A` is fine if the working tree has no unrelated noise; otherwise stage by path.
 2. Commit using the message format above.
