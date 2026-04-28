@@ -233,6 +233,14 @@ async def _async_pair_invite(tg_user_id: int, label: str | None) -> int:
     return exit_code
 
 
+def _cmd_console(args: argparse.Namespace) -> None:
+    from ccr.config import Settings  # noqa: PLC0415
+    from ccr.console.app import run  # noqa: PLC0415
+
+    settings = Settings()  # type: ignore[call-arg]
+    asyncio.run(run(settings, once=args.once))
+
+
 def _cmd_pair_list(_args: argparse.Namespace) -> None:
     asyncio.run(_async_pair_list())
 
@@ -327,7 +335,13 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.set_defaults(func=_stub("serve"))
 
     console_parser = subparsers.add_parser("console", help="Open the owner REPL.")
-    console_parser.set_defaults(func=_stub("console"))
+    console_parser.add_argument(
+        "--once",
+        metavar="CMD",
+        default=None,
+        help="Run one command and exit.",
+    )
+    console_parser.set_defaults(func=_cmd_console)
 
     pair_parser = subparsers.add_parser("pair", help="Manage Telegram pairing.")
     pair_subparsers = pair_parser.add_subparsers(

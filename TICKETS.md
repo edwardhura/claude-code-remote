@@ -131,7 +131,7 @@ Notes:
 
 ---
 
-## CCR-005: Console REPL app [todo]
+## CCR-005: Console REPL app [done]
 Phase: 4
 Feature: console
 Files:
@@ -146,16 +146,19 @@ Files:
 Out of scope:
   - Permission UI for inline buttons via console; that stays in Telegram.
 Acceptance:
-  - [ ] `python -m ccr console` opens a `ccr>` prompt and accepts commands.
-  - [ ] `pair list` prints a column-aligned table.
-  - [ ] `help` lists all commands. `unknown_cmd` prints `Unknown command. Type 'help'.`
-  - [ ] `python -m ccr console --once "pair list"` prints the table and exits 0.
-  - [ ] `pytest tests/test_console.py` passes.
+  - [x] `python -m ccr console` opens a `ccr>` prompt and accepts commands.
+  - [x] `pair list` prints a column-aligned table.
+  - [x] `help` lists all commands. `unknown_cmd` prints `Unknown command. Type 'help'.`
+  - [x] `python -m ccr console --once "pair list"` prints the table and exits 0.
+  - [x] `pytest tests/test_console.py` passes.
 Depends on: CCR-004
 Notes:
   Small command registry pattern (`COMMANDS: dict[str, Callable]`). Aligned-column table rendering with no extra dep. Auto-complete words refreshed before each prompt by querying the DB. `status` uses `httpx.get(public_url + "/healthz", timeout=2)`. `--once "<cmd>"` flag for non-interactive scripted use. Tests use `prompt_toolkit.input.create_pipe_input` + `DummyOutput`. The `status` command pings `/healthz` which doesn't exist yet (Phase 11) — handle the connection error gracefully and still print DB stats.
 
 ### Review log
+  - 2026-04-28 main: branch ccr-005-console-repl created, dispatching team-lead
+  - 2026-04-28 team-lead: scope brief issued, dispatching python-developer
+  - 2026-04-28 team-lead: approved (LOW advisory: broad except in app.py:348 may surface DB file path in error messages — owner-only risk, no fix required)
 
 ---
 
