@@ -61,9 +61,19 @@ ignore = [
     "S101",    # asserts are how pytest works
     "S603",    # subprocess calls in tests target sys.executable, not user input
     "S607",    # likewise — invoking python as a partial path is fine in tests
+    "S106",    # dummy/test-only credentials are not real secrets
+    "S108",    # /tmp paths in test fixtures are intentional
     "ANN",     # tests don't need full type hints
     "PLR2004", # magic numbers in assertions are fine
+    "PLR0913", # test helpers can take a few keyword-only knobs
+    "PLC0415", # local imports in test bodies are fine
+    "ASYNC109", # `timeout=` keyword on async test helpers is a deliberate choice
+    "PERF401", # async-for accumulators in tests need not be comprehensions
+    "TC003",   # test fixture annotations don't need TYPE_CHECKING gymnastics
     "INP001",  # tests dir is not an importable package
+]
+"tests/fakes/**" = [
+    "INP001",  # fakes dir is imported via `python -m`
 ]
 "src/ccr/__main__.py" = [
     "INP001",
