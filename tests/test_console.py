@@ -39,7 +39,7 @@ def _make_settings(tmp_path: Path) -> Settings:
     data_dir = tmp_path / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
     return Settings(
-        telegram_bot_token="test-token",  # type: ignore[arg-type]  # noqa: S106
+        telegram_bot_token="test-token",  # type: ignore[arg-type]
         public_url="http://127.0.0.1:1/",  # type: ignore[arg-type]
         jwt_secret="x" * 64,  # type: ignore[arg-type]
         data_dir=data_dir,

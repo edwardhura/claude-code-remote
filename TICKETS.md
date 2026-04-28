@@ -198,7 +198,7 @@ Notes:
 
 ---
 
-## CCR-007: Claude subprocess wrapper, event bus, JSONL logger [todo]
+## CCR-007: Claude subprocess wrapper, event bus, JSONL logger [done]
 Phase: 7
 Feature: claude-runtime
 Files:
@@ -226,15 +226,19 @@ Files:
 Out of scope:
   - Real Claude Code invocation in tests; bot or web integration.
 Acceptance:
-  - [ ] `pytest tests/test_claude_events.py tests/test_session_manager.py` passes.
-  - [ ] A test exercises the fake subprocess and asserts: 5 events persisted to JSONL with sequence 0–4; `EventBus` subscriber receives the same 5 events; `status()` transitions `idle → running → completed`.
-  - [ ] A test asserts that killing the fake subprocess mid-stream sets `Session.status = 'crashed'` and publishes a synthetic error event.
-  - [ ] `python -c "from ccr.claude.events import ClaudeEvent; from pydantic import TypeAdapter; print(TypeAdapter(ClaudeEvent).json_schema())"` prints a non-empty schema.
+  - [x] `pytest tests/test_claude_events.py tests/test_session_manager.py` passes.
+  - [x] A test exercises the fake subprocess and asserts: 5 events persisted to JSONL with sequence 0–4; `EventBus` subscriber receives the same 5 events; `status()` transitions `idle → running → completed`.
+  - [x] A test asserts that killing the fake subprocess mid-stream sets `Session.status = 'crashed'` and publishes a synthetic error event.
+  - [x] `python -c "from ccr.claude.events import ClaudeEvent; from pydantic import TypeAdapter; print(TypeAdapter(ClaudeEvent).json_schema())"` prints a non-empty schema.
 Depends on: CCR-003
 Notes:
   Per plan §8 ordering note, Phase 7 must land BEFORE Phase 6 — this ticket is numbered CCR-007 and ordered first in TICKETS.md to make that explicit. `EventBus` uses weakref-tracked subscriber queues. Stderr is buffered and surfaced as `UnknownEvent(type="stderr", raw={...})` only on subprocess crash. `JsonlSessionLog` is append-only with `asyncio.Lock` for serialization; tail uses an internal `asyncio.Event` notified by `append()`. Startup pruning keeps last `LOG_RETENTION_COUNT` files and deletes files older than `LOG_RETENTION_DAYS`. `SessionManager` enforces single running session globally.
 
 ### Review log
+  - 2026-04-29 main: branch ccr-007-claude-runtime created, dispatching team-lead
+  - 2026-04-29 team-lead: dispatching architect — new subsystem (EventBus + SessionManager + JSONL log), first ticket of claude-runtime feature, 6 source files with load-bearing abstractions consumed by every later phase
+  - 2026-04-29 team-lead: plan reviewed (.claude/plans/CCR-007-claude-runtime.md), dispatching python-developer
+  - 2026-04-29 team-lead: approved — all 4 acceptance criteria verified (41 ticket-targeted tests + full suite 127 passed at 87.78% coverage); note: ClaudeEvent shipped as plain Union with internal _KnownEvent discriminated union due to Pydantic v2.12 strict-discriminator constraint; behavioral contract preserved
 
 ---
 
