@@ -36,8 +36,11 @@ main session
         - if either failed: team-lead returns fix scope → loop to step 6 (fresh dev session)
         - if both passed: team-lead updates TICKETS.md, CONTEXT.md, BRIEF.md (if last ticket)
                           → returns APPROVED
-  9. main session commits, pushes, opens PR (never merges)
+  9. main session **stops and waits for user approval** before the final step
+ 10. on user approval: main session commits, pushes, opens PR (never merges)
 ```
+
+**Hard rule — user gate before publish.** After team-lead returns `APPROVED`, the main session **must not** stage, commit, push, or run `gh pr create` until the user explicitly approves. End the turn with a short summary (ticket, branch, files changed, acceptance verdict, PR title + body preview) and an explicit ask such as "Ready to commit, push, and open the PR?". Wait for the user's reply. Only after the user says yes (or equivalent) does the main session execute step 10. If the user says no, asks for changes, or stays silent, do not publish.
 
 The developer is dispatched **fresh** each time — including on the fix loop. Pass the team-lead's fix scope verbatim in the new dispatch prompt.
 
