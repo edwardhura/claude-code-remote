@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import ccr.server as server_mod
 from ccr.cli import main
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -52,9 +53,27 @@ def test_pair_without_subcommand_exits_two() -> None:
     assert exc_info.value.code == 2
 
 
-def test_serve_raises_not_implemented() -> None:
-    with pytest.raises(NotImplementedError):
-        main(["serve"])
+def test_serve_dispatches_to_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`ccr serve` should hand off to ccr.server.serve via asyncio.run."""
+    captured: dict[str, object] = {}
+
+    def fake_run(coro: object) -> None:
+        captured["ran"] = True
+        if hasattr(coro, "close"):
+            coro.close()  # type: ignore[attr-defined]
+
+    async def fake_serve(settings: object) -> None:  # pragma: no cover - never awaited
+        captured["settings"] = settings
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:test-token")
+    monkeypatch.setenv("JWT_SECRET", "x" * 32)
+    monkeypatch.setenv("PUBLIC_URL", "https://example.test")
+    monkeypatch.setattr("ccr.cli.asyncio.run", fake_run)
+    monkeypatch.setattr(server_mod, "serve", fake_serve)
+
+    main(["serve"])
+
+    assert captured.get("ran") is True
 
 
 def test_pair_approve_requires_code() -> None:

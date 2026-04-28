@@ -22,6 +22,90 @@ Pre-release. The architecture and phased build plan live in [`claude-code-remote
 
 This section will be rewritten end-to-end once the bootstrap and viewer phases ship.
 
+## Try it now (current state through CCR-006)
+
+The bot can talk over Telegram, gate non-paired users, and bootstrap the first owner via the console. Session execution, the web viewer, the proxy, and `/view` / `/last` / `/preview` URLs all land in later tickets.
+
+### Prerequisites
+
+- Python 3.12+ and [`uv`](https://docs.astral.sh/uv/).
+- A Telegram bot token from [`@BotFather`](https://t.me/BotFather) (`/newbot`).
+- (One-time) `uv sync` and `uv run python -m ccr init-db`.
+
+### 1. Configure `.env`
+
+```bash
+cp .env.example .env  # if you don't have one yet
+# edit .env: paste your bot token into TELEGRAM_BOT_TOKEN
+# JWT_SECRET can be generated with: openssl rand -hex 32
+```
+
+`PUBLIC_URL` is unused until CCR-012 (the web server); keep the placeholder.
+
+### 2. Start the bot (terminal 1)
+
+```bash
+uv run python -m ccr serve
+```
+
+You should see `Bot started, awaiting updates` in the logs. Leave it running.
+
+### 3. Bootstrap the first owner (Telegram + terminal 2)
+
+In Telegram, open your bot and send `/start`. With no owner paired yet, the bot replies:
+
+```
+Bootstrap pairing.
+Telegram ID: <your-id>
+Code: <8-char-code>
+
+On the project host:
+python -m ccr pair approve <code>
+```
+
+Run that command in a second terminal:
+
+```bash
+uv run python -m ccr pair approve <code>
+```
+
+It prints `Approved Telegram user <id> (owner)`. Send `/start` again — the bot now replies:
+
+```
+Paired. Send a prompt to start, or /new for a fresh session.
+```
+
+`/new` and prompt forwarding don't do anything yet (they land in CCR-008).
+
+### 4. Verify the allowlist
+
+From a different (unpaired) Telegram account, send any plain text to the bot. Expected reply:
+
+```
+Not paired. Send /start to request access.
+```
+
+The owner gets a DM only after the unpaired user sends `/start`:
+
+```
+Pairing request from @<username> (id <id>).
+Approve with: python -m ccr pair approve <code>
+```
+
+### Owner ops via the console
+
+`uv run python -m ccr console` opens a REPL with `pair list`, `pair pending`, `pair approve <code>`, `pair revoke <id>`, `pair invite <id> [--label X]`, `status`, `help`. The same operations are available as one-shot subcommands:
+
+```bash
+uv run python -m ccr pair list
+uv run python -m ccr pair pending
+uv run python -m ccr pair approve <code>
+uv run python -m ccr pair revoke <tg-user-id>
+uv run python -m ccr pair invite <tg-user-id> --label friend
+```
+
+Owner cannot be revoked. The first approved pairing auto-promotes to owner.
+
 ## Layout
 
 ```

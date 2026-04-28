@@ -241,6 +241,14 @@ def _cmd_console(args: argparse.Namespace) -> None:
     asyncio.run(run(settings, once=args.once))
 
 
+def _cmd_serve(_args: argparse.Namespace) -> None:
+    from ccr import server  # noqa: PLC0415
+    from ccr.config import Settings  # noqa: PLC0415
+
+    settings = Settings()  # type: ignore[call-arg]
+    asyncio.run(server.serve(settings))
+
+
 def _cmd_pair_list(_args: argparse.Namespace) -> None:
     asyncio.run(_async_pair_list())
 
@@ -332,7 +340,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     serve_parser = subparsers.add_parser("serve", help="Run the bot and web server.")
-    serve_parser.set_defaults(func=_stub("serve"))
+    serve_parser.set_defaults(func=_cmd_serve)
 
     console_parser = subparsers.add_parser("console", help="Open the owner REPL.")
     console_parser.add_argument(

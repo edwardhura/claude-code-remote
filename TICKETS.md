@@ -162,7 +162,7 @@ Notes:
 
 ---
 
-## CCR-006: Bot scaffold, allowlist middleware, pairing flow, owner notification [todo]
+## CCR-006: Bot scaffold, allowlist middleware, pairing flow, owner notification [done]
 Phase: 5
 Feature: chat-bot
 Files:
@@ -183,15 +183,18 @@ Files:
 Out of scope:
   - Session commands. Web server still off.
 Acceptance:
-  - [ ] `python -m ccr serve` starts polling and logs `Bot started, awaiting updates`.
-  - [ ] `pytest tests/test_bot_pairing.py` passes, covering all four paths above.
-  - [ ] A test asserts `notify_owner` is *not* called in the bootstrap path.
-  - [ ] A test asserts unpaired plain text returns the fixed rejection string and never reaches a session handler.
+  - [x] `python -m ccr serve` starts polling and logs `Bot started, awaiting updates`.
+  - [x] `pytest tests/test_bot_pairing.py` passes, covering all four paths above.
+  - [x] A test asserts `notify_owner` is *not* called in the bootstrap path.
+  - [x] A test asserts unpaired plain text returns the fixed rejection string and never reaches a session handler.
 Depends on: CCR-004
 Notes:
   Plan lists Phase 4 as "helpful but not blocking" — only Phase 3 (CCR-004) is a hard dependency. `AllowlistMiddleware` registers on both `dp.message` and `dp.callback_query` and persists `last_chat_id` on every message from a paired user (used later by notify functions). Owner DMs go to `paired_users.last_chat_id` for the owner; if null (owner hasn't messaged the bot since pairing), log a warning and skip. `cli.py serve` runs `asyncio.run(server.serve(settings))` — initially polling-only; uvicorn comes in Phase 10/11.
 
 ### Review log
+  - 2026-04-28 main: branch ccr-006-bot-pairing created, dispatching team-lead
+  - 2026-04-28 team-lead: scope brief issued, dispatching python-developer
+  - 2026-04-28 team-lead: approved — QA PASS (86 passed, 86.44% coverage, all 4 acceptance criteria verified); REVIEW PASS (clean on secrets/injection); F1 ADVISORY: @username interpolated without html.escape() in pairing.py:55-62 — not a current exploit (Telegram username regex bars <>&), document as a hardening gap to fix in CCR-008 when more HTML messages land
 
 ---
 
