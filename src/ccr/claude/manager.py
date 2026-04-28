@@ -315,7 +315,13 @@ class SessionManager:
     def _schedule_last_event_at_update(self, session_id: uuid.UUID) -> None:
         """Debounce ``last_event_at`` writes to ≤ 1 per second, fire-and-forget."""
         now_ts = time.monotonic()
-        if now_ts - self._last_event_at_write_ts < _LAST_EVENT_DEBOUNCE_SECONDS:
+        # First call always fires; ``_last_event_at_write_ts == 0.0`` is the
+        # "never written" sentinel and must not be subtracted into the
+        # debounce window.
+        if (
+            self._last_event_at_write_ts > 0.0
+            and now_ts - self._last_event_at_write_ts < _LAST_EVENT_DEBOUNCE_SECONDS
+        ):
             return
         self._last_event_at_write_ts = now_ts
         self._last_event_at_pending = asyncio.create_task(
@@ -352,6 +358,14 @@ class SessionManager:
         if self._consumer_task is not None and self._consumer_task is not asyncio.current_task():
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._consumer_task
+
+        # Drain any in-flight ``last_event_at`` write before we issue the
+        # final-state update — otherwise observers that read the row right
+        # after seeing the COMPLETED/CRASHED status may still see
+        # ``last_event_at`` as NULL.
+        if self._last_event_at_pending is not None:
+            with contextlib.suppress(BaseException):
+                await self._last_event_at_pending
 
         if self._stop_requested:
             final_status = SessionStatus.STOPPED
