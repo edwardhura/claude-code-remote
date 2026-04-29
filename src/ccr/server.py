@@ -10,19 +10,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import TYPE_CHECKING, Any
+import uuid
+from typing import TYPE_CHECKING
 
 import structlog
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
+from aiogram.types import InlineKeyboardMarkup
 from sqlalchemy import select
 
 from ccr.bot.app import run_polling
-from ccr.bot.formatting import event_to_messages
+from ccr.bot.formatting import OutboundMessage, _PendingKeyboard, event_to_messages
+from ccr.bot.keyboards import permission_kb
 from ccr.bot.typing import TypingKeepalive
-from ccr.claude.events import ResultEvent
+from ccr.claude.events import PermissionRequest, ResultEvent
 from ccr.claude.manager import SessionManager
 from ccr.db.engine import AsyncSessionMaker, create_engine_from_settings
 from ccr.db.models import PairedUser
@@ -50,7 +53,7 @@ async def serve(settings: Settings) -> None:
     )
 
     broadcast_task = asyncio.create_task(
-        _broadcast_loop(bus, broadcast_bot, db_factory),
+        _broadcast_loop(bus, broadcast_bot, db_factory, manager),
         name="broadcast",
     )
     typing_task = asyncio.create_task(
@@ -80,6 +83,7 @@ async def _broadcast_loop(
     bus: EventBus,
     bot: Bot,
     db_factory: async_sessionmaker[AsyncSession],
+    manager: SessionManager,
 ) -> None:
     """Fan ``session.event`` payloads out to every paired user.
 
@@ -88,32 +92,114 @@ async def _broadcast_loop(
     the others. One persistent sender task per chat drains its queue. Both
     the queues and the sender tasks live for the lifetime of the broadcast
     loop; cancellation of the loop cascades to every sender.
+
+    Permission gating (CCR-009): while ``manager.is_telegram_paused(session_id)``
+    is True for a session, non-permission events for that session are
+    appended to a per-loop ``buffered`` list. The
+    :class:`~ccr.claude.events.PermissionRequest` event itself bypasses the
+    gate — it carries the keyboard the user needs to tap, so we flush the
+    existing buffer and send the permission message immediately. The first
+    non-paused event after a permission response triggers a drain of any
+    older buffered messages for that session, preserving order. SSE
+    consumers (CCR-012) subscribe to the same bus independently and are not
+    affected by this Telegram-only gate.
+
+    Buffered-on-shutdown trade-off: if a session ends (``/stop``) while
+    events are still buffered for it, the buffer is not actively cleared —
+    the next non-paused event for *any* session triggers a drain that
+    flushes leftover entries. The messages still send (best-effort);
+    ordering with respect to the next session's events is best-effort too.
+    Tying buffer entries to a ``session.status`` STOPPED watcher would
+    require a second subscription; not worth it for MVP.
     """
     senders: dict[int, _ChatSender] = {}
+    buffered: list[tuple[uuid.UUID, list[OutboundMessage]]] = []
     try:
         async for payload in bus.subscribe("session.event"):
             if not isinstance(payload, dict):
                 continue
             event = payload.get("event")
-            if event is None:
+            session_id = payload.get("session_id")
+            if event is None or not isinstance(session_id, uuid.UUID):
                 continue
             messages = event_to_messages(event)
             if not messages:
                 continue
-            chat_ids = await _list_active_chat_ids(db_factory)
-            for chat_id in chat_ids:
-                sender = senders.get(chat_id)
-                if sender is None:
-                    sender = _ChatSender(bot=bot, chat_id=chat_id)
-                    sender.start()
-                    senders[chat_id] = sender
-                for message in messages:
-                    sender.enqueue(message)
+            messages = _materialise_keyboards(messages, session_id)
+
+            if isinstance(event, PermissionRequest):
+                # The permission message MUST flush immediately so users see
+                # the keyboard. Drain any buffered events first to preserve
+                # event order, then send the permission message itself.
+                await _flush_buffer(buffered, senders, bot, db_factory)
+                await _send_to_all(messages, senders, bot, db_factory)
+                continue
+
+            if manager.is_telegram_paused(session_id):
+                buffered.append((session_id, messages))
+                continue
+
+            # Not paused — drain anything buffered for any session first so
+            # the resumed messages emit before the new event.
+            if buffered:
+                await _flush_buffer(buffered, senders, bot, db_factory)
+            await _send_to_all(messages, senders, bot, db_factory)
     finally:
         for sender in senders.values():
             sender.cancel()
         for sender in senders.values():
             await sender.wait_closed()
+
+
+def _materialise_keyboards(
+    messages: list[OutboundMessage],
+    session_id: uuid.UUID,
+) -> list[OutboundMessage]:
+    """Swap :class:`_PendingKeyboard` sentinels for real keyboards.
+
+    The formatter does not see the ``session_id`` (it's a pure function of
+    :data:`ClaudeEvent`); the broadcast loop has it from the bus payload.
+    """
+    out: list[OutboundMessage] = []
+    for text, kb in messages:
+        if isinstance(kb, _PendingKeyboard):
+            out.append((text, permission_kb(session_id, kb.request_id, kb.options)))
+        else:
+            out.append((text, kb))
+    return out
+
+
+async def _flush_buffer(
+    buffered: list[tuple[uuid.UUID, list[OutboundMessage]]],
+    senders: dict[int, _ChatSender],
+    bot: Bot,
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Drain every entry from ``buffered`` (in order) into per-chat queues."""
+    if not buffered:
+        return
+    drained = list(buffered)
+    buffered.clear()
+    for _sid, messages in drained:
+        await _send_to_all(messages, senders, bot, db_factory)
+
+
+async def _send_to_all(
+    messages: list[OutboundMessage],
+    senders: dict[int, _ChatSender],
+    bot: Bot,
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Enqueue ``messages`` onto every active paired chat's sender queue."""
+    chat_ids = await _list_active_chat_ids(db_factory)
+    for chat_id in chat_ids:
+        sender = senders.get(chat_id)
+        if sender is None:
+            sender = _ChatSender(bot=bot, chat_id=chat_id)
+            sender.start()
+            senders[chat_id] = sender
+        for message in messages:
+            sender.enqueue(message)
 
 
 async def _typing_loop(
@@ -184,7 +270,7 @@ class _ChatSender:
     def __init__(self, *, bot: Bot, chat_id: int) -> None:
         self._bot = bot
         self._chat_id = chat_id
-        self._queue: asyncio.Queue[Any] = asyncio.Queue()
+        self._queue: asyncio.Queue[OutboundMessage] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
@@ -194,7 +280,7 @@ class _ChatSender:
                 name=f"broadcast-sender-{self._chat_id}",
             )
 
-    def enqueue(self, message: str) -> None:
+    def enqueue(self, message: OutboundMessage) -> None:
         self._queue.put_nowait(message)
 
     def cancel(self) -> None:
@@ -209,12 +295,19 @@ class _ChatSender:
 
     async def _run(self) -> None:
         while True:
-            message = await self._queue.get()
+            text, kb = await self._queue.get()
+            # Defensive: a sentinel should already have been materialised by
+            # the broadcast loop. If one slips through, drop the keyboard so
+            # we still deliver the text rather than crashing the sender.
+            reply_markup: InlineKeyboardMarkup | None = (
+                kb if isinstance(kb, InlineKeyboardMarkup) else None
+            )
             try:
                 await self._bot.send_message(
                     self._chat_id,
-                    message,
+                    text,
                     parse_mode="HTML",
+                    reply_markup=reply_markup,
                 )
             except TelegramAPIError as exc:
                 log.warning(

@@ -28,7 +28,7 @@ from ccr.claude import (
     SessionStatus,
     StaleSessionError,
 )
-from ccr.claude.events import UnknownEvent
+from ccr.claude.events import PermissionRequest, UnknownEvent
 from ccr.config import Settings
 from ccr.db.engine import AsyncSessionMaker
 from ccr.db.models import Base, Session
@@ -360,6 +360,205 @@ async def test_first_prompt_recorded_truncated_to_500(
     assert row is not None
     assert row.first_prompt is not None
     assert len(row.first_prompt) == 500
+
+
+# --------------------------------------------------------------------------- #
+# CCR-009: permission gating.
+# --------------------------------------------------------------------------- #
+
+
+async def _wait_for_pause(
+    manager: SessionManager,
+    session_id: object,
+    timeout: float = 5.0,
+) -> None:
+    """Spin until ``manager.is_telegram_paused(session_id)`` is True."""
+    import uuid as _uuid_mod
+
+    assert isinstance(session_id, _uuid_mod.UUID)
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not manager.is_telegram_paused(session_id):
+        if asyncio.get_running_loop().time() > deadline:
+            msg = "is_telegram_paused never went True"
+            raise AssertionError(msg)
+        await asyncio.sleep(0.01)
+
+
+async def test_permission_request_pauses_telegram_and_clears_on_response(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PermissionRequest event flips ``is_telegram_paused`` True; ``send_permission`` clears it."""
+    events = [
+        {"type": "system", "subtype": "init"},
+        {
+            "type": "permission_request",
+            "request_id": "r1",
+            "tool_name": "bash",
+            "input": {"cmd": "ls"},
+            "options": ["approve", "skip", "abort"],
+        },
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    # Slow the producer so we can observe the paused state before the
+    # ResultEvent triggers session completion.
+    _set_fake_env(monkeypatch, script=script, delay_ms=200)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    session_id = await manager.new_session(prompt=None, started_by_tg_user_id=None)
+
+    await _wait_for_pause(manager, session_id)
+    assert manager.is_telegram_paused(session_id) is True
+    assert manager.is_permission_choice_valid("r1", "approve") is True
+
+    await manager.send_permission(session_id, "r1", "approve")
+    assert manager.is_telegram_paused(session_id) is False
+    assert manager.is_permission_choice_valid("r1", "approve") is False
+
+    await manager.stop()
+
+
+async def test_concurrent_permission_requests_count_correctly(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two outstanding permission_requests bump the counter; both must clear before unpause."""
+    events = [
+        {"type": "system", "subtype": "init"},
+        {
+            "type": "permission_request",
+            "request_id": "r1",
+            "tool_name": "bash",
+            "input": {"cmd": "ls"},
+            "options": ["approve", "skip"],
+        },
+        {
+            "type": "permission_request",
+            "request_id": "r2",
+            "tool_name": "bash",
+            "input": {"cmd": "rm"},
+            "options": ["approve", "abort"],
+        },
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script, delay_ms=200)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    received: list[ClaudeEvent] = []
+
+    async def consumer() -> None:
+        async for payload in bus.subscribe("session.event"):
+            assert isinstance(payload, dict)
+            received.append(payload["event"])  # type: ignore[arg-type]
+            # Stop after the second permission_request so we observe both.
+            perms = [e for e in received if isinstance(e, PermissionRequest)]
+            if len(perms) >= 2:
+                return
+
+    consumer_task = asyncio.create_task(consumer())
+    await asyncio.sleep(0)
+
+    session_id = await manager.new_session(prompt=None, started_by_tg_user_id=None)
+    await asyncio.wait_for(consumer_task, timeout=5.0)
+
+    assert manager.is_telegram_paused(session_id) is True
+    # Counter == 2 internally — we infer it by clearing one and asserting
+    # the gate stays paused.
+    await manager.send_permission(session_id, "r1", "approve")
+    assert manager.is_telegram_paused(session_id) is True
+    assert manager.is_permission_choice_valid("r1", "approve") is False
+    assert manager.is_permission_choice_valid("r2", "approve") is True
+
+    await manager.send_permission(session_id, "r2", "approve")
+    assert manager.is_telegram_paused(session_id) is False
+
+    await manager.stop()
+
+
+async def test_is_permission_choice_valid_rejects_forged_choice(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``is_permission_choice_valid`` rejects choices not in the captured options set."""
+    events = [
+        {"type": "system", "subtype": "init"},
+        {
+            "type": "permission_request",
+            "request_id": "r1",
+            "tool_name": "bash",
+            "input": {"cmd": "ls"},
+            "options": ["approve", "skip"],
+        },
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script, delay_ms=200)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    session_id = await manager.new_session(prompt=None, started_by_tg_user_id=None)
+    await _wait_for_pause(manager, session_id)
+
+    assert manager.is_permission_choice_valid("r1", "approve") is True
+    assert manager.is_permission_choice_valid("r1", "skip") is True
+    assert manager.is_permission_choice_valid("r1", "abort") is False
+    assert manager.is_permission_choice_valid("nope", "approve") is False
+
+    await manager.stop()
+
+
+async def test_session_teardown_clears_pending_permissions(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``manager.stop()`` clears all permission-gate state for the dying session."""
+    events = [
+        {"type": "system", "subtype": "init"},
+        {
+            "type": "permission_request",
+            "request_id": "r1",
+            "tool_name": "bash",
+            "input": {"cmd": "ls"},
+            "options": ["approve", "skip"],
+        },
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script, delay_ms=200)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    session_id = await manager.new_session(prompt=None, started_by_tg_user_id=None)
+    await _wait_for_pause(manager, session_id)
+    assert manager.is_telegram_paused(session_id) is True
+
+    await manager.stop()
+
+    assert manager.is_telegram_paused(session_id) is False
+    assert manager.is_permission_choice_valid("r1", "approve") is False
+    # Internal dicts are empty after teardown. We read through ``getattr``
+    # so ruff's SLF001 (private-member access) does not trip; the public
+    # accessors above already cover the user-facing observation.
+    assert getattr(manager, "_pending_permissions") == {}  # noqa: B009
+    assert getattr(manager, "_pending_options") == {}  # noqa: B009
+    assert getattr(manager, "_telegram_pause_count") == {}  # noqa: B009
+    assert getattr(manager, "_telegram_resume") == {}  # noqa: B009
 
 
 async def test_last_event_at_is_updated_with_debounce(

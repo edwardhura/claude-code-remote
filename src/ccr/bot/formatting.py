@@ -1,23 +1,28 @@
 """Convert :class:`ClaudeEvent` instances into Telegram-ready outbound messages.
 
-Public surface (kept stable for CCR-009 which will refactor
-:data:`OutboundMessage` into ``tuple[str, InlineKeyboardMarkup | None]``):
+Public surface:
 
 * :func:`chunk_text` — paragraph/sentence-aware splitter that never returns a
   chunk longer than :data:`TELEGRAM_HARD_LIMIT`.
 * :func:`event_to_messages` — pattern-match a :class:`ClaudeEvent` to zero or
-  more :data:`OutboundMessage` strings.
+  more :data:`OutboundMessage` tuples ``(text, reply_markup_or_sentinel)``.
 
 All user-supplied strings inserted into the outbound HTML are escaped with
 :func:`html.escape` so a tool name like ``"<script>"`` or a free-form text
 block cannot break Telegram's HTML parse mode (the bot is configured with
 ``parse_mode="HTML"`` by default).
+
+The second tuple slot carries either ``None`` (no keyboard), a real
+:class:`aiogram.types.InlineKeyboardMarkup`, or a :class:`_PendingKeyboard`
+sentinel that the broadcast loop materialises into a real keyboard once the
+``session_id`` from the bus payload is in scope. Keeping the formatter a pure
+function of :data:`ClaudeEvent` is what lets it be reused by the web viewer.
 """
 
 from __future__ import annotations
 
 import html
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from ccr.claude.events import (
     AssistantTurn,
@@ -33,10 +38,28 @@ from ccr.claude.events import (
 )
 
 if TYPE_CHECKING:
+    from aiogram.types import InlineKeyboardMarkup
+
     from ccr.claude.events import ClaudeEvent
 
-# CCR-009 will widen this to ``tuple[str, InlineKeyboardMarkup | None]``.
-type OutboundMessage = str
+
+class _PendingKeyboard(NamedTuple):
+    """Sentinel for a permission keyboard awaiting a ``session_id``.
+
+    The formatter does not see the ``session_id`` (the bus payload owns it);
+    the broadcast loop swaps this for a real
+    :class:`aiogram.types.InlineKeyboardMarkup` via
+    :func:`ccr.bot.keyboards.permission_kb`.
+    """
+
+    request_id: str
+    options: list[str]
+
+
+# Tuple of ``(text, reply_markup_or_sentinel)``. ``reply_markup`` is ``None``
+# for every event except :class:`PermissionRequest`, which carries a
+# :class:`_PendingKeyboard` sentinel until the broadcast loop materialises it.
+type OutboundMessage = tuple[str, "InlineKeyboardMarkup | _PendingKeyboard | None"]
 
 TELEGRAM_HARD_LIMIT = 4096
 SAFE_CHUNK = 3500
@@ -99,13 +122,13 @@ def _split_once(text: str) -> tuple[str, str]:
     return text[:SAFE_CHUNK], text[SAFE_CHUNK:]
 
 
-def _format_tool_use(block: ToolUseBlock) -> OutboundMessage:
+def _format_tool_use(block: ToolUseBlock) -> str:
     name = html.escape(block.name)
     short_args = html.escape(repr(block.input)[:_TOOL_ARG_TRUNCATE])
     return f"\U0001f527 {name} {short_args}"
 
 
-def _format_tool_result_error(block: ToolResultBlock) -> OutboundMessage | None:
+def _format_tool_result_error(block: ToolResultBlock) -> str | None:
     if not block.is_error:
         return None
     tool_use_id = html.escape(block.tool_use_id)
@@ -117,15 +140,15 @@ def _format_assistant_turn(event: AssistantTurn) -> list[OutboundMessage]:
     out: list[OutboundMessage] = []
     for block in event.message.content:
         if isinstance(block, TextBlock):
-            out.extend(html.escape(chunk) for chunk in chunk_text(block.text))
+            out.extend((html.escape(chunk), None) for chunk in chunk_text(block.text))
         elif isinstance(block, ThinkingBlock):
-            out.extend(html.escape(chunk) for chunk in chunk_text(block.thinking))
+            out.extend((html.escape(chunk), None) for chunk in chunk_text(block.thinking))
         elif isinstance(block, ToolUseBlock):
-            out.append(_format_tool_use(block))
+            out.append((_format_tool_use(block), None))
         elif isinstance(block, ToolResultBlock):
             formatted = _format_tool_result_error(block)
             if formatted is not None:
-                out.append(formatted)
+                out.append((formatted, None))
     return out
 
 
@@ -164,14 +187,27 @@ def _format_result(event: ResultEvent) -> list[OutboundMessage]:
         token_segment = _format_token_count(event.usage)
         if token_segment is not None:
             parts.append(token_segment)
-        return [" · ".join(parts)]
-    return [f"❌ failed: {html.escape(event.subtype)}"]
+        return [(" · ".join(parts), None)]
+    return [(f"❌ failed: {html.escape(event.subtype)}", None)]
+
+
+def _format_permission(event: PermissionRequest) -> OutboundMessage:
+    """Render a :class:`PermissionRequest` as a single keyboarded message.
+
+    The keyboard slot is a :class:`_PendingKeyboard` sentinel; the broadcast
+    loop materialises it via :func:`ccr.bot.keyboards.permission_kb` once the
+    ``session_id`` from the bus payload is in scope.
+    """
+    tool = html.escape(event.tool_name)
+    args = html.escape(repr(event.input)[:_TOOL_ARG_TRUNCATE])
+    text = f"\U0001f6d1 Permission requested\nTool: <code>{tool}</code>\nInput: {args}"
+    return (text, _PendingKeyboard(request_id=event.request_id, options=list(event.options)))
 
 
 def event_to_messages(event: ClaudeEvent) -> list[OutboundMessage]:
     """Render ``event`` into zero or more outbound Telegram messages.
 
-    Mapping rules (see ticket CCR-008 / plan §6):
+    Mapping rules (see ticket CCR-008 / CCR-009 / plan §6):
 
     * :class:`AssistantTurn` text/thinking blocks → chunked through
       :func:`chunk_text`.
@@ -188,14 +224,17 @@ def event_to_messages(event: ClaudeEvent) -> list[OutboundMessage]:
       ``n >= 10_000`` and ``"{n} tokens"`` otherwise; the segment is omitted
       entirely when ``usage`` is missing or zero.
     * :class:`ResultEvent` non-success → ``"❌ failed: {subtype}"``.
-    * :class:`PermissionRequest`, :class:`SystemInit`, :class:`UserTurn`,
-      :class:`UnknownEvent` → ``[]``.
+    * :class:`PermissionRequest` → one tuple ``(text, _PendingKeyboard(...))``;
+      the broadcast loop materialises the sentinel into a real keyboard.
+    * :class:`SystemInit`, :class:`UserTurn`, :class:`UnknownEvent` → ``[]``.
     """
     if isinstance(event, AssistantTurn):
         return _format_assistant_turn(event)
     if isinstance(event, ResultEvent):
         return _format_result(event)
-    if isinstance(event, (PermissionRequest, SystemInit, UserTurn, UnknownEvent)):
+    if isinstance(event, PermissionRequest):
+        return [_format_permission(event)]
+    if isinstance(event, (SystemInit, UserTurn, UnknownEvent)):
         return []
     return []
 
@@ -204,6 +243,7 @@ __all__ = [
     "SAFE_CHUNK",
     "TELEGRAM_HARD_LIMIT",
     "OutboundMessage",
+    "_PendingKeyboard",
     "chunk_text",
     "event_to_messages",
 ]

@@ -145,12 +145,12 @@ class ClaudeProcess:
              "request_id": <id>,
              "choice": <option>}
 
-        The exact wire format is to be validated end-to-end in CCR-009 (the
-        permission-handler ticket); if the upstream format diverges,
+        The exact wire format is deferred to CCR-019 (validate end-to-end
+        against a live ``claude`` session); if the upstream format diverges,
         adjust here.
 
-        TODO(CCR-009): nail down the exact permission-response wire format
-        with a real Claude Code session and update this encoder if needed.
+        TODO(CCR-019): confirm permission_response wire format end-to-end
+        against a live claude session.
         """
         payload: dict[str, Any] = {
             "type": "permission_response",

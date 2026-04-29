@@ -19,6 +19,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 from ccr.bot.handlers.pairing import router as pairing_router
+from ccr.bot.handlers.permission import router as permission_router
 from ccr.bot.handlers.session import router as session_router
 from ccr.bot.middlewares import AllowlistMiddleware
 
@@ -49,6 +50,7 @@ def build_dispatcher(
 
     dp.include_router(pairing_router)
     dp.include_router(session_router)
+    dp.include_router(permission_router)
 
     bot = Bot(
         token=settings.telegram_bot_token.get_secret_value(),
