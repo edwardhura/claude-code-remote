@@ -242,7 +242,7 @@ Notes:
 
 ---
 
-## CCR-008: Session lifecycle handlers, Telegram formatting, multi-user broadcast [todo]
+## CCR-008: Session lifecycle handlers, Telegram formatting, multi-user broadcast [done]
 Phase: 6
 Feature: chat-bot
 Files:
@@ -266,16 +266,19 @@ Files:
 Out of scope:
   - Permission inline buttons (next phase). Slash passthrough commands. `/view` / `/preview`.
 Acceptance:
-  - [ ] `pytest tests/test_bot_session.py tests/test_formatting.py tests/test_broadcast.py` passes.
-  - [ ] Formatting test asserts a 10 000-char text event becomes ≥ 3 messages, none > 4096 chars, with no mid-sentence cuts when paragraph breaks exist.
-  - [ ] Broadcast test asserts events fan out to all paired users with known chat IDs.
+  - [x] `pytest tests/test_bot_session.py tests/test_formatting.py tests/test_broadcast.py` passes.
+  - [x] Formatting test asserts a 10 000-char text event becomes ≥ 3 messages, none > 4096 chars, with no mid-sentence cuts when paragraph breaks exist.
+  - [x] Broadcast test asserts events fan out to all paired users with known chat IDs.
   - [ ] Manual smoke: `/new` then `"List the files in this project"` produces streamed output in Telegram with file names visible but no full file contents dumped.
-  - [ ] `/stop` on idle session returns `"No active session."` and exits cleanly; running it twice in a row doesn't crash.
+  - [x] `/stop` on idle session returns `"No active session."` and exits cleanly; running it twice in a row doesn't crash.
 Depends on: CCR-006, CCR-007
 Notes:
   Plan flags this with `⚠️ ordering note`: Phase 7 (CCR-007) must land before this. Inject `SessionManager` via aiogram workflow data (`dp["session_manager"] = mgr`). Chunking rule: prefer `\n\n` split, fall back to `\n`, fall back to `. `, then hard cut at 3500 chars; keep code blocks intact when small. `TELEGRAM_HARD_LIMIT = 4096`, `SAFE_CHUNK = 3500`. The broadcast task is wired in `server.serve` after Phase 7's `SessionManager`. Manual smoke checklist for the real `claude` binary belongs in README.
 
 ### Review log
+  - 2026-04-29 main: branch ccr-008-session-handlers created, dispatching team-lead
+  - 2026-04-29 team-lead: scope brief issued (no architect), dispatching python-developer
+  - 2026-04-29 team-lead: approved — 34 new tests, 161 total passed at 87.87% coverage; all automated acceptance criteria verified; F1 LOW (handle_text forwards unknown slash commands to Claude — CCR-010 closes); F2 LOW (pairing.py:59 unescaped username — pre-existing CCR-006 advisory, theoretical risk only)
 
 ---
 
@@ -538,5 +541,51 @@ Acceptance:
 Depends on: CCR-013, CCR-014, CCR-015, CCR-016
 Notes:
   Split from Phase 14: this ticket owns the sysops pieces (`install.sh`, `.gitmodules`, `README.md`) plus the final repo-wide test/lint/type pass. The python-developer doctor work is CCR-016. `install.sh` uses `set -euo pipefail` and idempotent steps. The "60 seconds" README walkthrough must use these exact commands per plan §8 Phase 14 task 4: `git clone --recurse-submodules`, `cd claude-code-remote`, `./install.sh`, edit `.env` (TELEGRAM_BOT_TOKEN, PUBLIC_URL), `python -m ccr serve`, send `/start` in Telegram, then `python -m ccr pair approve <code>` (or `python -m ccr console`). Include the "invite a friend" walkthrough verbatim from plan task 5. README author should confirm license with project owner before merging.
+
+### Review log
+
+---
+
+## CCR-018: UX polish — PID exposure, token-based result line, typing indicator [todo]
+Phase: 6 (post-CCR-008 UX polish)
+Feature: chat-bot
+Files:
+  - `src/ccr/claude/process.py` — add public `pid` property on `ClaudeProcess` returning `self._proc.pid` or `None` when not started.
+  - `src/ccr/claude/manager.py` — extend `status()` return (or add `info()`) to surface `pid`, `session_id`, and `started_at` so handlers can display them.
+  - `src/ccr/claude/events.py` — add optional `usage` field on `ResultEvent` (typed sub-model: `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`) once verified against a real `claude` JSONL stream. If `result.usage` is not emitted by the CLI, accumulate per-turn `AssistantTurn.message.usage` in `SessionManager` instead.
+  - `src/ccr/bot/formatting.py` — rewrite the `ResultEvent` rule:
+    - Drop the `$cost` segment unconditionally.
+    - Format duration in seconds: `<60s → "{s:.1f}s"`, `≥60s → "{m}m {s}s"`.
+    - When token count is available, append `· {N}k tokens` (`{N}k` if ≥10_000, raw otherwise).
+    - Final shape: `✅ done · 2.2s · 4.2k tokens` or `✅ done · 1m 5s` (when usage missing).
+  - `src/ccr/bot/handlers/session.py`:
+    - Update `cmd_new` reply to `f"Session {id8} started (pid {pid})."`.
+    - Update `cmd_clear` reply the same way.
+    - New `cmd_pid`: replies `f"Session {id8} · pid {pid} · running {uptime}"` when active; `"No active session."` when idle.
+    - Register `/pid` on the existing `session_router`.
+  - `src/ccr/bot/typing.py` — new module. Per-chat keepalive task class that calls `bot.send_chat_action(chat_id, "typing")` every 4s while the session is producing events. One task per chat, started on the first non-result event for a session, cancelled on `ResultEvent` arrival or `manager.stop()`. Same lifecycle pattern as `_ChatSender` in `server.py`.
+  - `src/ccr/server.py` — wire the typing-keepalive subscription alongside the existing broadcast loop. Cancel keepalive tasks on shutdown.
+  - `tests/test_formatting.py` — extend `ResultEvent` cases: assert no `$` in output, seconds format under and over 60s, token-count rendering when usage is present and absent.
+  - `tests/test_bot_session.py` — assert `/new` reply contains `(pid <int>)`; `/pid` returns full info on active session and the idle string otherwise.
+  - `tests/test_typing.py` — new. Assert keepalive task fires `send_chat_action` while running, refreshes within the 5s window, cancels on `ResultEvent`, never lingers past `manager.stop()`.
+Out of scope:
+  - Removing the `"Forwarded."` ack — deferred per CCR-008 review (revisit after CCR-018 ships and we see how the typing indicator feels).
+  - Subscription quota lookups (no Anthropic endpoint exposed in the stream-json schema).
+  - Cost-display env flag for API users — not requested; can be added later if asked.
+Acceptance:
+  - [ ] `/new` reply includes `(pid <N>)` and the `<N>` matches `pgrep -P $(pgrep -f "ccr serve")` while the session runs.
+  - [ ] `/pid` returns `Session <id8> · pid <N> · running <uptime>` for an active session and `No active session.` when idle.
+  - [ ] `ResultEvent` rendered output never contains a `$` character.
+  - [ ] Duration is rendered in seconds (`2.2s`) for sub-minute and `<m>m <s>s` for ≥60s; no `ms` suffix.
+  - [ ] When `usage` data is available, the result line includes a `· {N}k tokens` (or raw count) segment; when missing, the line still renders cleanly without the segment.
+  - [ ] While a session is running, every paired user with `last_chat_id` set sees the bot as "typing…" in their chat; the indicator clears within ~5s of the `ResultEvent`.
+  - [ ] `pytest tests/test_formatting.py tests/test_bot_session.py tests/test_typing.py` passes.
+  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
+Depends on: CCR-008
+Notes:
+  Pre-implementation: tail `data/logs/<latest>.jsonl | jq 'select(.type == "result")'` from a real claude session and confirm whether `usage` is emitted on the `result` event itself or only on per-turn `assistant` events. The Files: list assumes the field lands in `result`; if the CLI only emits it per-turn, the `events.py` change shrinks to nothing and the work moves into `SessionManager` (accumulate per-turn `usage` and stash it for the formatter to consume on `ResultEvent`).
+  Recommended ordering: ship CCR-018 BEFORE CCR-009. CCR-009 already extends the broadcast loop and `OutboundMessage` shape for inline keyboards; landing the typing-keepalive scaffolding first means CCR-009 picks up a stable per-chat-task pattern instead of refactoring it twice.
+  Telegram chat actions last ~5s server-side; refresh interval 4s leaves a 1s safety margin. Keepalive task should swallow `TelegramAPIError` per chat (same pattern as `_ChatSender`) so a single rate-limited chat doesn't kill the indicator for everyone else.
+  Token-count rendering rule: `f"{n//1000}k"` for `n ≥ 10_000`, `f"{n}"` otherwise. Avoid scientific notation. If both `input_tokens` and `output_tokens` are present, render the sum; if only one, render what's available with a label (`· 4.2k in / 1.1k out`) — pick the simpler "sum" form unless the per-direction data is materially more useful.
 
 ### Review log
