@@ -1,0 +1,164 @@
+"""Session lifecycle handlers — `/new`, `/stop`, `/clear`, `/who`, plain text.
+
+The :class:`SessionManager` and the DB factory are passed in via aiogram
+workflow data (``dp["session_manager"] = ...`` etc.) so handlers stay free
+of module-level singletons. Reply strings are deliberately stable — tests
+match them verbatim.
+"""
+
+from __future__ import annotations
+
+import html
+from typing import TYPE_CHECKING
+
+from aiogram import Router
+from aiogram.filters import Command
+
+from ccr.auth import pairing
+from ccr.claude.manager import (
+    NoActiveSessionError,
+    SessionError,
+)
+from ccr.claude.state import SessionStatus
+
+if TYPE_CHECKING:
+    from aiogram.types import Message
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from ccr.claude.manager import SessionManager
+
+
+router = Router(name="session")
+
+
+def _short_id(session_id: object) -> str:
+    return str(session_id)[:8]
+
+
+@router.message(Command("new"))
+async def cmd_new(
+    msg: Message,
+    session_manager: SessionManager,
+    db_factory: async_sessionmaker[AsyncSession],  # noqa: ARG001 — kept for parity with siblings
+) -> None:
+    """Start a fresh Claude session with no initial prompt."""
+    if msg.from_user is None:
+        return
+    try:
+        session_id = await session_manager.new_session(
+            prompt=None,
+            started_by_tg_user_id=msg.from_user.id,
+        )
+    except SessionError as exc:
+        await msg.answer(html.escape(str(exc)))
+        return
+    await msg.answer(f"Session {_short_id(session_id)} started.")
+
+
+@router.message(Command("stop"))
+async def cmd_stop(
+    msg: Message,
+    session_manager: SessionManager,
+) -> None:
+    """Stop the active session, or report idle when there's nothing to stop.
+
+    :meth:`SessionManager.stop` is itself idempotent (no-op on idle), so we
+    look up the status before calling so we can produce the documented
+    "No active session." reply on the idle path.
+    """
+    status = await session_manager.status()
+    if status == SessionStatus.IDLE:
+        await msg.answer("No active session.")
+        return
+    await session_manager.stop()
+    await msg.answer("Session stopped.")
+
+
+@router.message(Command("clear"))
+async def cmd_clear(
+    msg: Message,
+    session_manager: SessionManager,
+    db_factory: async_sessionmaker[AsyncSession],  # noqa: ARG001 — kept for parity with siblings
+) -> None:
+    """Stop any running session and immediately start a fresh empty one."""
+    if msg.from_user is None:
+        return
+    await session_manager.stop()
+    try:
+        session_id = await session_manager.new_session(
+            prompt=None,
+            started_by_tg_user_id=msg.from_user.id,
+        )
+    except SessionError as exc:
+        await msg.answer(html.escape(str(exc)))
+        return
+    await msg.answer(f"Session {_short_id(session_id)} started.")
+
+
+@router.message(Command("who"))
+async def cmd_who(
+    msg: Message,
+    db_factory: async_sessionmaker[AsyncSession],
+    is_paired_user: bool,  # noqa: FBT001 — aiogram passes workflow data by name, not positionally
+) -> None:
+    """Show pairing status. Owners see the full table; friends see the count + owner handle."""
+    if not is_paired_user or msg.from_user is None:
+        # Defensive — middleware already short-circuits unpaired senders.
+        return
+
+    async with db_factory() as db:
+        owner = await pairing.get_owner(db)
+        is_owner = owner is not None and owner.tg_user_id == msg.from_user.id
+
+        if is_owner:
+            users = await pairing.list_paired(db)
+            lines = ["<b>Paired users</b>"]
+            for u in users:
+                handle = f"@{html.escape(u.tg_username)}" if u.tg_username else "—"
+                role = "owner" if u.is_owner else "friend"
+                state = "revoked" if u.revoked_at is not None else "active"
+                lines.append(
+                    f"• <code>{u.tg_user_id}</code> {handle} ({role}, {state})",
+                )
+            await msg.answer("\n".join(lines))
+            return
+
+        users = await pairing.list_paired(db)
+        active = [u for u in users if u.revoked_at is None]
+        owner_handle = (
+            f"@{html.escape(owner.tg_username)}" if owner is not None and owner.tg_username else "—"
+        )
+        await msg.answer(
+            f"Paired users: {len(active)}.\nOwner: {owner_handle}",
+        )
+
+
+@router.message()
+async def handle_text(
+    msg: Message,
+    session_manager: SessionManager,
+    db_factory: async_sessionmaker[AsyncSession],  # noqa: ARG001 — kept for parity with siblings
+) -> None:
+    """Forward free-text input to the manager: starts a session if idle."""
+    if msg.from_user is None or msg.text is None:
+        return
+
+    status = await session_manager.status()
+    try:
+        if status == SessionStatus.IDLE:
+            await session_manager.new_session(
+                prompt=msg.text,
+                started_by_tg_user_id=msg.from_user.id,
+            )
+        else:
+            await session_manager.send(msg.text)
+    except NoActiveSessionError:
+        await msg.answer("No active session.")
+        return
+    except SessionError as exc:
+        await msg.answer(html.escape(str(exc)))
+        return
+    await msg.answer("Forwarded.")
+
+
+__all__ = ["router"]
