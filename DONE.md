@@ -359,3 +359,28 @@ Notes:
   - 2026-04-29 main: branch ccr-018-ux-polish created, dispatching team-lead
   - 2026-04-29 team-lead: scope brief issued (no architect), dispatching python-developer
   - 2026-04-29 team-lead: approved — 178 tests, 87.82% coverage; acceptance items 1-5, 7-8 verified by automated test suite; item 6 (typing indicator visible in real Telegram chat) is a manual smoke check, unticked — covered structurally by test_typing.py unit tests (keepalive firing, looping, cancel on ResultEvent) but cannot be exercised in the automated loop; F1 LOW advisory (_format_token_count accepts usage: object) documented, no fix required
+
+---
+
+## CCR-010: Slash-command passthrough whitelist [done]
+Phase: 9
+Feature: chat-bot
+Files:
+  - `src/ccr/bot/handlers/passthrough.py` — `WHITELIST = {"cost", "model", "compact"}`; `BLOCKED_INTERACTIVE = {"agents", "mcp", "init"}`. Handler matches commands not already claimed by other routers.
+  - `src/ccr/claude/manager.py` — add `async send_slash(self, name: str, args: str) -> None` that prepends `"/" + name + " " + args` and submits as a normal user turn (Claude Code interprets it the same as if typed in TTY).
+  - `tests/test_passthrough.py` — `/cost` calls `send_slash("cost", "")`; `/agents` is blocked with the documented message; unknown `/foo` returns the usage hint.
+Out of scope:
+  - Expanding the whitelist.
+Acceptance:
+  - [x] `pytest tests/test_passthrough.py` passes.
+  - [ ] `/cost` produces a Telegram-side cost summary in the manual smoke test.
+  - [x] `/agents` produces: `"Interactive command — run /agents in your local Claude Code terminal."`
+  - [x] `/totallyunknown` returns: `"Unknown command. Whitelisted: /new /stop /clear /view /last /preview /cost /model /compact /who."`
+Depends on: CCR-008
+Notes:
+  Three branches in the handler: whitelist (forward via `send_slash`), blocked-interactive (canned reply), unknown (usage hint). The unknown-command response lists slashes from later phases (`/view`, `/last`, `/preview`) — those land in Phase 13; the message text is fixed now to keep UX stable.
+
+### Review log
+  - 2026-04-29 main: branch ccr-010-slash-passthrough created, dispatching team-lead
+  - 2026-04-29 team-lead: scope brief issued (no architect), dispatching python-developer
+  - 2026-04-29 team-lead: approved

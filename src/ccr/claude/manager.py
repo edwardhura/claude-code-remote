@@ -246,6 +246,11 @@ class SessionManager:
             raise NoActiveSessionError(message)
         await self._proc.send_user_turn(prompt)
 
+    async def send_slash(self, name: str, args: str) -> None:
+        """Forward ``/name args`` as a user turn — Claude Code handles it as a slash command."""
+        prompt = f"/{name} {args}".rstrip()
+        await self.send(prompt)
+
     async def send_permission(
         self,
         session_id: uuid.UUID,
