@@ -12,7 +12,7 @@ import html
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.filters import Command
 
 from ccr.auth import pairing
@@ -166,13 +166,18 @@ async def cmd_who(
         )
 
 
-@router.message()
+@router.message(F.text & ~F.text.startswith("/"))
 async def handle_text(
     msg: Message,
     session_manager: SessionManager,
     db_factory: async_sessionmaker[AsyncSession],  # noqa: ARG001 — kept for parity with siblings
 ) -> None:
-    """Forward free-text input to the manager: starts a session if idle."""
+    """Forward free-text input to the manager: starts a session if idle.
+
+    Slash-prefixed messages are intentionally excluded so unhandled
+    commands fall through to the passthrough router (see CCR-010); a
+    user typing ``/cost`` should hit ``send_slash``, not ``send``.
+    """
     if msg.from_user is None or msg.text is None:
         return
 
