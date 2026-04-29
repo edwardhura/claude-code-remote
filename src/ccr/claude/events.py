@@ -118,6 +118,21 @@ class AssistantTurn(_EventBase):
     message: _AssistantMessage
 
 
+class ResultUsage(BaseModel):
+    """Token-usage stats reported alongside a :class:`ResultEvent`.
+
+    Forward-compatible: extra fields (e.g. ``server_tool_use``,
+    ``service_tier``) surface through ``model_extra`` rather than failing
+    validation.
+    """
+
+    model_config = ConfigDict(extra="allow")
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+
+
 class ResultEvent(_EventBase):
     """Final per-turn outcome event from Claude Code."""
 
@@ -125,6 +140,7 @@ class ResultEvent(_EventBase):
     subtype: Literal["success", "error_during_execution"]
     duration_ms: int | None = None
     total_cost_usd: float | None = None
+    usage: ResultUsage | None = None
 
 
 class PermissionRequest(_EventBase):
@@ -228,6 +244,7 @@ __all__ = [
     "ContentBlock",
     "PermissionRequest",
     "ResultEvent",
+    "ResultUsage",
     "SystemInit",
     "TextBlock",
     "ThinkingBlock",

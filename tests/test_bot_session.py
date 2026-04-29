@@ -8,8 +8,9 @@ exercises the dispatch logic without spinning up a real Telegram bot.
 
 from __future__ import annotations
 
+import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
@@ -25,6 +26,7 @@ from ccr.auth.pairing import approve, create_code
 from ccr.bot.handlers.session import (
     cmd_clear,
     cmd_new,
+    cmd_pid,
     cmd_stop,
     cmd_who,
     handle_text,
@@ -79,19 +81,47 @@ def _make_message(
     return msg
 
 
+_DEFAULT_SESSION_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
+
+
 class FakeManager:
     """Stub :class:`SessionManager` exposing only the surface the handlers use."""
 
-    def __init__(self, *, status: SessionStatus = SessionStatus.IDLE) -> None:
+    def __init__(
+        self,
+        *,
+        status: SessionStatus = SessionStatus.IDLE,
+        pid: int | None = 4242,
+        started_at: datetime | None = None,
+        session_id: uuid.UUID = _DEFAULT_SESSION_ID,
+    ) -> None:
         self._status = status
+        self._pid = pid
+        self._session_id = session_id
+        self._started_at = started_at if started_at is not None else datetime.now(UTC)
         self.new_session = AsyncMock()
         self.send = AsyncMock()
         self.stop = AsyncMock()
         # Default new_session returns a stable UUID.
-        self.new_session.return_value = uuid.UUID("11111111-1111-1111-1111-111111111111")
+        self.new_session.return_value = self._session_id
 
     async def status(self) -> SessionStatus:
         return self._status
+
+    async def info(self) -> dict[str, object]:
+        if self._status == SessionStatus.IDLE:
+            return {
+                "session_id": None,
+                "pid": None,
+                "started_at": None,
+                "status": SessionStatus.IDLE,
+            }
+        return {
+            "session_id": self._session_id,
+            "pid": self._pid,
+            "started_at": self._started_at,
+            "status": self._status,
+        }
 
     def set_status(self, status: SessionStatus) -> None:
         self._status = status
@@ -102,10 +132,17 @@ class FakeManager:
 # --------------------------------------------------------------------------- #
 
 
-async def test_cmd_new_starts_session_and_replies_with_short_id(
+async def test_cmd_new_starts_session_and_replies_with_short_id_and_pid(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    manager = FakeManager()
+    manager = FakeManager(pid=4242)
+
+    async def _fake_new_session(*, prompt: str | None, started_by_tg_user_id: int) -> uuid.UUID:
+        del prompt, started_by_tg_user_id
+        manager.set_status(SessionStatus.RUNNING)
+        return _DEFAULT_SESSION_ID
+
+    manager.new_session.side_effect = _fake_new_session
     msg = _make_message(text="/new", user_id=42)
 
     await cmd_new(msg, session_manager=manager, db_factory=session_factory)
@@ -113,7 +150,8 @@ async def test_cmd_new_starts_session_and_replies_with_short_id(
     manager.new_session.assert_awaited_once_with(prompt=None, started_by_tg_user_id=42)
     msg.answer.assert_awaited_once()
     reply = msg.answer.await_args.args[0]
-    assert reply == "Session 11111111 started."
+    assert reply == "Session 11111111 started (pid 4242)."
+    assert re.search(r"\(pid \d+\)", reply) is not None
 
 
 async def test_cmd_new_reports_session_error(
@@ -162,7 +200,7 @@ async def test_cmd_stop_on_running_calls_stop_and_replies() -> None:
 async def test_cmd_clear_stops_then_starts_fresh(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    manager = FakeManager(status=SessionStatus.RUNNING)
+    manager = FakeManager(status=SessionStatus.RUNNING, pid=9999)
     msg = _make_message(text="/clear", user_id=7)
 
     await cmd_clear(msg, session_manager=manager, db_factory=session_factory)
@@ -170,7 +208,53 @@ async def test_cmd_clear_stops_then_starts_fresh(
     manager.stop.assert_awaited_once_with()
     manager.new_session.assert_awaited_once_with(prompt=None, started_by_tg_user_id=7)
     msg.answer.assert_awaited_once()
-    assert "started" in msg.answer.await_args.args[0]
+    reply = msg.answer.await_args.args[0]
+    assert "started" in reply
+    assert re.search(r"\(pid \d+\)", reply) is not None
+
+
+# --------------------------------------------------------------------------- #
+# /pid
+# --------------------------------------------------------------------------- #
+
+
+async def test_cmd_pid_idle_returns_no_active_session() -> None:
+    manager = FakeManager(status=SessionStatus.IDLE)
+    msg = _make_message(text="/pid")
+
+    await cmd_pid(msg, session_manager=manager)
+
+    msg.answer.assert_awaited_once_with("No active session.")
+
+
+async def test_cmd_pid_active_returns_session_pid_and_uptime() -> None:
+    started_at = datetime.now(UTC)
+    manager = FakeManager(
+        status=SessionStatus.RUNNING,
+        pid=12345,
+        started_at=started_at,
+        session_id=uuid.UUID("abcdef01-2345-6789-abcd-ef0123456789"),
+    )
+    msg = _make_message(text="/pid")
+
+    await cmd_pid(msg, session_manager=manager)
+
+    msg.answer.assert_awaited_once()
+    reply = msg.answer.await_args.args[0]
+    assert re.match(r"^Session [0-9a-f]{8} · pid \d+ · running \d", reply) is not None
+    assert "abcdef01" in reply
+    assert "12345" in reply
+
+
+async def test_cmd_pid_active_uptime_minutes_format() -> None:
+    started_at = datetime.now(UTC) - timedelta(minutes=2, seconds=10)
+    manager = FakeManager(status=SessionStatus.RUNNING, pid=777, started_at=started_at)
+    msg = _make_message(text="/pid")
+
+    await cmd_pid(msg, session_manager=manager)
+
+    reply = msg.answer.await_args.args[0]
+    assert re.search(r"running \d+m \d+s$", reply) is not None
 
 
 # --------------------------------------------------------------------------- #

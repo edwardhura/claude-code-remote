@@ -240,6 +240,13 @@ class ClaudeProcess:
         return proc.returncode if proc.returncode is not None else -1
 
     @property
+    def pid(self) -> int | None:
+        """PID of the running subprocess, or ``None`` if not started / already stopped."""
+        if self._proc is None:
+            return None
+        return self._proc.pid
+
+    @property
     def stderr_tail(self) -> bytes:
         """Last :data:`STDERR_TAIL_BYTES` bytes of subprocess stderr."""
         return bytes(self._stderr_tail)

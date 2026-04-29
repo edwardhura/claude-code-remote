@@ -546,7 +546,7 @@ Notes:
 
 ---
 
-## CCR-018: UX polish — PID exposure, token-based result line, typing indicator [todo]
+## CCR-018: UX polish — PID exposure, token-based result line, typing indicator [done]
 Phase: 6 (post-CCR-008 UX polish)
 Feature: chat-bot
 Files:
@@ -573,19 +573,94 @@ Out of scope:
   - Subscription quota lookups (no Anthropic endpoint exposed in the stream-json schema).
   - Cost-display env flag for API users — not requested; can be added later if asked.
 Acceptance:
-  - [ ] `/new` reply includes `(pid <N>)` and the `<N>` matches `pgrep -P $(pgrep -f "ccr serve")` while the session runs.
-  - [ ] `/pid` returns `Session <id8> · pid <N> · running <uptime>` for an active session and `No active session.` when idle.
-  - [ ] `ResultEvent` rendered output never contains a `$` character.
-  - [ ] Duration is rendered in seconds (`2.2s`) for sub-minute and `<m>m <s>s` for ≥60s; no `ms` suffix.
-  - [ ] When `usage` data is available, the result line includes a `· {N}k tokens` (or raw count) segment; when missing, the line still renders cleanly without the segment.
+  - [x] `/new` reply includes `(pid <N>)` and the `<N>` matches `pgrep -P $(pgrep -f "ccr serve")` while the session runs.
+  - [x] `/pid` returns `Session <id8> · pid <N> · running <uptime>` for an active session and `No active session.` when idle.
+  - [x] `ResultEvent` rendered output never contains a `$` character.
+  - [x] Duration is rendered in seconds (`2.2s`) for sub-minute and `<m>m <s>s` for ≥60s; no `ms` suffix.
+  - [x] When `usage` data is available, the result line includes a `· {N}k tokens` (or raw count) segment; when missing, the line still renders cleanly without the segment.
   - [ ] While a session is running, every paired user with `last_chat_id` set sees the bot as "typing…" in their chat; the indicator clears within ~5s of the `ResultEvent`.
-  - [ ] `pytest tests/test_formatting.py tests/test_bot_session.py tests/test_typing.py` passes.
-  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [x] `pytest tests/test_formatting.py tests/test_bot_session.py tests/test_typing.py` passes.
+  - [x] `pytest --cov=ccr --cov-fail-under=80` passes.
 Depends on: CCR-008
 Notes:
   Pre-implementation: tail `data/logs/<latest>.jsonl | jq 'select(.type == "result")'` from a real claude session and confirm whether `usage` is emitted on the `result` event itself or only on per-turn `assistant` events. The Files: list assumes the field lands in `result`; if the CLI only emits it per-turn, the `events.py` change shrinks to nothing and the work moves into `SessionManager` (accumulate per-turn `usage` and stash it for the formatter to consume on `ResultEvent`).
   Recommended ordering: ship CCR-018 BEFORE CCR-009. CCR-009 already extends the broadcast loop and `OutboundMessage` shape for inline keyboards; landing the typing-keepalive scaffolding first means CCR-009 picks up a stable per-chat-task pattern instead of refactoring it twice.
   Telegram chat actions last ~5s server-side; refresh interval 4s leaves a 1s safety margin. Keepalive task should swallow `TelegramAPIError` per chat (same pattern as `_ChatSender`) so a single rate-limited chat doesn't kill the indicator for everyone else.
   Token-count rendering rule: `f"{n//1000}k"` for `n ≥ 10_000`, `f"{n}"` otherwise. Avoid scientific notation. If both `input_tokens` and `output_tokens` are present, render the sum; if only one, render what's available with a label (`· 4.2k in / 1.1k out`) — pick the simpler "sum" form unless the per-direction data is materially more useful.
+
+### Review log
+  - 2026-04-29 main: branch ccr-018-ux-polish created, dispatching team-lead
+  - 2026-04-29 team-lead: scope brief issued (no architect), dispatching python-developer
+  - 2026-04-29 team-lead: approved — 178 tests, 87.82% coverage; acceptance items 1-5, 7-8 verified by automated test suite; item 6 (typing indicator visible in real Telegram chat) is a manual smoke check, unticked — covered structurally by test_typing.py unit tests (keepalive firing, looping, cancel on ResultEvent) but cannot be exercised in the automated loop; F1 LOW advisory (_format_token_count accepts usage: object) documented, no fix required
+
+---
+
+## CCR-019: `/sessions` command + orphan reconciliation on startup [todo]
+Phase: 6 (post-CCR-018 UX polish)
+Feature: chat-bot
+Files:
+  - `src/ccr/bot/handlers/session.py` — new `cmd_sessions` handler registered on `session_router`. Query `SELECT id, started_at, status, started_by_tg_user_id, first_prompt, ended_at, exit_reason FROM sessions ORDER BY started_at DESC LIMIT 20`. One line per session: `<id8> · <status> · <started_at iso> · <first_prompt truncated to 60 chars or "—"> · <by @username or tg_user_id>`. HTML mode like the rest of the bot. Empty DB replies a stable fixed string (e.g. `"(no sessions)"`). Cap message body to ≤ 3500 chars (reuse chunking from `formatting.py` if needed).
+  - `src/ccr/claude/manager.py` — new `async reconcile_orphans(self) -> int` method (or equivalent helper) that updates any DB row with `status='running'` and no live in-memory session to `status='crashed'`, `exit_reason='bot restart'`, `ended_at=now()`. Returns count reconciled. Logs one structured line per row reconciled. Idempotent — second call must be a no-op.
+  - `src/ccr/server.py` — call `manager.reconcile_orphans()` once during `serve()` startup, before the dispatcher and broadcast tasks start.
+  - `tests/test_bot_session.py` — extend: `/sessions` on empty DB returns `"(no sessions)"` (or whatever stable string is picked); `/sessions` with 3 seeded rows returns 3 lines in `started_at`-desc order containing the id8 prefixes; long-prompt truncation to 60 chars; status field passed through verbatim.
+  - `tests/test_orphan_reconcile.py` (new) — seed a row with `status='running'`, instantiate a fresh `SessionManager`, call `reconcile_orphans()`, assert the row is now `status='crashed'`, `exit_reason='bot restart'`, `ended_at` populated; second call returns 0 / no-op. (PM note: test file location is the developer's call — folding into `tests/test_session_manager.py` is also acceptable.)
+Out of scope:
+  - Resuming sessions (handled in CCR-020).
+  - Deleting old sessions.
+  - Pagination beyond `LIMIT 20`.
+Acceptance:
+  - [ ] `/sessions` on a fresh DB replies with the chosen stable empty-state string (e.g. `"(no sessions)"`).
+  - [ ] After 3 seeded sessions across mixed statuses, `/sessions` reply contains all three id8 prefixes in `started_at`-desc order.
+  - [ ] After a simulated bot restart (insert a `running` row, instantiate a fresh manager, call `reconcile_orphans`, then `/sessions`), the row appears as `crashed` with `exit_reason='bot restart'`.
+  - [ ] `pytest tests/test_bot_session.py tests/test_orphan_reconcile.py` (or wherever the orphan test lives) passes.
+  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
+Depends on: CCR-018
+Notes:
+  Phase n/a in the plan — this is post-CCR-018 UX polish in the same Phase 6 cluster, same precedent as CCR-018 sitting in chat-bot despite touching `claude/manager.py`. The orphan problem: on bot crash/kill the child `claude` subprocess dies with the parent but the `Session` row stays `status='running'` forever because `_db_finalize_session` never runs. After restart, the DB lies. `/sessions` listing would surface that lie unless reconcile fixes it on startup.
+  Reply formatting: HTML escape `first_prompt` and `tg_username` before interpolation (consistent with CCR-008/CCR-018 conventions in `session.py` and `formatting.py`). The `db_factory` is already on workflow data — handler just opens a short-lived session.
+  Reconcile criteria: `Session.status == 'running' AND id != current_session_id_or_None`. On a fresh-start manager with `_proc=None`, there is no live session to exclude — the simple `WHERE status='running'` predicate is sufficient. Wrap in a single transaction; commit eagerly. Log `session_manager.orphan_reconciled` per row with `session_id`, `started_at`.
+  Recommended ordering: ship before CCR-020 so `/continue` inherits a clean DB story for "what's the most recent prior session" — without it, `/continue` would have to filter out potentially-still-running rows that aren't actually running.
+
+### Review log
+
+---
+
+## CCR-020: `/continue` command [todo]
+Phase: 6 (post-CCR-018 UX polish)
+Feature: chat-bot
+Files:
+  - `src/ccr/claude/process.py` — `ClaudeProcess.__init__` gains an optional `resume: bool | str = False` parameter. `start()` appends `--continue` (bool path) or `--resume <id>` (str path) before `--input-format` in the argv it builds.
+  - `src/ccr/claude/manager.py` — new `async continue_session(self, *, started_by_tg_user_id: int | None) -> uuid.UUID` method. Stops any current session, picks the most recent finished `Session` row (per outcome 2: pull its `claude_session_id`), spawns a new `ClaudeProcess` with the resume flag/id, inserts a fresh `Session` row (mints a new local `uuid.uuid4()`; for outcome 2, also stashes the resumed `claude_session_id` on the new row so future `/continue` chains keep working).
+  - `src/ccr/db/models.py` (outcome 2 only) — add `claude_session_id: Mapped[str | None]` to `Session`.
+  - `alembic/versions/0002_session_claude_id.py` (outcome 2 only) — new migration adding the column.
+  - `src/ccr/claude/manager.py` `_consume_events` (outcome 2 only) — when `SystemInit` arrives, extract Claude's internal session id from the event's raw payload and persist it on the current `Session` row. `SystemInit` already preserves unknown fields via `extra="allow"`; the developer confirms the field name from the probe step.
+  - `src/ccr/bot/handlers/session.py` — new `cmd_continue` handler:
+    - If a session is already running → `"Session already running. /stop first or /clear to start fresh."`
+    - If there is no prior session in the DB → `"No prior session to continue."`
+    - Otherwise call `manager.continue_session(...)` and reply `f"Session {id8} resumed (pid {pid})."` (mirrors the `(pid N)` style from CCR-018).
+  - `tests/test_session_manager.py` — extend using the fake claude script: fake reads its argv and emits a marker so the test can assert `--continue` (or `--resume <id>`) was passed through. (Outcome 2) extend to assert `claude_session_id` is captured from the `system.init` event and persisted on the row.
+  - `tests/test_bot_continue.py` (new) — `/continue` happy path; `/continue` with a running session returns the canned reply; `/continue` with no prior session returns the canned reply.
+Out of scope:
+  - Picking which prior session to continue when there are several (default: most recent; explicit `/continue <id>` is a follow-up ticket).
+  - A `/resume <id>` UI on the `/sessions` listing.
+  - JSONL-replay fallback for outcome 3 (escalate via `BLOCKED` instead).
+Acceptance:
+  - [ ] Step 0 probe outcome documented in the developer's work summary (which of `--continue` / `--resume <id>` / neither works in `-p stream-json` mode).
+  - [ ] `/continue` after a finished session shares conversation context with the prior session (manual smoke: `/new` → "remember the word banana" → `/stop` → `/continue` → "what word did I ask you to remember" should answer "banana").
+  - [ ] `/continue` with no prior session returns `"No prior session to continue."`.
+  - [ ] `/continue` while a session is running returns `"Session already running. /stop first or /clear to start fresh."`.
+  - [ ] (Outcome 2 only) `claude_session_id` column exists, populated on `system.init`, used by the next `/continue`.
+  - [ ] `pytest tests/test_bot_continue.py tests/test_session_manager.py` passes.
+  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
+Depends on: CCR-018, CCR-019
+Notes:
+  Phase n/a in the plan — post-CCR-018 UX polish in the same Phase 6 cluster, same chat-bot feature precedent as CCR-018.
+  **Step 0 probe — required before writing any code.** Confirm whether `claude -p --input-format=stream-json --output-format=stream-json --verbose --continue` (and / or `--resume <id>`) works. Three outcomes:
+    1. `--continue` works in `-p` stream-json mode → smallest path: pass the flag, fresh subprocess, Claude figures out which conversation to resume from `~/.claude/`. ~1 day.
+    2. `--resume <claude-session-id>` works but `--continue` does not → capture Claude's internal session id from the `SystemInit` event, persist on the `Session` row in a new column `claude_session_id TEXT`, add an Alembic migration, pass `--resume <id>` when continuing. ~1.5 days.
+    3. Neither works in `-p` mode → return `BLOCKED — Claude Code -p mode does not support continuation; awaiting upstream`. Do NOT build a JSONL-replay fallback (lossy, brittle; team-lead/architect should weigh in before that path is taken).
+  The developer must document which outcome they hit and which path they took in the work summary.
+  This is a load-bearing change to the SessionManager surface (a second public lifecycle method). Mode 1A note for team-lead: worth dispatching the architect first to settle the resume-flag plumbing in `ClaudeProcess` and the `claude_session_id` capture path, especially if outcome 2 is hit. Architect should be told that the probe is the developer's job, not the architect's — the architect designs *both* paths and the developer picks at implementation time.
+  CCR-019 is a hard dep so `/continue` inherits a clean orphan story: without orphan reconcile, "most recent prior session" could pick a row that says `running` but isn't. Manual smoke acceptance is documented but unticked — we cannot automate a real Claude binary in CI.
 
 ### Review log

@@ -5,10 +5,10 @@
 - src/ccr/events/bus.py — `EventBus` with WeakSet-tracked subscriber queues, snapshot-iterating publish, drop-oldest backpressure with WARN, async-generator `subscribe()` with explicit `finally` discard
 - src/ccr/claude/__init__.py — public surface re-exports for the claude subpackage
 - src/ccr/claude/state.py — `SessionStatus(StrEnum)` with five states: IDLE, RUNNING, COMPLETED, STOPPED, CRASHED
-- src/ccr/claude/events.py — Pydantic v2 schema; `ClaudeEvent` plain Union over `_KnownEvent` discriminated union + `UnknownEvent`; `parse_event()` with double-fallback; `ContentBlock` inner/outer variants (text, thinking, tool_use, tool_result)
-- src/ccr/claude/process.py — `ClaudeProcess`: idempotent `start()`/`stop()` with SIGTERM+SIGKILL grace, stderr ring buffer (8192 bytes), line-buffered async generator, `send_user_turn()` / `send_permission_response()` writers
+- src/ccr/claude/events.py — Pydantic v2 schema; `ClaudeEvent` plain Union over `_KnownEvent` discriminated union + `UnknownEvent`; `parse_event()` with double-fallback; `ContentBlock` inner/outer variants (text, thinking, tool_use, tool_result); `ResultUsage` sub-model with optional `usage` field on `ResultEvent`
+- src/ccr/claude/process.py — `ClaudeProcess`: idempotent `start()`/`stop()` with SIGTERM+SIGKILL grace, stderr ring buffer (8192 bytes), line-buffered async generator, `send_user_turn()` / `send_permission_response()` writers; public read-only `pid` property
 - src/ccr/claude/log.py — `JsonlSessionLog` with `append()`, `read_from(seq)`, `tail()` (asyncio.Event-notified); module-level `prune()` for retention-count and age-based cleanup
-- src/ccr/claude/manager.py — `SessionManager`: single asyncio lock enforcing one-session-at-a-time invariant, lifecycle FSM, log-before-publish ordering, synthetic crash event on abnormal exit; error classes `SessionError`, `NoActiveSessionError`, `StaleSessionError`
+- src/ccr/claude/manager.py — `SessionManager`: single asyncio lock enforcing one-session-at-a-time invariant, lifecycle FSM, log-before-publish ordering, synthetic crash event on abnormal exit; `info()` async method returning `{session_id, pid, started_at, status}`; error classes `SessionError`, `NoActiveSessionError`, `StaleSessionError`
 - tests/fakes/__init__.py — package marker
 - tests/fakes/fake_claude.py — env-var-driven JSONL emitter replacing the real claude binary in tests
 - tests/fakes/fake_claude — POSIX shell shim (0o755) that invokes fake_claude.py
@@ -23,3 +23,4 @@
 
 ## Change history
 - [CCR-007]: implemented EventBus, ClaudeEvent discriminated-union schema, ClaudeProcess subprocess wrapper, JsonlSessionLog JSONL logger, SessionManager single-session enforcer, and full fake-claude test harness
+- [CCR-018]: added ResultUsage sub-model + optional usage field on ResultEvent; added ClaudeProcess.pid property; added SessionManager.info() snapshot method with started_at tracking
