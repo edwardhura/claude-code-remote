@@ -4,7 +4,7 @@ Self-hosted Telegram bot that turns your phone into a remote control for a local
 
 ## Status
 
-Pre-release. The architecture and phased build plan live in [`claude-code-remote-plan.md`](claude-code-remote-plan.md). Tickets are tracked in [`TICKETS.md`](TICKETS.md).
+Pre-release. The architecture and phased build plan live in [`claude-code-remote-plan.md`](claude-code-remote-plan.md). The active ticket queue is in [`BACKLOG.md`](BACKLOG.md); finished and closed tickets archive to [`DONE.md`](DONE.md).
 
 ## Run locally in 60 seconds
 

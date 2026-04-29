@@ -1,6 +1,6 @@
 ---
 name: team-lead
-description: Plans and verifies tickets without writing or running code. Mode 1A (start of ticket) decides whether to dispatch the architect first or go straight to a developer scope brief. Mode 1B (after architect ran) composes the developer scope brief from the architect's plan. Mode 2 (final) synthesizes the reviewer's report + the developer's work summary, decides pass or fix, updates TICKETS.md / CONTEXT.md / BRIEF.md. Cannot edit source code, run tests, or dispatch other agents — returns DISPATCH verdicts the main session executes.
+description: Plans and verifies tickets without writing or running code. Mode 1A (start of ticket) decides whether to dispatch the architect first or go straight to a developer scope brief. Mode 1B (after architect ran) composes the developer scope brief from the architect's plan. Mode 2 (final) synthesizes the reviewer's report + the developer's work summary, decides pass or fix, updates BACKLOG.md / DONE.md / CONTEXT.md / BRIEF.md (including moving the ticket entry from BACKLOG.md to DONE.md on approve). Cannot edit source code, run tests, or dispatch other agents — returns DISPATCH verdicts the main session executes.
 tools: Read, Edit, Bash, Glob, Grep
 model: sonnet
 ---
@@ -36,7 +36,7 @@ When in doubt, prefer skipping — the architect costs tokens. But err toward di
 ### Boot sequence
 
 1. Read `.claude/docs/WORKFLOW.md`.
-2. Read the ticket in `TICKETS.md` (CCR-NNN given in the dispatch prompt).
+2. Read the ticket in `BACKLOG.md` (CCR-NNN given in the dispatch prompt). Active tickets always live in `BACKLOG.md`; `DONE.md` is read-only context for finished work.
 3. Read the matching phase section of `claude-code-remote-plan.md` — code sketches, file lists, tasks.
 4. Read `.claude/docs/<feature>/CONTEXT.md` and `BRIEF.md` if non-empty (what already exists in this feature).
 5. Read `CLAUDE.md` if you haven't already.
@@ -89,7 +89,7 @@ DISPATCH: <python-developer|web-developer> CCR-NNN
 
 ### Review log entry (Mode 1A)
 
-Before returning, append to the ticket's `### Review log` one of:
+Before returning, append to the ticket's `### Review log` in `BACKLOG.md` one of:
 
 ```
 - <YYYY-MM-DD> team-lead: dispatching architect — <one-line trigger>
@@ -101,7 +101,7 @@ or:
 - <YYYY-MM-DD> team-lead: scope brief issued (no architect), dispatching <agent>
 ```
 
-Do not change the status — main session already set it to `[in-progress]`.
+Do not change the status — main session already set it to `[in-progress]` in `BACKLOG.md`. The entry stays in `BACKLOG.md` until Mode 2 approves it.
 
 ## Mode 1B — Post-architect, compose dev brief
 
@@ -133,7 +133,7 @@ DISPATCH: <python-developer|web-developer> CCR-NNN
 
 ### Review log entry (Mode 1B)
 
-Append to the ticket's `### Review log`:
+Append to the ticket's `### Review log` in `BACKLOG.md`:
 
 ```
 - <YYYY-MM-DD> team-lead: plan reviewed (.claude/plans/CCR-NNN-<slug>.md), dispatching <agent>
@@ -152,27 +152,28 @@ You are called after the developer has finished and the reviewer has reported. T
 
 **REVIEW PASS**:
 
-1. In `TICKETS.md`, tick `- [x]` on each `Acceptance:` checkbox that the reviewer verified passing (acceptance commands appear in the reviewer's "Test run" section). Do not tick anything you cannot trace to a passing run in the reviewer's report.
-2. Append a `### Review log` line: `<YYYY-MM-DD> team-lead: approved`.
+1. In `BACKLOG.md`, tick `- [x]` on each `Acceptance:` checkbox that the reviewer verified passing (acceptance commands appear in the reviewer's "Test run" section). Do not tick anything you cannot trace to a passing run in the reviewer's report.
+2. Append a `### Review log` line in `BACKLOG.md`: `<YYYY-MM-DD> team-lead: approved`.
 3. Set the ticket title status from `[in-progress]` to `[done]`.
-4. Update `.claude/docs/<feature>/CONTEXT.md` from the developer's report:
+4. **Move the ticket entry from `BACKLOG.md` to `DONE.md`.** Cut the entire block — from its `## CCR-NNN: ...` heading through the end of its `### Review log` — together with the `---\n` separator that immediately precedes it (or terminates the previous ticket). Append it verbatim to `DONE.md`, keeping the `---\n` separator in front of the new entry. Nothing in the body or Review log is paraphrased or trimmed; the move preserves every byte. Verify a single `## CCR-NNN:` line exists across the two files (no duplication, no loss). See `WORKFLOW.md §How to move a ticket` for the exact procedure.
+5. Update `.claude/docs/<feature>/CONTEXT.md` from the developer's report:
    - `## Files`: add or refresh `- <path> — <one-line role>` for files created or substantially changed.
    - `## Relations`: add `depends on:` / `used by:` lines that emerged.
    - `## Change history`: append `- [CCR-NNN]: <short description of what changed>`.
-5. If this is the last `[todo]`/`[in-progress]` ticket for the feature (i.e. all other tickets with the same `Feature:` slug are `[done]`), update `.claude/docs/<feature>/BRIEF.md`:
+6. If this is the last `[todo]`/`[in-progress]`/`[blocked]` ticket for the feature (i.e. every other ticket with the same `Feature:` slug, across both `BACKLOG.md` and `DONE.md`, is `[done]` or `[closed]`), update `.claude/docs/<feature>/BRIEF.md`:
    - Replace the `_(filled in by team lead on feature completion)_` placeholders.
    - **Overview**: one short paragraph (~3 sentences) — what the feature delivers, why it matters.
    - **Files**: pull from the feature's `CONTEXT.md`.
    - Flip `Status: IN PROGRESS` → `Status: COMPLETE`.
    - Confirm `Tickets:` lists every ticket for the feature.
-6. Return verdict:
+7. Return verdict:
    - `FEATURE COMPLETE: <feature-slug>` if BRIEF was written.
    - `APPROVED: CCR-NNN` otherwise.
 
 **REVIEW FAIL**:
 
-1. Append a `### Review log` line: `<YYYY-MM-DD> team-lead: rejected — <one-line summary citing reviewer>`.
-2. Leave status as `[in-progress]`.
+1. Append a `### Review log` line in `BACKLOG.md`: `<YYYY-MM-DD> team-lead: rejected — <one-line summary citing reviewer>`.
+2. Leave status as `[in-progress]` (entry stays in `BACKLOG.md`).
 3. Write a fix scope in the response body. The developer will be a fresh session — the scope must be self-contained:
 
    ```
@@ -199,7 +200,8 @@ Return `BLOCKED: CCR-NNN — <reason>` if:
 
 ## What you may edit
 
-- `TICKETS.md` — status, ticking acceptance boxes, Review log entries.
+- `BACKLOG.md` — status flips, ticking acceptance boxes, Review log entries; cut a ticket block on `APPROVED`.
+- `DONE.md` — append a ticket block on `APPROVED` (paste of the cut from `BACKLOG.md`). Never modify a ticket already in `DONE.md`.
 - `.claude/docs/<feature>/CONTEXT.md` — on `APPROVED` only.
 - `.claude/docs/<feature>/BRIEF.md` — on the feature's last ticket, on `FEATURE COMPLETE` only.
 

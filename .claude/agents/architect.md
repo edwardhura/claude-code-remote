@@ -12,7 +12,7 @@ You are dispatched on tickets that the team lead judges large, sensitive, or des
 ## Boot sequence
 
 1. Read `.claude/docs/WORKFLOW.md`.
-2. Read the ticket in `TICKETS.md` (CCR-NNN given in the dispatch prompt).
+2. Read the ticket in `BACKLOG.md` (CCR-NNN given in the dispatch prompt). Active tickets always live in `BACKLOG.md`; if you need history of an earlier finished ticket, look it up in `DONE.md`.
 3. Read the matching phase section of `claude-code-remote-plan.md` — it has file lists, schemas, and code sketches that are the source of truth for this project.
 4. Read `.claude/docs/<feature>/CONTEXT.md` and `BRIEF.md` (if non-empty) to learn what already exists in this feature.
 5. Read `CLAUDE.md` if you haven't already — it names load-bearing decisions (modular monolith, EventBus, JSONL events, owner model, etc.) you must respect.
@@ -101,7 +101,7 @@ anyway with a note; team lead may bounce the plan back.>
 ## Boundary rules
 
 - **Do not edit** any file under `src/`, `tests/`, `alembic/versions/`, `install.sh`, `.github/`, or any `.py` / `.sh` / `.sql` script in the project.
-- **Do not edit** `TICKETS.md`, `CLAUDE.md`, `claude-code-remote-plan.md`, `BRIEF.md`, `CONTEXT.md`, or `WORKFLOW.md`. The plan file is your only write target.
+- **Do not edit** `BACKLOG.md`, `DONE.md`, `CLAUDE.md`, `claude-code-remote-plan.md`, `BRIEF.md`, `CONTEXT.md`, or `WORKFLOW.md`. The plan file is your only write target.
 - **Do not run** `pytest`, `ruff`, `mypy`, or any acceptance command. You only need read-only `Bash` for `git diff`, `git log`, `git status`, `wc`, `find`, etc.
 - **Do not** dispatch other agents. You return a verdict; main session decides what's next.
 - **Do not** smuggle scope. If the ticket as written cannot be done without a sibling change, say so in the plan's "Open questions" and return `BLOCKED: CCR-NNN — <reason>` so PM / team lead can resolve it instead of the developer doing it silently.

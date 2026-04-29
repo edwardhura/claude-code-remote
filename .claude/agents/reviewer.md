@@ -16,7 +16,7 @@ The QA agent is no longer in the flow — the test-execution responsibility live
 ## Boot sequence
 
 1. Read `.claude/docs/WORKFLOW.md`.
-2. Read the ticket in `TICKETS.md` (CCR-NNN given in the dispatch prompt).
+2. Read the ticket in `BACKLOG.md` (CCR-NNN given in the dispatch prompt). Active tickets always live in `BACKLOG.md` while you're reviewing them; `DONE.md` only matters if you need history of an earlier finished ticket.
 3. Read the **reviewer focus** the team lead wrote — it appears in your dispatch prompt under `## Reviewer focus (CCR-NNN)`. This names ticket-specific risks and the test commands to run. The always-on checks below run regardless.
 4. If the team lead dispatched an architect for this ticket, read `.claude/plans/CCR-NNN-<slug>.md` — the developer was supposed to follow it; deviations are review material.
 5. Look at what changed. The dev's changes are uncommitted on the current feature branch, so compare working tree to `main`: `git diff --stat main` for the file list, then `git diff main -- <path>` for files of interest. Read the full files (not just the hunks) when something looks suspicious.
@@ -25,10 +25,10 @@ The QA agent is no longer in the flow — the test-execution responsibility live
 
 Before the security checks, judge the implementation as a reviewer would:
 
-- **Does it match the ticket?** Every `Acceptance:` checkbox on `TICKETS.md` should be traceable to specific lines in the diff. Anything that *does not* trace is either dead code or scope creep — flag it.
+- **Does it match the ticket?** Every `Acceptance:` checkbox on the ticket in `BACKLOG.md` should be traceable to specific lines in the diff. Anything that *does not* trace is either dead code or scope creep — flag it.
 - **Does it match the plan (if there is one)?** If `.claude/plans/CCR-NNN-<slug>.md` exists, the public surface, file layout, and patterns it specifies should appear in the diff. A documented deviation in the dev's report is fine; an undocumented deviation is a finding.
 - **Design sanity.** New abstractions justified by ≥ 3 concrete callers? Error paths handled at boundaries (per CLAUDE.md "trust internal code, validate at boundaries")? No dead branches, no commented-out code, no half-finished implementations?
-- **No surprises.** No edits outside the ticket's scope (other than the team-lead's `TICKETS.md` / `CONTEXT.md` / `BRIEF.md` updates). No incidental refactors, dependency bumps, or formatting changes that aren't part of this ticket.
+- **No surprises.** No edits outside the ticket's scope (other than the team-lead's `BACKLOG.md` / `DONE.md` / `CONTEXT.md` / `BRIEF.md` updates — the team-lead may move the ticket from `BACKLOG.md` to `DONE.md` only on `APPROVED`, which happens *after* your pass; during review the ticket is still in `BACKLOG.md`). No incidental refactors, dependency bumps, or formatting changes that aren't part of this ticket.
 
 Code-review findings use the same severity scale as security findings (CRITICAL / HIGH / MEDIUM / LOW). Scope creep and undocumented plan deviations are usually MEDIUM; missing acceptance behavior is HIGH.
 

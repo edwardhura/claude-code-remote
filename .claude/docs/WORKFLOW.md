@@ -8,8 +8,8 @@ The **main session** (the top-level Claude conversation) is the orchestrator and
 
 | Agent | Writes code? | Runs code? | Primary outputs |
 |---|---|---|---|
-| `project-manager` | No | No | Tickets in `TICKETS.md`; stub `.claude/docs/<feature>/{BRIEF,CONTEXT}.md` |
-| `team-lead` | No | No | Decision: architect-first or skip; dev + reviewer scope briefs; `BRIEF.md`, `CONTEXT.md`, `TICKETS.md` updates on completion |
+| `project-manager` | No | No | Tickets appended to `BACKLOG.md`; stub `.claude/docs/<feature>/{BRIEF,CONTEXT}.md` |
+| `team-lead` | No | No | Decision: architect-first or skip; dev + reviewer scope briefs; `BRIEF.md`, `CONTEXT.md`, `BACKLOG.md`/`DONE.md` updates on completion |
 | `architect` | No (plan file only) | No | Design plan at `.claude/plans/CCR-NNN-<slug>.md`; runs only when team-lead asks |
 | `python-developer` | Yes | Yes (own tests) | Code + tests under Python backend scope (incl. install/CI/doctor) |
 | `web-developer` | Yes | Yes (own tests) | Code + tests under `src/ccr/web/` |
@@ -21,10 +21,10 @@ There is no sysops agent. Install / CI / doctor work belongs to `python-develope
 
 ```
 main session
-  1. picks next [todo] ticket
+  1. picks next [todo] ticket from BACKLOG.md
   2. checks git status; asks user if working tree is dirty
   3. creates branch ccr-NNN-<slug>
-  4. marks ticket [in-progress] in TICKETS.md
+  4. marks ticket [in-progress] in BACKLOG.md (entry stays in BACKLOG.md)
   5. dispatches team-lead (Mode 1A — architect-or-dev decision)
        └─→ team-lead returns either:
             (A) DISPATCH: architect CCR-NNN — go to step 6
@@ -40,8 +40,9 @@ main session
            runs the test suite + lint + types at the end; reports pass/fail
  10. dispatches team-lead (Mode 2 — verdict)
         - REVIEW FAIL: team-lead returns fix scope → loop to step 8 (fresh dev session)
-        - REVIEW PASS: team-lead updates TICKETS.md, CONTEXT.md, BRIEF.md (if last ticket)
-                       → returns APPROVED
+        - REVIEW PASS: team-lead flips status to [done], MOVES the ticket entry from
+                       BACKLOG.md to DONE.md, updates CONTEXT.md and BRIEF.md (if last
+                       ticket of the feature) → returns APPROVED
  11. main session **stops and waits for user approval** before the final step
  12. on user approval: main session commits, pushes, opens PR (never merges)
 ```
@@ -72,9 +73,14 @@ The architect is **optional**. Team-lead Mode 1A decides whether to dispatch it 
 
 The verdict line is parsed by the main session. Anything before it is human-readable detail the main session may quote when dispatching the next agent.
 
-## TICKETS.md
+## Ticket files: `BACKLOG.md` and `DONE.md`
 
-Single file at repo root. Append-only — never delete tickets, only update status in the title.
+Two files at repo root, both append-only:
+
+- **`BACKLOG.md`** holds active tickets in statuses `todo`, `in-progress`, `blocked`. New tickets are appended here by the project-manager.
+- **`DONE.md`** holds archived tickets in statuses `done` and `closed`. Entries arrive here by being **moved** from `BACKLOG.md` (verbatim, including the entire `### Review log`) when a ticket reaches a terminal state.
+
+Never delete a ticket. Status changes that stay in BACKLOG.md (e.g. `todo` → `in-progress`, `→ blocked`) only flip the title token. Status changes that hit a terminal state (`→ done`, `→ closed`) move the whole ticket entry, separator and all, from `BACKLOG.md` to `DONE.md`.
 
 ### Ticket schema
 
@@ -98,25 +104,47 @@ Notes:
   - <YYYY-MM-DD> <agent>: <one-line note>
 ````
 
-`<status>` is one of: `todo` `in-progress` `done` `blocked`.
+`<status>` is one of: `todo` `in-progress` `done` `blocked` `closed`.
 
-**Status goes inside `[...]` in the title** so it's grep-able as a single line:
+| Status | File | Meaning |
+|---|---|---|
+| `todo` | `BACKLOG.md` | Ready to pick up (dependencies met or pending). |
+| `in-progress` | `BACKLOG.md` | Picked up; in the architect → dev → review → fix loop. |
+| `blocked` | `BACKLOG.md` | Cannot proceed; reason in the Review log. |
+| `done` | `DONE.md` | Approved by team-lead. Acceptance criteria verified. |
+| `closed` | `DONE.md` | Abandoned, rejected, superseded, or auto-closed without acceptance verification. |
+
+**Status goes inside `[...]` in the title** so it's grep-able as a single line. Search by intent:
+
 ```
-grep -E '^## CCR-[0-9]+' TICKETS.md
+grep -E '^## CCR-[0-9]+' BACKLOG.md          # active queue
+grep -E '^## CCR-[0-9]+' DONE.md             # archive
+grep -E '^## CCR-[0-9]+' BACKLOG.md DONE.md  # everything, when looking up by id
 ```
 
 ### Status transitions
 
-- `todo` → `in-progress` — main session, when picking up the ticket
-- `in-progress` → `done` — team-lead, on `APPROVED`
-- `in-progress` → `blocked` — any agent, with a Review log entry explaining what is blocking
+- `todo` → `in-progress` — main session, when picking up the ticket. Stays in `BACKLOG.md`.
+- `in-progress` → `done` — team-lead, on `APPROVED`. **Moves entry from `BACKLOG.md` to `DONE.md`.**
+- `in-progress` → `blocked` — any agent, with a Review log entry explaining what is blocking. Stays in `BACKLOG.md`.
+- `blocked` → `todo` / `in-progress` — any agent, when the blocker resolves. Stays in `BACKLOG.md`.
+- `todo` / `in-progress` / `blocked` → `closed` — main session, on user direction (rejected, superseded, abandoned). **Moves entry from `BACKLOG.md` to `DONE.md`** with a Review log line summarizing why.
 - A ticket stays `[in-progress]` through the entire architect → dev → review → fix loop. There is no `in-review` status.
 
-### Who writes what to TICKETS.md
+### Who writes what
 
-- **Main session**: status flip on pickup; Review log line per dispatch (`<date> main: dispatched <agent> for <reason>`).
-- **Team lead**: status flip to `[done]`; ticking acceptance boxes (`- [x]`); Review log line per verdict.
-- **Architect / developers / reviewer**: do not edit `TICKETS.md`. They report in their response body; main and team-lead translate that into log entries.
+- **Main session**: status flip to `[in-progress]` on pickup (in BACKLOG.md); status flip to `[closed]` plus the move from BACKLOG.md → DONE.md when the user closes a ticket; one Review log line per dispatch (`<date> main: dispatched <agent> for <reason>`).
+- **Team lead**: status flip to `[done]`; ticking acceptance boxes (`- [x]`); Review log line per verdict; **the move from `BACKLOG.md` to `DONE.md` is part of the team-lead's REVIEW PASS step**.
+- **Architect / developers / reviewer**: do not edit `BACKLOG.md` or `DONE.md`. They report in their response body; main and team-lead translate that into log entries and file moves.
+
+### How to move a ticket from BACKLOG.md to DONE.md
+
+When emitting `APPROVED` (team-lead) or `[closed]` (main session):
+
+1. Tick acceptance boxes / append the final Review log line in the BACKLOG.md entry.
+2. Cut the entire ticket block — from its `## CCR-NNN: ...` heading through the end of its `### Review log` — including the `---\n` separator that immediately precedes it (or follows the last ticket).
+3. Append the cut block to `DONE.md`, preserving the `---\n` separator before it.
+4. Verify a single `## CCR-NNN:` line is found across both files (no duplication, no loss).
 
 ## `.claude/docs/<feature>/`
 
@@ -227,19 +255,20 @@ If the architect surfaced "Open questions for team lead" that team-lead cannot r
 When dispatched with reviewer output, team-lead either:
 
 **REVIEW PASS**:
-1. Tick `- [x]` on each verified `Acceptance:` checkbox (acceptance commands appear in the reviewer's "Test run" section).
+1. In `BACKLOG.md`, tick `- [x]` on each verified `Acceptance:` checkbox (acceptance commands appear in the reviewer's "Test run" section).
 2. Append `### Review log` line: `<YYYY-MM-DD> team-lead: approved`.
 3. Set ticket status to `[done]`.
-4. Update `.claude/docs/<feature>/CONTEXT.md` based on the developer's report:
+4. **Move the ticket entry from `BACKLOG.md` to `DONE.md`** per "How to move a ticket" above. The whole block — title, body, and full Review log — goes verbatim; nothing is dropped.
+5. Update `.claude/docs/<feature>/CONTEXT.md` based on the developer's report:
    - Add/update `## Files` entries for files created or substantially changed.
    - Add `## Relations` entries (`depends on:` / `used by:`) that emerged.
    - Append `- [CCR-NNN]: <short description>` to `## Change history`.
-5. If this was the last ticket for the feature, update `BRIEF.md` (Overview, Files, Status: COMPLETE).
-6. Return `APPROVED: CCR-NNN` (or `FEATURE COMPLETE: <feature-slug>` if BRIEF was written).
+6. If this was the last ticket for the feature, update `BRIEF.md` (Overview, Files, Status: COMPLETE).
+7. Return `APPROVED: CCR-NNN` (or `FEATURE COMPLETE: <feature-slug>` if BRIEF was written).
 
 **REVIEW FAIL**:
 1. Append `### Review log` line summarizing the rejection.
-2. Leave status as `[in-progress]`.
+2. Leave status as `[in-progress]` (entry stays in `BACKLOG.md`).
 3. Write a fix-scope section in the response body — concretely what to fix, citing reviewer findings + failing test output. The developer is fresh and will not see the previous attempt; the fix scope must be self-contained.
 4. Return `DISPATCH: <python-developer|web-developer> CCR-NNN`.
 
@@ -281,10 +310,10 @@ CCR-NNN: <ticket title>
 - <bullet: what was added or changed, mirroring the ticket Files list>
 - ...
 
-Acceptance: all <N> criteria verified by reviewer (see TICKETS.md Review log).
+Acceptance: all <N> criteria verified by reviewer (see DONE.md Review log).
 ```
 
-Include in the commit: every file the ticket scoped, the ticket's `TICKETS.md` status / Review-log update, and any `CONTEXT.md` / `BRIEF.md` updates. Do **not** include unrelated edits. If `pre-commit` or CI fails on push, fix the underlying issue and create a NEW commit — never `--amend` a published commit.
+Include in the commit: every file the ticket scoped, the ticket's `BACKLOG.md` cut and `DONE.md` paste (the move) plus the ticked acceptance boxes, and any `CONTEXT.md` / `BRIEF.md` updates. Do **not** include unrelated edits. If `pre-commit` or CI fails on push, fix the underlying issue and create a NEW commit — never `--amend` a published commit.
 
 ### PR body template
 
@@ -301,14 +330,14 @@ Include in the commit: every file the ticket scoped, the ticket's `TICKETS.md` s
 - [x] ...
 
 ## Ticket
-TICKETS.md → CCR-NNN
+DONE.md → CCR-NNN
 ```
 
 ### Steps (main session)
 
 These steps run **only after the user has explicitly approved** the publish (see "User approval gate" above).
 
-1. Stage only the files this ticket owns (plus the ticket's `TICKETS.md` / `CONTEXT.md` / `BRIEF.md` updates): `git add -A` is fine if the working tree has no unrelated noise; otherwise stage by path.
+1. Stage only the files this ticket owns (plus the ticket's `BACKLOG.md` / `DONE.md` / `CONTEXT.md` / `BRIEF.md` updates — both halves of the BACKLOG → DONE move belong in the same commit): `git add -A` is fine if the working tree has no unrelated noise; otherwise stage by path.
 2. Commit using the message format above.
 3. Push: `git push -u origin ccr-NNN-<slug>`.
 4. Open the PR: `gh pr create --base main --title "CCR-NNN: <title>" --body "<filled template>"`.
