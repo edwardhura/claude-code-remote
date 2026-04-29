@@ -44,6 +44,9 @@ SAFE_CHUNK = 3500
 _TOOL_ARG_TRUNCATE = 200
 _TOOL_ERROR_TRUNCATE = 200
 
+_ONE_MINUTE_MS = 60_000
+_TOKEN_K_THRESHOLD = 10_000
+
 
 def chunk_text(text: str) -> list[str]:
     """Split ``text`` into chunks no longer than :data:`SAFE_CHUNK` characters.
@@ -126,11 +129,42 @@ def _format_assistant_turn(event: AssistantTurn) -> list[OutboundMessage]:
     return out
 
 
+def _format_duration(duration_ms: int | None) -> str:
+    """Render ``duration_ms`` as ``"2.2s"`` or ``"1m 5s"``; ``"?"`` when missing."""
+    if duration_ms is None:
+        return "?"
+    if duration_ms < _ONE_MINUTE_MS:
+        return f"{duration_ms / 1000:.1f}s"
+    minutes = duration_ms // _ONE_MINUTE_MS
+    seconds = (duration_ms % _ONE_MINUTE_MS) // 1000
+    return f"{minutes}m {seconds}s"
+
+
+def _format_token_count(usage: object) -> str | None:
+    """Render combined input+output token count: ``"42k"`` for ≥10_000, raw otherwise.
+
+    Returns ``None`` when ``usage`` is missing so the caller can omit the
+    segment entirely.
+    """
+    if usage is None:
+        return None
+    input_tokens = getattr(usage, "input_tokens", 0)
+    output_tokens = getattr(usage, "output_tokens", 0)
+    total = int(input_tokens) + int(output_tokens)
+    if total <= 0:
+        return None
+    if total >= _TOKEN_K_THRESHOLD:
+        return f"{total // 1000}k tokens"
+    return f"{total} tokens"
+
+
 def _format_result(event: ResultEvent) -> list[OutboundMessage]:
     if event.subtype == "success":
-        duration = f"{event.duration_ms}ms" if event.duration_ms is not None else "?ms"
-        cost = f"${event.total_cost_usd:.4f}" if event.total_cost_usd is not None else "$?"
-        return [f"✅ done · {duration} · {cost}"]
+        parts: list[str] = ["✅ done", _format_duration(event.duration_ms)]
+        token_segment = _format_token_count(event.usage)
+        if token_segment is not None:
+            parts.append(token_segment)
+        return [" · ".join(parts)]
     return [f"❌ failed: {html.escape(event.subtype)}"]
 
 
@@ -147,8 +181,12 @@ def event_to_messages(event: ClaudeEvent) -> list[OutboundMessage]:
     * :class:`AssistantTurn` tool-result → only emitted when
       ``is_error=True`` (``"❌ {tool_use_id}: {content[:200]}"``).
     * :class:`ResultEvent` ``subtype="success"`` →
-      ``"✅ done · {duration_ms}ms · ${total_cost_usd:.4f}"``; missing fields
-      become ``?ms`` / ``$?``.
+      ``"✅ done · {duration} · {tokens}"``. ``duration`` is rendered as
+      ``"2.2s"`` for sub-minute and ``"1m 5s"`` for ≥60s; missing duration
+      becomes ``"?"``. ``tokens`` is the sum of ``usage.input_tokens`` and
+      ``usage.output_tokens`` rendered as ``"{n // 1000}k tokens"`` for
+      ``n >= 10_000`` and ``"{n} tokens"`` otherwise; the segment is omitted
+      entirely when ``usage`` is missing or zero.
     * :class:`ResultEvent` non-success → ``"❌ failed: {subtype}"``.
     * :class:`PermissionRequest`, :class:`SystemInit`, :class:`UserTurn`,
       :class:`UnknownEvent` → ``[]``.

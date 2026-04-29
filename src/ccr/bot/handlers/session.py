@@ -9,6 +9,7 @@ match them verbatim.
 from __future__ import annotations
 
 import html
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from aiogram import Router
@@ -30,9 +31,20 @@ if TYPE_CHECKING:
 
 router = Router(name="session")
 
+_SECONDS_PER_MINUTE = 60
+
 
 def _short_id(session_id: object) -> str:
     return str(session_id)[:8]
+
+
+def _format_uptime(started_at: datetime) -> str:
+    """Render uptime as ``"{N}s"`` for <60s and ``"{m}m {s}s"`` otherwise."""
+    delta = datetime.now(UTC) - started_at
+    total_s = max(int(delta.total_seconds()), 0)
+    if total_s >= _SECONDS_PER_MINUTE:
+        return f"{total_s // _SECONDS_PER_MINUTE}m {total_s % _SECONDS_PER_MINUTE}s"
+    return f"{total_s}s"
 
 
 @router.message(Command("new"))
@@ -52,7 +64,9 @@ async def cmd_new(
     except SessionError as exc:
         await msg.answer(html.escape(str(exc)))
         return
-    await msg.answer(f"Session {_short_id(session_id)} started.")
+    inf = await session_manager.info()
+    pid = inf.get("pid")
+    await msg.answer(f"Session {_short_id(session_id)} started (pid {pid}).")
 
 
 @router.message(Command("stop"))
@@ -92,7 +106,26 @@ async def cmd_clear(
     except SessionError as exc:
         await msg.answer(html.escape(str(exc)))
         return
-    await msg.answer(f"Session {_short_id(session_id)} started.")
+    inf = await session_manager.info()
+    pid = inf.get("pid")
+    await msg.answer(f"Session {_short_id(session_id)} started (pid {pid}).")
+
+
+@router.message(Command("pid"))
+async def cmd_pid(
+    msg: Message,
+    session_manager: SessionManager,
+) -> None:
+    """Reply with the current session id, subprocess pid, and uptime."""
+    inf = await session_manager.info()
+    if inf.get("status") == SessionStatus.IDLE or inf.get("session_id") is None:
+        await msg.answer("No active session.")
+        return
+    id8 = str(inf.get("session_id"))[:8]
+    pid = inf.get("pid")
+    started_at = inf.get("started_at")
+    uptime = _format_uptime(started_at) if isinstance(started_at, datetime) else "?"
+    await msg.answer(f"Session {id8} · pid {pid} · running {uptime}")
 
 
 @router.message(Command("who"))

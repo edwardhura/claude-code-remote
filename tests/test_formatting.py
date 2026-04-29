@@ -12,6 +12,7 @@ from ccr.claude.events import (
     AssistantTurn,
     PermissionRequest,
     ResultEvent,
+    ResultUsage,
     SystemInit,
     TextBlock,
     ThinkingBlock,
@@ -148,31 +149,124 @@ def test_tool_result_error_renders_with_id_and_truncated_content() -> None:
     assert "x" * 300 not in body
 
 
-def test_result_success_with_metrics() -> None:
+def test_result_success_sub_minute_renders_seconds_one_decimal() -> None:
     event = ResultEvent(
         type="result",
         subtype="success",
-        duration_ms=1234,
+        duration_ms=2200,
         total_cost_usd=0.0012,
     )
     out = event_to_messages(event)
     assert len(out) == 1
     msg = out[0]
     assert "✅ done" in msg
-    assert "1234ms" in msg
-    assert "$0.0012" in msg
+    assert "2.2s" in msg
+    assert "ms" not in msg
+    assert "$" not in msg
 
 
-def test_result_success_with_missing_fields_uses_placeholder() -> None:
-    event = ResultEvent(type="result", subtype="success", duration_ms=None, total_cost_usd=None)
+def test_result_success_over_minute_renders_minutes_and_seconds() -> None:
+    event = ResultEvent(
+        type="result",
+        subtype="success",
+        duration_ms=65_000,
+    )
     out = event_to_messages(event)
-    assert out == ["✅ done · ?ms · $?"]
+    assert len(out) == 1
+    msg = out[0]
+    assert "1m 5s" in msg
+    assert "ms" not in msg
+    assert "$" not in msg
 
 
-def test_result_failure_renders_subtype() -> None:
+def test_result_success_missing_duration_renders_question_mark() -> None:
+    event = ResultEvent(type="result", subtype="success", duration_ms=None)
+    out = event_to_messages(event)
+    assert out == ["✅ done · ?"]
+    assert "$" not in out[0]
+    assert "ms" not in out[0]
+
+
+def test_result_success_with_usage_under_10k_renders_raw_count() -> None:
+    event = ResultEvent(
+        type="result",
+        subtype="success",
+        duration_ms=2200,
+        usage=ResultUsage(input_tokens=3000, output_tokens=1200),
+    )
+    out = event_to_messages(event)
+    assert len(out) == 1
+    msg = out[0]
+    assert "4200 tokens" in msg
+    assert "$" not in msg
+    assert "k tokens" not in msg
+
+
+def test_result_success_with_usage_at_or_above_10k_renders_k_suffix() -> None:
+    event = ResultEvent(
+        type="result",
+        subtype="success",
+        duration_ms=2200,
+        usage=ResultUsage(input_tokens=30_000, output_tokens=12_000),
+    )
+    out = event_to_messages(event)
+    assert len(out) == 1
+    msg = out[0]
+    assert "42k tokens" in msg
+    assert "$" not in msg
+
+
+def test_result_success_no_usage_omits_token_segment() -> None:
+    event = ResultEvent(type="result", subtype="success", duration_ms=2200)
+    out = event_to_messages(event)
+    assert out == ["✅ done · 2.2s"]
+    assert "tokens" not in out[0]
+    assert "$" not in out[0]
+
+
+def test_result_success_zero_usage_omits_token_segment() -> None:
+    event = ResultEvent(
+        type="result",
+        subtype="success",
+        duration_ms=2200,
+        usage=ResultUsage(input_tokens=0, output_tokens=0),
+    )
+    out = event_to_messages(event)
+    assert out == ["✅ done · 2.2s"]
+    assert "tokens" not in out[0]
+
+
+def test_result_failure_renders_subtype_and_no_dollar_sign() -> None:
     event = ResultEvent(type="result", subtype="error_during_execution")
     out = event_to_messages(event)
     assert out == ["❌ failed: error_during_execution"]
+    assert "$" not in out[0]
+
+
+def test_result_never_contains_dollar_sign_across_inputs() -> None:
+    """Belt-and-suspenders: no ``$`` character escapes from any result rendering."""
+    cases = [
+        ResultEvent(type="result", subtype="success", duration_ms=2200, total_cost_usd=0.0012),
+        ResultEvent(type="result", subtype="success", duration_ms=65_000, total_cost_usd=1.23),
+        ResultEvent(type="result", subtype="success", duration_ms=None, total_cost_usd=None),
+        ResultEvent(
+            type="result",
+            subtype="success",
+            duration_ms=2200,
+            total_cost_usd=0.5,
+            usage=ResultUsage(input_tokens=3000, output_tokens=1200),
+        ),
+        ResultEvent(
+            type="result",
+            subtype="success",
+            duration_ms=200,
+            usage=ResultUsage(input_tokens=30_000, output_tokens=12_000),
+        ),
+        ResultEvent(type="result", subtype="error_during_execution"),
+    ]
+    for event in cases:
+        for msg in event_to_messages(event):
+            assert "$" not in msg, f"unexpected $ in {msg!r}"
 
 
 def test_permission_request_returns_empty_list() -> None:

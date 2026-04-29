@@ -21,6 +21,8 @@ from sqlalchemy import select
 
 from ccr.bot.app import run_polling
 from ccr.bot.formatting import event_to_messages
+from ccr.bot.typing import TypingKeepalive
+from ccr.claude.events import ResultEvent
 from ccr.claude.manager import SessionManager
 from ccr.db.engine import AsyncSessionMaker, create_engine_from_settings
 from ccr.db.models import PairedUser
@@ -51,16 +53,24 @@ async def serve(settings: Settings) -> None:
         _broadcast_loop(bus, broadcast_bot, db_factory),
         name="broadcast",
     )
+    typing_task = asyncio.create_task(
+        _typing_loop(bus, broadcast_bot, db_factory),
+        name="typing",
+    )
 
     try:
         await asyncio.gather(
             run_polling(settings, db_factory, session_manager=manager),
             broadcast_task,
+            typing_task,
         )
     finally:
         broadcast_task.cancel()
+        typing_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await broadcast_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await typing_task
         with contextlib.suppress(Exception):
             await broadcast_bot.session.close()
         await engine.dispose()
@@ -104,6 +114,49 @@ async def _broadcast_loop(
             sender.cancel()
         for sender in senders.values():
             await sender.wait_closed()
+
+
+async def _typing_loop(
+    bus: EventBus,
+    bot: Bot,
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Drive a per-chat ``typing…`` indicator while a session emits events.
+
+    Subscribes to ``session.event`` independently from
+    :func:`_broadcast_loop`. On every non-result event a
+    :class:`~ccr.bot.typing.TypingKeepalive` is created (or refreshed) for
+    every active paired chat; on a :class:`ResultEvent` the keepalives are
+    cancelled and disposed. Cancellation of the loop cascades to every
+    keepalive task.
+    """
+    keepalives: dict[int, TypingKeepalive] = {}
+    try:
+        async for payload in bus.subscribe("session.event"):
+            if not isinstance(payload, dict):
+                continue
+            event = payload.get("event")
+            if event is None:
+                continue
+            chat_ids = await _list_active_chat_ids(db_factory)
+            is_result = isinstance(event, ResultEvent)
+            for chat_id in chat_ids:
+                if is_result:
+                    kv = keepalives.pop(chat_id, None)
+                    if kv is not None:
+                        kv.cancel()
+                        await kv.wait_closed()
+                else:
+                    kv = keepalives.get(chat_id)
+                    if kv is None:
+                        kv = TypingKeepalive(bot=bot, chat_id=chat_id)
+                        keepalives[chat_id] = kv
+                    kv.start()
+    finally:
+        for kv in keepalives.values():
+            kv.cancel()
+        for kv in keepalives.values():
+            await kv.wait_closed()
 
 
 async def _list_active_chat_ids(

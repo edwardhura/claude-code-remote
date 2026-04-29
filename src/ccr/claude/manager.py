@@ -89,6 +89,7 @@ class SessionManager:
         self._session_lock = asyncio.Lock()
         self._proc: ClaudeProcess | None = None
         self._session_id: uuid.UUID | None = None
+        self._started_at: datetime | None = None
         self._log: JsonlSessionLog | None = None
         self._consumer_task: asyncio.Task[None] | None = None
         self._exit_task: asyncio.Task[None] | None = None
@@ -110,6 +111,27 @@ class SessionManager:
         if self._proc is None:
             return SessionStatus.IDLE
         return self._status
+
+    async def info(self) -> dict[str, object]:
+        """Return snapshot metadata for the current session.
+
+        Keys: ``session_id`` (``uuid.UUID | None``), ``pid`` (``int | None``),
+        ``started_at`` (``datetime | None``), ``status``
+        (:class:`SessionStatus`).
+        """
+        if self._proc is None:
+            return {
+                "session_id": None,
+                "pid": None,
+                "started_at": None,
+                "status": SessionStatus.IDLE,
+            }
+        return {
+            "session_id": self._session_id,
+            "pid": self._proc.pid,
+            "started_at": self._started_at,
+            "status": self._status,
+        }
 
     async def new_session(
         self,
@@ -152,6 +174,7 @@ class SessionManager:
             self._last_event_at_pending = None
 
             now = datetime.now(UTC)
+            self._started_at = now
             await self._db_insert_session(
                 session_id=session_id,
                 started_at=now,
@@ -274,6 +297,7 @@ class SessionManager:
 
         self._proc = None
         self._session_id = None
+        self._started_at = None
         self._log = None
         self._consumer_task = None
         self._exit_task = None
