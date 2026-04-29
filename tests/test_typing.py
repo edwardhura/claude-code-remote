@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from ccr import server as server_module
 from ccr.bot import typing as typing_module
 from ccr.bot.typing import TypingKeepalive
 from ccr.claude.events import AssistantTurn, ResultEvent, TextBlock
@@ -241,10 +242,25 @@ async def test_typing_loop_starts_keepalive_on_text_event(
 async def test_typing_loop_cancels_keepalive_on_result_event(
     session_factory: async_sessionmaker[AsyncSession],
     fast_sleep: None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A ``ResultEvent`` must cancel an in-flight keepalive for that chat."""
     del fast_sleep
     await _seed_user(session_factory, tg_user_id=1, last_chat_id=1001, is_owner=True)
+
+    # Spy on ``TypingKeepalive`` construction so the test can synchronize on
+    # the actual task lifecycle rather than on ``send_chat_action`` call
+    # counts. Under ``fast_sleep`` the keepalive loops thousands of times per
+    # second, so any timing-based "no new calls" assertion is racy.
+    instances: list[TypingKeepalive] = []
+    real_cls = server_module.TypingKeepalive
+
+    class _SpyKeepalive(real_cls):  # type: ignore[valid-type,misc]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            instances.append(self)
+
+    monkeypatch.setattr(server_module, "TypingKeepalive", _SpyKeepalive)
 
     bus = EventBus()
     bot = AsyncMock()
@@ -260,7 +276,14 @@ async def test_typing_loop_cancels_keepalive_on_result_event(
     )
     await _wait_for_call_count(bot.send_chat_action, 1)
 
-    # Result event must tear down the keepalive.
+    assert len(instances) == 1, "expected exactly one keepalive to be created"
+    keepalive = instances[0]
+    keepalive_task = keepalive._task  # noqa: SLF001 — test introspection
+    assert keepalive_task is not None
+
+    # Result event must tear down the keepalive. The loop awaits
+    # ``wait_closed`` synchronously, so once we await ``keepalive_task`` (with
+    # CancelledError suppressed) the cancellation has fully landed.
     await bus.publish(
         "session.event",
         {
@@ -270,13 +293,16 @@ async def test_typing_loop_cancels_keepalive_on_result_event(
         },
     )
 
-    # Give the loop a moment to act.
-    await asyncio.sleep(0.05)
-    count_after_result = bot.send_chat_action.await_count
+    with contextlib.suppress(asyncio.CancelledError):
+        await keepalive_task
+    assert keepalive_task.done()
 
-    # Wait further; no new send_chat_action calls should arrive after cancel.
-    await asyncio.sleep(0.1)
-    assert bot.send_chat_action.await_count == count_after_result
+    # One extra cooperative yield to let any inflight ``send_chat_action``
+    # await actually resolve, then the count must be stable.
+    await asyncio.sleep(0)
+    count_after_cancel = bot.send_chat_action.await_count
+    await asyncio.sleep(0)
+    assert bot.send_chat_action.await_count == count_after_cancel
 
     loop_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
