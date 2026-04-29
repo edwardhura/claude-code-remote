@@ -282,7 +282,7 @@ Notes:
 
 ---
 
-## CCR-009: Permission inline-button handling [todo]
+## CCR-009: Permission inline-button handling [done]
 Phase: 8
 Feature: chat-bot
 Files:
@@ -299,16 +299,20 @@ Files:
 Out of scope:
   - Per-session permission UI in the web viewer (post-MVP).
 Acceptance:
-  - [ ] `pytest tests/test_bot_permission.py` passes.
-  - [ ] A test asserts feeding `permission_request{options=["approve","skip","abort"]}` produces one message with three inline buttons whose `callback_data` matches the spec.
-  - [ ] A test asserts tapping `Approve` calls `send_permission_response(request_id, "approve")` exactly once and the keyboard is removed.
-  - [ ] A test asserts the edited message includes the responder's username.
-  - [ ] Buffering test: while a permission is pending, an injected `text` event is held; once responded, the buffered event is delivered before any later events.
+  - [x] `pytest tests/test_bot_permission.py` passes.
+  - [x] A test asserts feeding `permission_request{options=["approve","skip","abort"]}` produces one message with three inline buttons whose `callback_data` matches the spec.
+  - [x] A test asserts tapping `Approve` calls `send_permission_response(request_id, "approve")` exactly once and the keyboard is removed.
+  - [x] A test asserts the edited message includes the responder's username.
+  - [x] Buffering test: while a permission is pending, an injected `text` event is held; once responded, the buffered event is delivered before any later events.
 Depends on: CCR-008, CCR-007
 Notes:
   Refactor `event_to_messages` (from CCR-008) to return the new `OutboundMessage` tuple type; broadcast task in `server.py` updated to handle keyboard-bearing messages. Buttons get short labels (`Approve`, `Skip`, `Abort`) with original choice strings preserved in `callback_data`. Gating logic in `SessionManager`: when a `permission_request` is published, increment a counter; broadcast task checks `manager.is_telegram_paused(session_id)` and buffers if paused, drains when response arrives. SSE stream is NOT paused — it continues to deliver all events live.
 
 ### Review log
+  - 2026-04-29 main: branch ccr-009-permission-buttons created, dispatching team-lead
+  - 2026-04-29 team-lead: dispatching architect — buffering drain mechanism unspecified; OutboundMessage type change cascades into _ChatSender; 6-file scope
+  - 2026-04-29 team-lead: plan reviewed (.claude/plans/CCR-009-permission-buttons.md), dispatching python-developer
+  - 2026-04-29 team-lead: approved — 203 tests passed, 88.61% coverage; all 5 acceptance criteria verified by reviewer; F1 LOW pre-existing middleware issue (cb.answer() not called for unpaired callback-query senders, spinner hangs) — not introduced by CCR-009, middlewares.py out of scope; file as separate ticket
 
 ---
 
@@ -662,5 +666,38 @@ Notes:
   The developer must document which outcome they hit and which path they took in the work summary.
   This is a load-bearing change to the SessionManager surface (a second public lifecycle method). Mode 1A note for team-lead: worth dispatching the architect first to settle the resume-flag plumbing in `ClaudeProcess` and the `claude_session_id` capture path, especially if outcome 2 is hit. Architect should be told that the probe is the developer's job, not the architect's — the architect designs *both* paths and the developer picks at implementation time.
   CCR-019 is a hard dep so `/continue` inherits a clean orphan story: without orphan reconcile, "most recent prior session" could pick a row that says `running` but isn't. Manual smoke acceptance is documented but unticked — we cannot automate a real Claude binary in CI.
+
+### Review log
+
+---
+
+## CCR-021: Probe Claude `-p` permission wire format and reconcile schema [todo]
+Phase: 8 (post-CCR-009 wire-format reconciliation)
+Feature: claude-runtime
+Files:
+  - `src/ccr/claude/process.py` — fix the misattributed `TODO(CCR-019)` comment at the `send_permission_response` site (delete or repoint to CCR-021); reconcile the `send_permission_response` payload shape against the wire format observed in the Step 0 probe (currently a best-effort `{"type": "permission_response", "request_id", "choice"}` guess).
+  - `src/ccr/claude/events.py` — adjust `PermissionRequest` field names / types if the probe shows divergence (current best-effort fields: `request_id`, `tool_name`, `input`, `options`).
+  - `tests/fakes/fake_claude.py` — update permission-request fixture lines to mirror the real wire format if it differs from today's guess.
+  - `tests/test_claude_process.py` and / or `tests/test_session_manager.py` — keep schema tests in sync with whatever the probe establishes; existing CCR-009 permission-gating tests must continue to pass.
+Out of scope:
+  - Building a full `python -m ccr serve` end-to-end harness — that's separate web/wiring work.
+  - MCP `--permission-prompt-tool` integration if Claude turns out to gate permissions via that channel — escalate as a follow-up ticket rather than expand scope here.
+  - Changing the bot-side button UX or the broadcast pause/buffer logic from CCR-009 — those layers are correct and out of scope here.
+Acceptance:
+  - [ ] Step 0 probe outcome documented in the developer's work summary: which of the three outcomes was hit (a) emits matching `permission_request` → minor field renames at most; (b) emits a different shape → reconcile schema and fixtures; (c) emits nothing / handled out-of-band → return BLOCKED with notes for follow-up.
+  - [ ] The `TODO(CCR-019)` comment in `src/ccr/claude/process.py` (currently around line 152, at the `send_permission_response` site) is removed or repointed to CCR-021.
+  - [ ] If the probe shows the schema diverged: `PermissionRequest` in `events.py` and the `send_permission_response` payload in `process.py` are updated to match the observed wire format; `tests/fakes/fake_claude.py` permission fixtures are aligned; `tests/test_claude_process.py` / `tests/test_session_manager.py` still pass.
+  - [ ] If the probe hits outcome (c): ticket returns `BLOCKED — claude -p does not emit permission events on stdout; alternative mechanism (MCP / different flag / awaiting upstream) needs design`, mirroring CCR-020's outcome-3 escape hatch.
+  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
+Depends on: CCR-009
+Notes:
+  Phase n/a in the plan — this is post-CCR-009 upstream-validation work, same chat-bot/claude-runtime cluster precedent as CCR-019 / CCR-020 sitting under "post-CCR-NNN" qualifiers. Filed under `claude-runtime` because the wire format is owned there; the bot just consumes whatever schema this ticket settles on.
+  **Step 0 probe — required before writing any code.** Mirror the CCR-020 pattern: run `claude -p --input-format=stream-json --output-format=stream-json --verbose` by hand with a prompt that requires Bash or Edit permission (something like "run `ls -la`" or "edit foo.txt"), capture the actual stdout JSONL, and document what you saw. Three documented outcomes:
+    1. Emits a JSONL line with `type: "permission_request"` and the fields we guessed — minor field renames at most.
+    2. Emits a different shape (different `type` discriminator, different field names, nested under `tool_use`, etc.) — reconcile `PermissionRequest`, `send_permission_response`, and the fake-claude fixtures to match, keep CCR-009's gating tests green.
+    3. Emits nothing on stdout for permission gating (auto-denies, uses MCP `--permission-prompt-tool`, prompts on stderr, or some other channel) — return BLOCKED with notes; do NOT improvise a fallback before team-lead/architect weighs in.
+  Why this exists: CCR-009's bot-side code is correct and tested against `tests/fakes/fake_claude.py`, but the fake's permission fixture and our `PermissionRequest` / `send_permission_response` shapes are best-effort guesses against the real claude binary. The smoke gap surfaced when a user tried to trigger a real permission prompt and saw nothing reach Telegram — the inline-button plumbing has never been exercised against a real claude session.
+  The misattributed TODO at `src/ccr/claude/process.py:152` reads `TODO(CCR-019): confirm permission_response wire format end-to-end against a live claude session`; CCR-019 (line 602 in TICKETS.md) is `/sessions` command + orphan reconciliation and does not own this work. Cleaning that comment up is part of acceptance.
+  Mode 1A note for team-lead: skip the architect — small, additive, validation-driven; scope is "probe + reconcile schema if needed". If the probe hits outcome (c) the ticket exits via BLOCKED rather than expanding scope.
 
 ### Review log

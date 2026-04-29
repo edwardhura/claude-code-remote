@@ -5,6 +5,7 @@ from __future__ import annotations
 from ccr.bot.formatting import (
     SAFE_CHUNK,
     TELEGRAM_HARD_LIMIT,
+    _PendingKeyboard,
     chunk_text,
     event_to_messages,
 )
@@ -87,18 +88,18 @@ def _assistant_with(blocks: list[object]) -> AssistantTurn:
 
 def test_text_block_renders_as_plain_string() -> None:
     event = _assistant_with([TextBlock(type="text", text="hello")])
-    assert event_to_messages(event) == ["hello"]
+    assert event_to_messages(event) == [("hello", None)]
 
 
 def test_text_block_html_escaped() -> None:
     event = _assistant_with([TextBlock(type="text", text="<script>x</script>")])
     out = event_to_messages(event)
-    assert out == ["&lt;script&gt;x&lt;/script&gt;"]
+    assert out == [("&lt;script&gt;x&lt;/script&gt;", None)]
 
 
 def test_thinking_block_renders_as_plain_string() -> None:
     event = _assistant_with([ThinkingBlock(type="thinking", thinking="deep thoughts")])
-    assert event_to_messages(event) == ["deep thoughts"]
+    assert event_to_messages(event) == [("deep thoughts", None)]
 
 
 def test_tool_use_one_liner_truncates_args() -> None:
@@ -108,16 +109,17 @@ def test_tool_use_one_liner_truncates_args() -> None:
     )
     out = event_to_messages(event)
     assert len(out) == 1
-    msg = out[0]
-    assert msg.startswith("\U0001f527 read_file ")
+    text, kb = out[0]
+    assert kb is None
+    assert text.startswith("\U0001f527 read_file ")
     # The full dict (over 1000 chars when repr'd) must NOT appear in the
     # outbound message — only the first 200 repr chars (HTML-escaped, which
     # may add a few entity expansions) should make it through.
-    assert "x" * 200 not in msg  # the full data block is suppressed
+    assert "x" * 200 not in text  # the full data block is suppressed
     # The repr-of-the-input portion derives from `repr(input)[:200]`; allowing
     # for HTML entity expansion of quote characters, the args section stays
     # well under twice the truncation bound.
-    args_section = msg.split(" ", 2)[2]
+    args_section = text.split(" ", 2)[2]
     assert len(args_section) <= 400
 
 
@@ -141,9 +143,10 @@ def test_tool_result_error_renders_with_id_and_truncated_content() -> None:
     )
     out = event_to_messages(event)
     assert len(out) == 1
-    msg = out[0]
-    assert msg.startswith("❌ t1: ")
-    body = msg.removeprefix("❌ t1: ")
+    text, kb = out[0]
+    assert kb is None
+    assert text.startswith("❌ t1: ")
+    body = text.removeprefix("❌ t1: ")
     # 500 'x's would mean the full content was passed through; truncation to
     # 200 keeps the runaway content out of the outbound message.
     assert "x" * 300 not in body
@@ -158,11 +161,12 @@ def test_result_success_sub_minute_renders_seconds_one_decimal() -> None:
     )
     out = event_to_messages(event)
     assert len(out) == 1
-    msg = out[0]
-    assert "✅ done" in msg
-    assert "2.2s" in msg
-    assert "ms" not in msg
-    assert "$" not in msg
+    text, kb = out[0]
+    assert kb is None
+    assert "✅ done" in text
+    assert "2.2s" in text
+    assert "ms" not in text
+    assert "$" not in text
 
 
 def test_result_success_over_minute_renders_minutes_and_seconds() -> None:
@@ -173,18 +177,19 @@ def test_result_success_over_minute_renders_minutes_and_seconds() -> None:
     )
     out = event_to_messages(event)
     assert len(out) == 1
-    msg = out[0]
-    assert "1m 5s" in msg
-    assert "ms" not in msg
-    assert "$" not in msg
+    text, kb = out[0]
+    assert kb is None
+    assert "1m 5s" in text
+    assert "ms" not in text
+    assert "$" not in text
 
 
 def test_result_success_missing_duration_renders_question_mark() -> None:
     event = ResultEvent(type="result", subtype="success", duration_ms=None)
     out = event_to_messages(event)
-    assert out == ["✅ done · ?"]
-    assert "$" not in out[0]
-    assert "ms" not in out[0]
+    assert out == [("✅ done · ?", None)]
+    assert "$" not in out[0][0]
+    assert "ms" not in out[0][0]
 
 
 def test_result_success_with_usage_under_10k_renders_raw_count() -> None:
@@ -196,10 +201,11 @@ def test_result_success_with_usage_under_10k_renders_raw_count() -> None:
     )
     out = event_to_messages(event)
     assert len(out) == 1
-    msg = out[0]
-    assert "4200 tokens" in msg
-    assert "$" not in msg
-    assert "k tokens" not in msg
+    text, kb = out[0]
+    assert kb is None
+    assert "4200 tokens" in text
+    assert "$" not in text
+    assert "k tokens" not in text
 
 
 def test_result_success_with_usage_at_or_above_10k_renders_k_suffix() -> None:
@@ -211,17 +217,18 @@ def test_result_success_with_usage_at_or_above_10k_renders_k_suffix() -> None:
     )
     out = event_to_messages(event)
     assert len(out) == 1
-    msg = out[0]
-    assert "42k tokens" in msg
-    assert "$" not in msg
+    text, kb = out[0]
+    assert kb is None
+    assert "42k tokens" in text
+    assert "$" not in text
 
 
 def test_result_success_no_usage_omits_token_segment() -> None:
     event = ResultEvent(type="result", subtype="success", duration_ms=2200)
     out = event_to_messages(event)
-    assert out == ["✅ done · 2.2s"]
-    assert "tokens" not in out[0]
-    assert "$" not in out[0]
+    assert out == [("✅ done · 2.2s", None)]
+    assert "tokens" not in out[0][0]
+    assert "$" not in out[0][0]
 
 
 def test_result_success_zero_usage_omits_token_segment() -> None:
@@ -232,15 +239,15 @@ def test_result_success_zero_usage_omits_token_segment() -> None:
         usage=ResultUsage(input_tokens=0, output_tokens=0),
     )
     out = event_to_messages(event)
-    assert out == ["✅ done · 2.2s"]
-    assert "tokens" not in out[0]
+    assert out == [("✅ done · 2.2s", None)]
+    assert "tokens" not in out[0][0]
 
 
 def test_result_failure_renders_subtype_and_no_dollar_sign() -> None:
     event = ResultEvent(type="result", subtype="error_during_execution")
     out = event_to_messages(event)
-    assert out == ["❌ failed: error_during_execution"]
-    assert "$" not in out[0]
+    assert out == [("❌ failed: error_during_execution", None)]
+    assert "$" not in out[0][0]
 
 
 def test_result_never_contains_dollar_sign_across_inputs() -> None:
@@ -265,11 +272,12 @@ def test_result_never_contains_dollar_sign_across_inputs() -> None:
         ResultEvent(type="result", subtype="error_during_execution"),
     ]
     for event in cases:
-        for msg in event_to_messages(event):
-            assert "$" not in msg, f"unexpected $ in {msg!r}"
+        for text, _kb in event_to_messages(event):
+            assert "$" not in text, f"unexpected $ in {text!r}"
 
 
-def test_permission_request_returns_empty_list() -> None:
+def test_permission_request_returns_message_with_keyboard_sentinel() -> None:
+    """A permission_request event renders as one tuple with a sentinel keyboard."""
     event = PermissionRequest(
         type="permission_request",
         request_id="r1",
@@ -277,7 +285,33 @@ def test_permission_request_returns_empty_list() -> None:
         input={"cmd": "ls"},
         options=["approve", "skip", "abort"],
     )
-    assert event_to_messages(event) == []
+    out = event_to_messages(event)
+    assert len(out) == 1
+    text, kb = out[0]
+    assert "Permission requested" in text
+    assert "bash" in text
+    assert "ls" in text
+    assert isinstance(kb, _PendingKeyboard)
+    assert kb.request_id == "r1"
+    assert kb.options == ["approve", "skip", "abort"]
+
+
+def test_permission_request_html_escapes_tool_name_and_input() -> None:
+    """Tool name and input repr go through ``html.escape``."""
+    event = PermissionRequest(
+        type="permission_request",
+        request_id="r2",
+        tool_name="<bash>",
+        input={"cmd": "<rm -rf>"},
+        options=["approve"],
+    )
+    out = event_to_messages(event)
+    assert len(out) == 1
+    text, _kb = out[0]
+    assert "<bash>" not in text
+    assert "&lt;bash&gt;" in text
+    # repr() wraps strings in quotes; the html-escape applies to the repr.
+    assert "<rm -rf>" not in text
 
 
 def test_system_init_returns_empty_list() -> None:
@@ -296,4 +330,6 @@ def test_long_text_event_yields_multiple_chunks_under_limit() -> None:
     event = _assistant_with([TextBlock(type="text", text=long)])
     out = event_to_messages(event)
     assert len(out) >= 3
-    assert all(len(m) <= TELEGRAM_HARD_LIMIT for m in out)
+    for text, kb in out:
+        assert kb is None
+        assert len(text) <= TELEGRAM_HARD_LIMIT

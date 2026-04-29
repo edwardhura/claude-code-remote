@@ -34,6 +34,7 @@ import structlog
 from sqlalchemy import select
 
 from ccr.claude.events import (
+    PermissionRequest,
     ResultEvent,
     SystemInit,
     UnknownEvent,
@@ -101,6 +102,19 @@ class SessionManager:
         self._saw_result_success = False
         self._last_event_at_write_ts: float = 0.0
         self._last_event_at_pending: asyncio.Task[None] | None = None
+
+        # CCR-009 — permission gating. ``request_id`` is the Claude-emitted
+        # opaque id; ``session_id`` is the manager-owned UUID for the
+        # subprocess session. The dicts persist across the lifetime of the
+        # ``SessionManager`` because permission requests are scoped to a
+        # single session and are cleaned up either on response or teardown.
+        # Refcount the pause so multiple concurrent permission_request
+        # events for the same session pause once and unpause when the last
+        # response lands.
+        self._pending_permissions: dict[str, asyncio.Event] = {}
+        self._pending_options: dict[str, frozenset[str]] = {}
+        self._telegram_pause_count: dict[uuid.UUID, int] = {}
+        self._telegram_resume: dict[uuid.UUID, asyncio.Event] = {}
 
     # ------------------------------------------------------------------ #
     # Public API.
@@ -248,6 +262,67 @@ class SessionManager:
             )
             raise StaleSessionError(message)
         await self._proc.send_permission_response(request_id, choice)
+        self._clear_pending_permission(session_id, request_id)
+
+    def is_telegram_paused(self, session_id: uuid.UUID) -> bool:
+        """Return True iff at least one permission_request is outstanding for this session.
+
+        Consulted by :func:`ccr.server._broadcast_loop` to decide whether
+        to buffer non-permission events. The flag is independent of SSE —
+        SSE consumers subscribe to the same bus and ignore this gate.
+        """
+        return self._telegram_pause_count.get(session_id, 0) > 0
+
+    async def wait_for_resume(self, session_id: uuid.UUID) -> None:
+        """Block until ``session_id`` has no outstanding permission_request.
+
+        Currently unused by the broadcast loop (which polls
+        :meth:`is_telegram_paused` per event to avoid stalling
+        ``bus.subscribe`` consumption), but kept as a primitive for future
+        consumers that need an awaitable handle.
+        """
+        ev = self._telegram_resume.get(session_id)
+        if ev is None or ev.is_set():
+            return
+        await ev.wait()
+
+    def is_permission_choice_valid(self, request_id: str, choice: str) -> bool:
+        """Validate ``choice`` against the option set captured at request time.
+
+        ``callback_data`` is forgeable; the manager keeps the authoritative
+        ``options`` snapshot from the original
+        :class:`~ccr.claude.events.PermissionRequest` event. Returns False
+        for unknown ``request_id`` (already-answered or torn-down session)
+        as well as for unrecognised ``choice`` values.
+        """
+        opts = self._pending_options.get(request_id)
+        return opts is not None and choice in opts
+
+    def _clear_pending_permission(
+        self,
+        session_id: uuid.UUID,
+        request_id: str,
+    ) -> None:
+        """Drop ``request_id`` from the pending dicts and decrement the pause counter.
+
+        Idempotent — calling this for an already-cleared ``request_id`` is a
+        no-op. The per-``request_id`` event is fired on first clear so any
+        :meth:`wait_for_resume` waiter wakes; the per-``session_id`` resume
+        Event flips only when the counter hits 0 (handles concurrent
+        permission_requests for the same session).
+        """
+        self._pending_options.pop(request_id, None)
+        ev = self._pending_permissions.pop(request_id, None)
+        if ev is not None:
+            ev.set()
+        count = self._telegram_pause_count.get(session_id, 0)
+        if count <= 1:
+            self._telegram_pause_count.pop(session_id, None)
+            resume = self._telegram_resume.get(session_id)
+            if resume is not None:
+                resume.set()
+        else:
+            self._telegram_pause_count[session_id] = count - 1
 
     async def stop(self) -> None:
         """Idempotent shutdown: SIGTERM → grace → SIGKILL → STOPPED."""
@@ -272,6 +347,24 @@ class SessionManager:
             return
 
         self._stop_requested = final_status == SessionStatus.STOPPED
+
+        # CCR-009 — clear permission-gate state for the dying session before
+        # we drop the references. Wake any orphaned wait_for_resume waiters
+        # first so they unblock cleanly. Keys for OTHER sessions (currently
+        # impossible — one session at a time — but cheap to be correct) are
+        # left intact.
+        resume = self._telegram_resume.pop(session_id, None)
+        if resume is not None:
+            resume.set()
+        self._telegram_pause_count.pop(session_id, None)
+        # Drop every pending request_id we recorded; we do not track which
+        # request_id belongs to which session so we walk both dicts. In
+        # practice _pending_options and _pending_permissions only contain
+        # entries for the session being torn down (one session globally).
+        for ev in list(self._pending_permissions.values()):
+            ev.set()
+        self._pending_permissions.clear()
+        self._pending_options.clear()
 
         await proc.stop()
 
@@ -305,8 +398,16 @@ class SessionManager:
     async def _consume_events(self) -> None:
         """Drain :meth:`ClaudeProcess.events` into the log + bus.
 
-        Order: ``log.append`` → ``bus.publish`` for every event. Handles the
-        ``system.init`` signal that unblocks the first prompt send.
+        Ordering for non-permission events: ``log.append`` → ``bus.publish``.
+
+        Ordering for :class:`~ccr.claude.events.PermissionRequest` events
+        (CCR-009): ``log.append`` → permission bookkeeping (capture options,
+        bump pause counter) → ``bus.publish``. The bookkeeping runs BEFORE
+        the bus publish so any subscriber that consults
+        :meth:`is_telegram_paused` for follow-up events sees an already-set
+        gate. The PermissionRequest message itself bypasses the gate in
+        :func:`ccr.server._broadcast_loop` (it carries the keyboard the
+        user needs to tap), so the order does not stall the prompt itself.
         """
         proc = self._proc
         log_obj = self._log
@@ -317,6 +418,10 @@ class SessionManager:
         try:
             async for event in proc.events():
                 seq = await log_obj.append(event)
+
+                if isinstance(event, PermissionRequest):
+                    self._record_pending_permission(session_id, event)
+
                 await self._bus.publish(
                     "session.event",
                     {"session_id": session_id, "seq": seq, "event": event},
@@ -335,6 +440,21 @@ class SessionManager:
                 "session_manager.consumer_error",
                 session_id=str(session_id),
             )
+
+    def _record_pending_permission(
+        self,
+        session_id: uuid.UUID,
+        event: PermissionRequest,
+    ) -> None:
+        """Capture options + bump the pause counter for ``event.request_id``."""
+        self._pending_options[event.request_id] = frozenset(event.options)
+        self._pending_permissions[event.request_id] = asyncio.Event()
+        self._telegram_pause_count[session_id] = self._telegram_pause_count.get(session_id, 0) + 1
+        resume = self._telegram_resume.get(session_id)
+        if resume is None:
+            resume = asyncio.Event()
+            self._telegram_resume[session_id] = resume
+        resume.clear()
 
     def _schedule_last_event_at_update(self, session_id: uuid.UUID) -> None:
         """Debounce ``last_event_at`` writes to ≤ 1 per second, fire-and-forget."""

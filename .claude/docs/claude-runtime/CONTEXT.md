@@ -8,14 +8,14 @@
 - src/ccr/claude/events.py — Pydantic v2 schema; `ClaudeEvent` plain Union over `_KnownEvent` discriminated union + `UnknownEvent`; `parse_event()` with double-fallback; `ContentBlock` inner/outer variants (text, thinking, tool_use, tool_result); `ResultUsage` sub-model with optional `usage` field on `ResultEvent`
 - src/ccr/claude/process.py — `ClaudeProcess`: idempotent `start()`/`stop()` with SIGTERM+SIGKILL grace, stderr ring buffer (8192 bytes), line-buffered async generator, `send_user_turn()` / `send_permission_response()` writers; public read-only `pid` property
 - src/ccr/claude/log.py — `JsonlSessionLog` with `append()`, `read_from(seq)`, `tail()` (asyncio.Event-notified); module-level `prune()` for retention-count and age-based cleanup
-- src/ccr/claude/manager.py — `SessionManager`: single asyncio lock enforcing one-session-at-a-time invariant, lifecycle FSM, log-before-publish ordering, synthetic crash event on abnormal exit; `info()` async method returning `{session_id, pid, started_at, status}`; error classes `SessionError`, `NoActiveSessionError`, `StaleSessionError`
+- src/ccr/claude/manager.py — `SessionManager`: single asyncio lock enforcing one-session-at-a-time invariant, lifecycle FSM, log-before-publish ordering, synthetic crash event on abnormal exit; `info()` async method returning `{session_id, pid, started_at, status}`; gating dicts for permission flow (`_pending_permissions`, `_pending_options`, `_telegram_pause_count`, `_telegram_resume`); public accessors `is_telegram_paused`, `wait_for_resume`, `is_permission_choice_valid`; `_clear_pending_permission` and `_record_pending_permission` private helpers; `_teardown_locked` wakes orphaned resume Events and clears all gate state; error classes `SessionError`, `NoActiveSessionError`, `StaleSessionError`
 - tests/fakes/__init__.py — package marker
 - tests/fakes/fake_claude.py — env-var-driven JSONL emitter replacing the real claude binary in tests
 - tests/fakes/fake_claude — POSIX shell shim (0o755) that invokes fake_claude.py
 - tests/test_event_bus.py — 8 tests: pub/sub, slow-consumer WARN, weakref GC, topic isolation, cancel safety
 - tests/test_claude_events.py — 12 tests: variant round-trips, JSON schema non-empty, parse-error fallback, schema-drift fallback, extra=allow round-trip
 - tests/test_claude_log.py — 13 tests: sequential seq, resume, in-order read, EOF boundary, tail, concurrent tailers, cancel safety, prune (retention-count, age-based, malformed line, idempotent open, parent-dir creation, missing-dir prune)
-- tests/test_session_manager.py — 8 tests: lifecycle, crash detection, idempotent stop, new_session-while-running, send-without-session, stale send_permission, first_prompt truncation, last_event_at debounce
+- tests/test_session_manager.py — 12 tests: lifecycle, crash detection, idempotent stop, new_session-while-running, send-without-session, stale send_permission, first_prompt truncation, last_event_at debounce; plus 4 new (CCR-009): permission gating pause/clear on response, concurrent permission request counting, forged-choice rejection, teardown clears pending permissions
 
 ## Relations
 - depends on: core
@@ -24,3 +24,4 @@
 ## Change history
 - [CCR-007]: implemented EventBus, ClaudeEvent discriminated-union schema, ClaudeProcess subprocess wrapper, JsonlSessionLog JSONL logger, SessionManager single-session enforcer, and full fake-claude test harness
 - [CCR-018]: added ResultUsage sub-model + optional usage field on ResultEvent; added ClaudeProcess.pid property; added SessionManager.info() snapshot method with started_at tracking
+- [CCR-009]: added permission gating to SessionManager — four gating dicts, is_telegram_paused/wait_for_resume/is_permission_choice_valid accessors, _record_pending_permission/_clear_pending_permission helpers, teardown clears gate state and wakes orphaned resume Events; process.py TODO(CCR-009) updated to TODO(CCR-019)
