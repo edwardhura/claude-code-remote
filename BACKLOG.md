@@ -220,47 +220,6 @@ Notes:
 ### Review log
 ---
 
-## CCR-020: `/continue` command [todo]
-Phase: 6 (post-CCR-018 UX polish)
-Feature: chat-bot
-Files:
-  - `src/ccr/claude/process.py` — `ClaudeProcess.__init__` gains an optional `resume: bool | str = False` parameter. `start()` appends `--continue` (bool path) or `--resume <id>` (str path) before `--input-format` in the argv it builds.
-  - `src/ccr/claude/manager.py` — new `async continue_session(self, *, started_by_tg_user_id: int | None) -> uuid.UUID` method. Stops any current session, picks the most recent finished `Session` row (per outcome 2: pull its `claude_session_id`), spawns a new `ClaudeProcess` with the resume flag/id, inserts a fresh `Session` row (mints a new local `uuid.uuid4()`; for outcome 2, also stashes the resumed `claude_session_id` on the new row so future `/continue` chains keep working).
-  - `src/ccr/db/models.py` (outcome 2 only) — add `claude_session_id: Mapped[str | None]` to `Session`.
-  - `alembic/versions/0002_session_claude_id.py` (outcome 2 only) — new migration adding the column.
-  - `src/ccr/claude/manager.py` `_consume_events` (outcome 2 only) — when `SystemInit` arrives, extract Claude's internal session id from the event's raw payload and persist it on the current `Session` row. `SystemInit` already preserves unknown fields via `extra="allow"`; the developer confirms the field name from the probe step.
-  - `src/ccr/bot/handlers/session.py` — new `cmd_continue` handler:
-    - If a session is already running → `"Session already running. /stop first or /clear to start fresh."`
-    - If there is no prior session in the DB → `"No prior session to continue."`
-    - Otherwise call `manager.continue_session(...)` and reply `f"Session {id8} resumed (pid {pid})."` (mirrors the `(pid N)` style from CCR-018).
-  - `tests/test_session_manager.py` — extend using the fake claude script: fake reads its argv and emits a marker so the test can assert `--continue` (or `--resume <id>`) was passed through. (Outcome 2) extend to assert `claude_session_id` is captured from the `system.init` event and persisted on the row.
-  - `tests/test_bot_continue.py` (new) — `/continue` happy path; `/continue` with a running session returns the canned reply; `/continue` with no prior session returns the canned reply.
-Out of scope:
-  - Picking which prior session to continue when there are several (default: most recent; explicit `/continue <id>` is a follow-up ticket).
-  - A `/resume <id>` UI on the `/sessions` listing.
-  - JSONL-replay fallback for outcome 3 (escalate via `BLOCKED` instead).
-Acceptance:
-  - [ ] Step 0 probe outcome documented in the developer's work summary (which of `--continue` / `--resume <id>` / neither works in `-p stream-json` mode).
-  - [ ] `/continue` after a finished session shares conversation context with the prior session (manual smoke: `/new` → "remember the word banana" → `/stop` → `/continue` → "what word did I ask you to remember" should answer "banana").
-  - [ ] `/continue` with no prior session returns `"No prior session to continue."`.
-  - [ ] `/continue` while a session is running returns `"Session already running. /stop first or /clear to start fresh."`.
-  - [ ] (Outcome 2 only) `claude_session_id` column exists, populated on `system.init`, used by the next `/continue`.
-  - [ ] `pytest tests/test_bot_continue.py tests/test_session_manager.py` passes.
-  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
-Depends on: CCR-018, CCR-019
-Notes:
-  Phase n/a in the plan — post-CCR-018 UX polish in the same Phase 6 cluster, same chat-bot feature precedent as CCR-018.
-  **Step 0 probe — required before writing any code.** Confirm whether `claude -p --input-format=stream-json --output-format=stream-json --verbose --continue` (and / or `--resume <id>`) works. Three outcomes:
-    1. `--continue` works in `-p` stream-json mode → smallest path: pass the flag, fresh subprocess, Claude figures out which conversation to resume from `~/.claude/`. ~1 day.
-    2. `--resume <claude-session-id>` works but `--continue` does not → capture Claude's internal session id from the `SystemInit` event, persist on the `Session` row in a new column `claude_session_id TEXT`, add an Alembic migration, pass `--resume <id>` when continuing. ~1.5 days.
-    3. Neither works in `-p` mode → return `BLOCKED — Claude Code -p mode does not support continuation; awaiting upstream`. Do NOT build a JSONL-replay fallback (lossy, brittle; team-lead/architect should weigh in before that path is taken).
-  The developer must document which outcome they hit and which path they took in the work summary.
-  This is a load-bearing change to the SessionManager surface (a second public lifecycle method). Mode 1A note for team-lead: worth dispatching the architect first to settle the resume-flag plumbing in `ClaudeProcess` and the `claude_session_id` capture path, especially if outcome 2 is hit. Architect should be told that the probe is the developer's job, not the architect's — the architect designs *both* paths and the developer picks at implementation time.
-  CCR-019 is a hard dep so `/continue` inherits a clean orphan story: without orphan reconcile, "most recent prior session" could pick a row that says `running` but isn't. Manual smoke acceptance is documented but unticked — we cannot automate a real Claude binary in CI.
-
-### Review log
----
-
 ## CCR-021: Probe Claude `-p` permission wire format and reconcile schema [todo]
 Phase: 8 (post-CCR-009 wire-format reconciliation)
 Feature: claude-runtime

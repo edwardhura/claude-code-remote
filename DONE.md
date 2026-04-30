@@ -416,3 +416,56 @@ Notes:
   - 2026-04-30 main: branch ccr-019-sessions-orphan-reconcile created, dispatching team-lead
   - 2026-04-30 team-lead: scope brief issued (no architect), dispatching python-developer
   - 2026-04-30 team-lead: approved
+---
+
+## CCR-020: `/continue` command [done]
+Phase: 6 (post-CCR-018 UX polish)
+Feature: chat-bot
+Files:
+  - `src/ccr/claude/process.py` — `ClaudeProcess.__init__` gains an optional `resume: bool | str = False` parameter. `start()` appends `--continue` (bool path) or `--resume <id>` (str path) before `--input-format` in the argv it builds.
+  - `src/ccr/claude/manager.py` — new `async continue_session(self, *, started_by_tg_user_id: int | None, session_id_prefix: str | None = None) -> uuid.UUID` method. When `session_id_prefix is None`, picks the most recent finished `Session` row; when provided, looks up by 8-char hex prefix and resumes that session specifically. Stops any current session first, spawns a new `ClaudeProcess` with the resume flag/id, inserts a fresh `Session` row. Adds `_db_lookup_session_by_prefix(prefix: str) -> tuple[uuid.UUID | None, str | None]` helper. Adds `SessionNotFoundError` (subclass of `SessionError`) raised when a provided prefix matches no resumable row. (Outcome 2 only: also stashes resumed `claude_session_id` on the new row.)
+  - `src/ccr/db/models.py` (outcome 2 only) — add `claude_session_id: Mapped[str | None]` to `Session`.
+  - `alembic/versions/0002_session_claude_id.py` (outcome 2 only) — new migration adding the column.
+  - `src/ccr/claude/manager.py` `_consume_events` (outcome 2 only) — when `SystemInit` arrives, extract Claude's internal session id from the event's raw payload and persist it on the current `Session` row.
+  - `src/ccr/bot/handlers/session.py` — `cmd_continue` handler:
+    - Parse optional positional argument (everything after `/continue`).
+    - No argument → call `manager.continue_session(...)` to resume the most recent finished session.
+    - One argument matching `^[0-9a-f]{8}$` → call `manager.continue_session(..., session_id_prefix=arg)`.
+    - One argument NOT matching the regex → reply `"Invalid session id. Expected 8 hex characters (e.g. /continue 76581b99)."` (no manager call).
+    - Manager raised `SessionNotFoundError` → reply `f"No session found with id {prefix}."`.
+    - Other canned replies unchanged: already running → `"Session already running. /stop first or /clear to start fresh."`; no prior session (no-arg path only) → `"No prior session to continue."`; success → `f"Session {id8} resumed (pid {pid})."`.
+  - `tests/test_session_manager.py` — extend with: `--continue` is passed when no prefix; lookup-by-prefix returns the right row; lookup-by-prefix returns `None` for an unknown prefix; `continue_session(session_id_prefix=...)` raises `SessionNotFoundError` for an unknown prefix; `continue_session(session_id_prefix=...)` resumes the matched row's session (existing tests for no-arg path remain).
+  - `tests/test_bot_continue.py` (new) — `/continue` happy path; `/continue` with running session; `/continue` with no prior session; `/continue <8-hex>` happy path; `/continue <bad-format>` (e.g. `xyz`, `12345`, `12345678901`) rejected without a manager call; `/continue <unknown-8-hex>` returns the not-found canned string.
+Out of scope:
+  - A `/resume <id>` UI on the `/sessions` listing (selecting via inline buttons).
+  - Disambiguation when multiple session ids share the same 8-hex prefix (treat as not-found-or-pick-first per architect plan; collisions effectively impossible at this scale).
+  - JSONL-replay fallback for outcome 3 (escalate via `BLOCKED` instead).
+Acceptance:
+  - [x] Step 0 probe outcome documented in the developer's work summary (which of `--continue` / `--resume <id>` / neither works in `-p stream-json` mode).
+  - [ ] `/continue` after a finished session shares conversation context with the prior session (manual smoke: `/new` → "remember the word banana" → `/stop` → `/continue` → "what word did I ask you to remember" should answer "banana").
+  - [x] `/continue` with no prior session returns `"No prior session to continue."`.
+  - [x] `/continue` while a session is running returns `"Session already running. /stop first or /clear to start fresh."`.
+  - [x] `/continue <8-hex-id>` resumes the matched session (verified via test using the prefix lookup).
+  - [x] `/continue <invalid-format>` returns `"Invalid session id. Expected 8 hex characters (e.g. /continue 76581b99)."` and does not call the manager.
+  - [x] `/continue <unknown-8-hex>` returns `"No session found with id <prefix>."`.
+  - [ ] (Outcome 2 only) `claude_session_id` column exists, populated on `system.init`, used by the next `/continue`.
+  - [x] `pytest tests/test_bot_continue.py tests/test_session_manager.py` passes.
+  - [x] `pytest --cov=ccr --cov-fail-under=80` passes.
+Depends on: CCR-018, CCR-019
+Notes:
+  Phase n/a in the plan — post-CCR-018 UX polish in the same Phase 6 cluster, same chat-bot feature precedent as CCR-018.
+  **Step 0 probe — required before writing any code.** Confirm whether `claude -p --input-format=stream-json --output-format=stream-json --verbose --continue` (and / or `--resume <id>`) works. Three outcomes:
+    1. `--continue` works in `-p` stream-json mode → smallest path: pass the flag, fresh subprocess, Claude figures out which conversation to resume from `~/.claude/`. ~1 day.
+    2. `--resume <claude-session-id>` works but `--continue` does not → capture Claude's internal session id from the `SystemInit` event, persist on the `Session` row in a new column `claude_session_id TEXT`, add an Alembic migration, pass `--resume <id>` when continuing. ~1.5 days.
+    3. Neither works in `-p` mode → return `BLOCKED — Claude Code -p mode does not support continuation; awaiting upstream`. Do NOT build a JSONL-replay fallback.
+  Probe was run in the first dispatch (Outcome 1 — `--continue` works in `-p` stream-json mode). The optional-id scope was added by the user mid-flight; the prefix-lookup path uses the local-DB row id (Session.id.hex prefix), NOT Claude's internal session id, so it works under Outcome 1 (no `claude_session_id` column needed) and is naturally compatible with Outcome 2 should it ever be re-probed.
+  The 8-char hex format mirrors the `_short_id()` helper already used for display in CCR-018's permission/session reply lines — users will see the id, paste it back, and the regex-validate path catches typos before any DB lookup.
+  CCR-019 is a hard dep so `/continue` inherits a clean orphan story.
+
+### Review log
+  - 2026-04-30 main: branch ccr-020-continue-command created, dispatching team-lead
+  - 2026-04-30 team-lead: dispatching architect — dual-path (--continue / --resume) design with conditional DB migration and _consume_events ordering are load-bearing calls the developer must not re-litigate during implementation
+  - 2026-04-30 team-lead: plan reviewed (.claude/plans/CCR-020-continue-command.md), dispatching python-developer
+  - 2026-04-30 team-lead: approved
+  - 2026-05-01 main: scope extended (optional 8-hex session-id argument) before publish; ticket reopened from DONE.md, dispatching python-developer with fix scope
+  - 2026-05-01 team-lead: re-approved (extension verified)

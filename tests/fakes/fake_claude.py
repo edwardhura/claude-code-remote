@@ -15,6 +15,9 @@ Env directives:
   crash). When set, the exit code is ``139`` unless overridden by
   ``FAKE_CLAUDE_EXIT_CODE``.
 * ``FAKE_CLAUDE_STDERR`` — text written to stderr before exit.
+* ``FAKE_CLAUDE_ARGV_FILE`` — path to write ``sys.argv`` (one token per
+  line) to on startup, before reading any input. Lets tests assert which
+  flags the wrapper passed (e.g. ``--continue`` / ``--resume <id>``).
 
 Run via ``python -m tests.fakes.fake_claude`` or the ``tests/fakes/fake_claude``
 shell shim.
@@ -39,6 +42,10 @@ def _env_int(name: str, default: int) -> int:
 
 
 def main() -> int:
+    argv_file = os.environ.get("FAKE_CLAUDE_ARGV_FILE")
+    if argv_file:
+        Path(argv_file).write_text("\n".join(sys.argv) + "\n", encoding="utf-8")
+
     script_path = os.environ.get("FAKE_CLAUDE_SCRIPT", "")
     delay_ms = _env_int("FAKE_CLAUDE_DELAY_MS", 0)
     abort_after_raw = os.environ.get("FAKE_CLAUDE_ABORT_AFTER")

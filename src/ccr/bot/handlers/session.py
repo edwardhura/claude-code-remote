@@ -9,6 +9,7 @@ match them verbatim.
 from __future__ import annotations
 
 import html
+import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -20,7 +21,10 @@ from ccr.auth import pairing
 from ccr.bot.formatting import chunk_text
 from ccr.claude.manager import (
     NoActiveSessionError,
+    NoPriorSessionError,
+    SessionAlreadyRunningError,
     SessionError,
+    SessionNotFoundError,
 )
 from ccr.claude.state import SessionStatus
 from ccr.db.models import Session
@@ -38,6 +42,10 @@ _SECONDS_PER_MINUTE = 60
 _SESSIONS_LIMIT = 20
 _FIRST_PROMPT_DISPLAY_TRUNCATE = 60
 _EMPTY_SESSIONS_REPLY = "(no sessions)"
+_HEX8_RE = re.compile(r"^[0-9a-f]{8}$")
+_INVALID_CONTINUE_ARG_REPLY = (
+    "Invalid session id. Expected 8 hex characters (e.g. /continue 76581b99)."
+)
 
 
 def _short_id(session_id: object) -> str:
@@ -92,6 +100,51 @@ async def cmd_stop(
         return
     await session_manager.stop()
     await msg.answer("Session stopped.")
+
+
+@router.message(Command("continue"))
+async def cmd_continue(
+    msg: Message,
+    session_manager: SessionManager,
+    db_factory: async_sessionmaker[AsyncSession],  # noqa: ARG001 — kept for parity with siblings
+) -> None:
+    """Resume a finished Claude session — most recent, or one matched by 8-hex prefix."""
+    if msg.from_user is None:
+        return
+
+    raw = msg.text or ""
+    args = raw.removeprefix("/continue").strip()
+    session_id_prefix: str | None
+    if args == "":
+        session_id_prefix = None
+    elif _HEX8_RE.match(args):
+        session_id_prefix = args
+    else:
+        await msg.answer(_INVALID_CONTINUE_ARG_REPLY)
+        return
+
+    try:
+        session_id = await session_manager.continue_session(
+            started_by_tg_user_id=msg.from_user.id,
+            session_id_prefix=session_id_prefix,
+        )
+    except SessionAlreadyRunningError as exc:
+        # Fixed canned string from the exception — passed verbatim, no escape.
+        await msg.answer(str(exc))
+        return
+    except NoPriorSessionError as exc:
+        await msg.answer(str(exc))
+        return
+    except SessionNotFoundError as exc:
+        # Message embeds only the validated 8-hex prefix — no HTML escape needed.
+        await msg.answer(str(exc))
+        return
+    except SessionError as exc:
+        await msg.answer(html.escape(str(exc)))
+        return
+    inf = await session_manager.info()
+    pid = inf.get("pid")
+    await msg.answer(f"Session {_short_id(session_id)} resumed (pid {pid}).")
 
 
 @router.message(Command("clear"))
@@ -247,4 +300,4 @@ async def handle_text(
     await msg.answer("Forwarded.")
 
 
-__all__ = ["cmd_sessions", "router"]
+__all__ = ["cmd_continue", "cmd_sessions", "router"]

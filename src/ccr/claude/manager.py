@@ -72,6 +72,30 @@ class StaleSessionError(SessionError):
     """Raised when a permission response targets a session that is no longer current."""
 
 
+class SessionAlreadyRunningError(SessionError):
+    """Raised when :meth:`SessionManager.continue_session` is called while a session is running."""
+
+
+class NoPriorSessionError(SessionError):
+    """Raised when :meth:`SessionManager.continue_session` finds no eligible prior session."""
+
+
+class SessionNotFoundError(SessionError):
+    """Raised when ``continue_session`` is given a prefix that matches no resumable row."""
+
+
+# Status set defining "finished and resumable". ``crashed`` is deliberately
+# excluded — a crashed session may have left Claude's local conversation
+# cache in a partial state and resuming is unsafe. ``running`` is excluded
+# by definition (CCR-019 reconciliation guarantees ``status='running'`` rows
+# reflect a live process at startup, and ``continue_session`` already
+# refuses to act if a process is currently held).
+_RESUMABLE_STATUSES: tuple[str, ...] = (
+    SessionStatus.COMPLETED.value,
+    SessionStatus.STOPPED.value,
+)
+
+
 class SessionManager:
     """Owns the global Claude subprocess and its companion log + bus."""
 
@@ -236,6 +260,102 @@ class SessionManager:
                             session_id=str(session_id),
                             error=str(exc),
                         )
+
+            return session_id
+
+    async def continue_session(
+        self,
+        *,
+        started_by_tg_user_id: int | None,
+        session_id_prefix: str | None = None,
+    ) -> uuid.UUID:
+        """Resume a finished session. Returns the new ``Session.id``.
+
+        With no ``session_id_prefix``, the most recent finished session is
+        chosen. With a prefix, the matching row from the resumable set is
+        chosen (most recent on the vanishingly rare 8-hex collision).
+
+        Refuses to silently replace a running session — caller must
+        ``/stop`` or ``/clear`` first. Mints a fresh local UUID and inserts
+        a new :class:`Session` row; spawns a fresh :class:`ClaudeProcess`
+        with ``--continue`` so Claude Code restores conversation context
+        from its own local cache.
+
+        Raises:
+            SessionAlreadyRunningError: a session is currently running.
+            NoPriorSessionError: no completed/stopped row exists in the DB
+                (no-arg path only).
+            SessionNotFoundError: a ``session_id_prefix`` was given but no
+                resumable row's first 8 hex chars match.
+            SessionError: ``claude_bin`` is missing or the subprocess
+                otherwise fails to start (mirrors :meth:`new_session`).
+        """
+        async with self._session_lock:
+            if self._proc is not None:
+                message = "Session already running. /stop first or /clear to start fresh."
+                raise SessionAlreadyRunningError(message)
+
+            if session_id_prefix is None:
+                prior_id, _prior_claude_id = await self._db_lookup_most_recent_finished()
+                if prior_id is None:
+                    message = "No prior session to continue."
+                    raise NoPriorSessionError(message)
+            else:
+                prior_id, _prior_claude_id = await self._db_lookup_session_by_prefix(
+                    session_id_prefix,
+                )
+                if prior_id is None:
+                    message = f"No session found with id {session_id_prefix}."
+                    raise SessionNotFoundError(message)
+
+            session_id = uuid.uuid4()
+            log_path = self._logs_dir / f"{session_id}.jsonl"
+            session_log = JsonlSessionLog(log_path)
+            await session_log.open()
+
+            proc = ClaudeProcess(settings=self._settings, resume=True)
+            try:
+                await proc.start()
+            except FileNotFoundError as exc:
+                message = f"claude binary not found: {self._settings.claude_bin!r}"
+                raise SessionError(message) from exc
+
+            self._proc = proc
+            self._session_id = session_id
+            self._log = session_log
+            self._status = SessionStatus.RUNNING
+            self._stop_requested = False
+            self._saw_result_success = False
+            self._init_event = asyncio.Event()
+            self._last_event_at_write_ts = 0.0
+            self._last_event_at_pending = None
+
+            now = datetime.now(UTC)
+            self._started_at = now
+            await self._db_insert_session(
+                session_id=session_id,
+                started_at=now,
+                started_by_tg_user_id=started_by_tg_user_id,
+                first_prompt=None,
+            )
+
+            self._consumer_task = asyncio.create_task(
+                self._consume_events(),
+                name=f"claude-consumer-{session_id}",
+            )
+            self._exit_task = asyncio.create_task(
+                self._await_exit(),
+                name=f"claude-exit-{session_id}",
+            )
+
+            await self._bus.publish(
+                "session.status",
+                {
+                    "session_id": session_id,
+                    "status": SessionStatus.RUNNING,
+                    "ts": now,
+                },
+            )
 
             return session_id
 
@@ -636,6 +756,57 @@ class SessionManager:
                 session_id=str(session_id),
             )
 
+    async def _db_lookup_most_recent_finished(
+        self,
+    ) -> tuple[uuid.UUID | None, str | None]:
+        """Return ``(id, claude_session_id)`` for the most recent finished session.
+
+        "Finished" = ``status IN ('completed', 'stopped')``; ``crashed`` is
+        deliberately excluded (see :data:`_RESUMABLE_STATUSES`). The second
+        tuple element is reserved for the Outcome 2 ``claude_session_id``
+        capture path; in Outcome 1 (the path landed by CCR-020) the column
+        does not exist on the row and the value is always ``None``.
+        """
+        async with self._db_factory() as db:
+            row = await db.scalar(
+                select(Session)
+                .where(Session.status.in_(_RESUMABLE_STATUSES))
+                .order_by(Session.started_at.desc())
+                .limit(1),
+            )
+            if row is None:
+                return None, None
+            return row.id, getattr(row, "claude_session_id", None)
+
+    async def _db_lookup_session_by_prefix(
+        self,
+        prefix: str,
+    ) -> tuple[uuid.UUID | None, str | None]:
+        """Return ``(id, claude_session_id)`` for a resumable row matching the 8-hex prefix.
+
+        Same eligibility set as :meth:`_db_lookup_most_recent_finished`
+        (``crashed`` and ``running`` excluded). The match runs in Python on
+        ``row.id.hex[:8]`` rather than SQL because :class:`Session.id` is
+        stored as a backend-specific UUID type (binary on most backends,
+        TEXT on SQLite) and a portable LIKE/SUBSTR predicate would have to
+        cast both sides; the resumable result set is small (worst case a
+        few hundred entries) so the in-Python filter is acceptable. On the
+        vanishingly rare 8-hex collision the most recent ``started_at``
+        wins (the rows are scanned in DESC order).
+        """
+        async with self._db_factory() as db:
+            rows = (
+                await db.scalars(
+                    select(Session)
+                    .where(Session.status.in_(_RESUMABLE_STATUSES))
+                    .order_by(Session.started_at.desc()),
+                )
+            ).all()
+            for row in rows:
+                if row.id.hex[:8] == prefix:
+                    return row.id, getattr(row, "claude_session_id", None)
+            return None, None
+
     async def _db_finalize_session(
         self,
         *,
@@ -679,7 +850,10 @@ class SessionManager:
 
 __all__ = [
     "NoActiveSessionError",
+    "NoPriorSessionError",
+    "SessionAlreadyRunningError",
     "SessionError",
     "SessionManager",
+    "SessionNotFoundError",
     "StaleSessionError",
 ]
