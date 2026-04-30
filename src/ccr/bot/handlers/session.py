@@ -14,13 +14,16 @@ from typing import TYPE_CHECKING
 
 from aiogram import F, Router
 from aiogram.filters import Command
+from sqlalchemy import select
 
 from ccr.auth import pairing
+from ccr.bot.formatting import chunk_text
 from ccr.claude.manager import (
     NoActiveSessionError,
     SessionError,
 )
 from ccr.claude.state import SessionStatus
+from ccr.db.models import Session
 
 if TYPE_CHECKING:
     from aiogram.types import Message
@@ -32,6 +35,9 @@ if TYPE_CHECKING:
 router = Router(name="session")
 
 _SECONDS_PER_MINUTE = 60
+_SESSIONS_LIMIT = 20
+_FIRST_PROMPT_DISPLAY_TRUNCATE = 60
+_EMPTY_SESSIONS_REPLY = "(no sessions)"
 
 
 def _short_id(session_id: object) -> str:
@@ -166,6 +172,48 @@ async def cmd_who(
         )
 
 
+@router.message(Command("sessions"))
+async def cmd_sessions(
+    msg: Message,
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """List the most recent sessions (up to 20), newest first.
+
+    Each line is ``<id8> · <status> · <started_at iso> · <first_prompt> · by <user>``.
+    Replies with the stable empty-state string ``"(no sessions)"`` when the DB
+    has no rows. The body is chunked through :func:`chunk_text` so very long
+    listings stay below Telegram's 4096-char limit.
+    """
+    async with db_factory() as db:
+        rows = (
+            await db.scalars(
+                select(Session).order_by(Session.started_at.desc()).limit(_SESSIONS_LIMIT),
+            )
+        ).all()
+
+    if not rows:
+        await msg.answer(_EMPTY_SESSIONS_REPLY)
+        return
+
+    lines = [_format_session_row(row) for row in rows]
+    body = "\n".join(lines)
+    for chunk in chunk_text(body):
+        await msg.answer(chunk)
+
+
+def _format_session_row(row: Session) -> str:
+    id8 = str(row.id)[:8]
+    status = html.escape(row.status)
+    started = row.started_at.isoformat()
+    prompt_display = (
+        "—"
+        if row.first_prompt is None
+        else html.escape(row.first_prompt[:_FIRST_PROMPT_DISPLAY_TRUNCATE])
+    )
+    by = "—" if row.started_by_tg_user_id is None else html.escape(str(row.started_by_tg_user_id))
+    return f"<code>{id8}</code> · {status} · {started} · {prompt_display} · by {by}"
+
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_text(
     msg: Message,
@@ -199,4 +247,4 @@ async def handle_text(
     await msg.answer("Forwarded.")
 
 
-__all__ = ["router"]
+__all__ = ["cmd_sessions", "router"]

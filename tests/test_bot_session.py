@@ -27,6 +27,7 @@ from ccr.bot.handlers.session import (
     cmd_clear,
     cmd_new,
     cmd_pid,
+    cmd_sessions,
     cmd_stop,
     cmd_who,
     handle_text,
@@ -34,7 +35,7 @@ from ccr.bot.handlers.session import (
 from ccr.claude.manager import NoActiveSessionError, SessionError
 from ccr.claude.state import SessionStatus
 from ccr.db.engine import AsyncSessionMaker
-from ccr.db.models import Base
+from ccr.db.models import Base, Session
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -365,3 +366,130 @@ async def test_plain_text_session_error_replies_with_message(
 
     msg.answer.assert_awaited_once()
     assert "claude binary not found" in msg.answer.await_args.args[0]
+
+
+# --------------------------------------------------------------------------- #
+# /sessions
+# --------------------------------------------------------------------------- #
+
+
+async def _seed_session(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    session_id: uuid.UUID,
+    started_at: datetime,
+    status: str = "completed",
+    started_by_tg_user_id: int | None = 42,
+    first_prompt: str | None = "hello world",
+) -> None:
+    async with session_factory() as db:
+        db.add(
+            Session(
+                id=session_id,
+                started_at=started_at,
+                status=status,
+                started_by_tg_user_id=started_by_tg_user_id,
+                first_prompt=first_prompt,
+            ),
+        )
+        await db.commit()
+
+
+async def test_cmd_sessions_empty_db_returns_stable_string(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    msg = _make_message(text="/sessions")
+
+    await cmd_sessions(msg, db_factory=session_factory)
+
+    msg.answer.assert_awaited_once_with("(no sessions)")
+
+
+async def test_cmd_sessions_three_rows_returns_three_lines_in_desc_order(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    base = datetime(2026, 4, 30, 12, 0, 0, tzinfo=UTC)
+    sid_oldest = uuid.UUID("aaaaaaaa-0000-0000-0000-000000000001")
+    sid_middle = uuid.UUID("bbbbbbbb-0000-0000-0000-000000000002")
+    sid_newest = uuid.UUID("cccccccc-0000-0000-0000-000000000003")
+    await _seed_session(
+        session_factory,
+        session_id=sid_oldest,
+        started_at=base,
+        status="completed",
+        first_prompt="oldest",
+    )
+    await _seed_session(
+        session_factory,
+        session_id=sid_middle,
+        started_at=base + timedelta(seconds=10),
+        status="stopped",
+        first_prompt="middle",
+    )
+    await _seed_session(
+        session_factory,
+        session_id=sid_newest,
+        started_at=base + timedelta(seconds=20),
+        status="crashed",
+        first_prompt="newest",
+    )
+
+    msg = _make_message(text="/sessions")
+    await cmd_sessions(msg, db_factory=session_factory)
+
+    msg.answer.assert_awaited_once()
+    reply = msg.answer.await_args.args[0]
+    assert "aaaaaaaa" in reply
+    assert "bbbbbbbb" in reply
+    assert "cccccccc" in reply
+    pos_newest = reply.index("cccccccc")
+    pos_middle = reply.index("bbbbbbbb")
+    pos_oldest = reply.index("aaaaaaaa")
+    assert pos_newest < pos_middle < pos_oldest
+
+
+async def test_cmd_sessions_long_prompt_truncated_to_60_chars(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    sid = uuid.UUID("dddddddd-0000-0000-0000-000000000004")
+    await _seed_session(
+        session_factory,
+        session_id=sid,
+        started_at=datetime(2026, 4, 30, 13, 0, 0, tzinfo=UTC),
+        status="completed",
+        first_prompt="x" * 80,
+    )
+
+    msg = _make_message(text="/sessions")
+    await cmd_sessions(msg, db_factory=session_factory)
+
+    reply = msg.answer.await_args.args[0]
+    assert "x" * 60 in reply
+    assert "x" * 61 not in reply
+
+
+async def test_cmd_sessions_status_field_passed_through_verbatim(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    base = datetime(2026, 4, 30, 14, 0, 0, tzinfo=UTC)
+    await _seed_session(
+        session_factory,
+        session_id=uuid.UUID("eeeeeeee-0000-0000-0000-000000000005"),
+        started_at=base,
+        status="crashed",
+        first_prompt="boom",
+    )
+    await _seed_session(
+        session_factory,
+        session_id=uuid.UUID("ffffffff-0000-0000-0000-000000000006"),
+        started_at=base + timedelta(seconds=5),
+        status="completed",
+        first_prompt="ok",
+    )
+
+    msg = _make_message(text="/sessions")
+    await cmd_sessions(msg, db_factory=session_factory)
+
+    reply = msg.answer.await_args.args[0]
+    assert "crashed" in reply
+    assert "completed" in reply

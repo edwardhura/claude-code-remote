@@ -47,11 +47,17 @@ async def serve(settings: Settings) -> None:
     bus = EventBus()
     manager = SessionManager(bus=bus, db_factory=db_factory, settings=settings)
 
+    await manager.reconcile_orphans()
+
     broadcast_bot = Bot(
         token=settings.telegram_bot_token.get_secret_value(),
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
 
+    poll_task = asyncio.create_task(
+        run_polling(settings, db_factory, session_manager=manager),
+        name="polling",
+    )
     broadcast_task = asyncio.create_task(
         _broadcast_loop(bus, broadcast_bot, db_factory, manager),
         name="broadcast",
@@ -60,20 +66,22 @@ async def serve(settings: Settings) -> None:
         _typing_loop(bus, broadcast_bot, db_factory),
         name="typing",
     )
+    tasks = [poll_task, broadcast_task, typing_task]
 
     try:
-        await asyncio.gather(
-            run_polling(settings, db_factory, session_manager=manager),
-            broadcast_task,
-            typing_task,
-        )
+        # aiogram's start_polling catches SIGINT and returns normally; the
+        # broadcast and typing tasks block on bus.subscribe forever. Wait for
+        # the first task to finish, then cancel the rest so the process exits.
+        done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for finished in done:
+            finished.result()
     finally:
-        broadcast_task.cancel()
-        typing_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await broadcast_task
-        with contextlib.suppress(asyncio.CancelledError):
-            await typing_task
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
         with contextlib.suppress(Exception):
             await broadcast_bot.session.close()
         await engine.dispose()
