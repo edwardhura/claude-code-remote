@@ -384,3 +384,35 @@ Notes:
   - 2026-04-29 main: branch ccr-010-slash-passthrough created, dispatching team-lead
   - 2026-04-29 team-lead: scope brief issued (no architect), dispatching python-developer
   - 2026-04-29 team-lead: approved
+---
+
+## CCR-019: `/sessions` command + orphan reconciliation on startup [done]
+Phase: 6 (post-CCR-018 UX polish)
+Feature: chat-bot
+Files:
+  - `src/ccr/bot/handlers/session.py` — new `cmd_sessions` handler registered on `session_router`. Query `SELECT id, started_at, status, started_by_tg_user_id, first_prompt, ended_at, exit_reason FROM sessions ORDER BY started_at DESC LIMIT 20`. One line per session: `<id8> · <status> · <started_at iso> · <first_prompt truncated to 60 chars or "—"> · <by @username or tg_user_id>`. HTML mode like the rest of the bot. Empty DB replies a stable fixed string (e.g. `"(no sessions)"`). Cap message body to ≤ 3500 chars (reuse chunking from `formatting.py` if needed).
+  - `src/ccr/claude/manager.py` — new `async reconcile_orphans(self) -> int` method (or equivalent helper) that updates any DB row with `status='running'` and no live in-memory session to `status='crashed'`, `exit_reason='bot restart'`, `ended_at=now()`. Returns count reconciled. Logs one structured line per row reconciled. Idempotent — second call must be a no-op.
+  - `src/ccr/server.py` — call `manager.reconcile_orphans()` once during `serve()` startup, before the dispatcher and broadcast tasks start.
+  - `tests/test_bot_session.py` — extend: `/sessions` on empty DB returns `"(no sessions)"` (or whatever stable string is picked); `/sessions` with 3 seeded rows returns 3 lines in `started_at`-desc order containing the id8 prefixes; long-prompt truncation to 60 chars; status field passed through verbatim.
+  - `tests/test_orphan_reconcile.py` (new) — seed a row with `status='running'`, instantiate a fresh `SessionManager`, call `reconcile_orphans()`, assert the row is now `status='crashed'`, `exit_reason='bot restart'`, `ended_at` populated; second call returns 0 / no-op. (PM note: test file location is the developer's call — folding into `tests/test_session_manager.py` is also acceptable.)
+Out of scope:
+  - Resuming sessions (handled in CCR-020).
+  - Deleting old sessions.
+  - Pagination beyond `LIMIT 20`.
+Acceptance:
+  - [x] `/sessions` on a fresh DB replies with the chosen stable empty-state string (e.g. `"(no sessions)"`).
+  - [x] After 3 seeded sessions across mixed statuses, `/sessions` reply contains all three id8 prefixes in `started_at`-desc order.
+  - [x] After a simulated bot restart (insert a `running` row, instantiate a fresh manager, call `reconcile_orphans`, then `/sessions`), the row appears as `crashed` with `exit_reason='bot restart'`.
+  - [x] `pytest tests/test_bot_session.py tests/test_orphan_reconcile.py` (or wherever the orphan test lives) passes.
+  - [x] `pytest --cov=ccr --cov-fail-under=80` passes.
+Depends on: CCR-018
+Notes:
+  Phase n/a in the plan — this is post-CCR-018 UX polish in the same Phase 6 cluster, same precedent as CCR-018 sitting in chat-bot despite touching `claude/manager.py`. The orphan problem: on bot crash/kill the child `claude` subprocess dies with the parent but the `Session` row stays `status='running'` forever because `_db_finalize_session` never runs. After restart, the DB lies. `/sessions` listing would surface that lie unless reconcile fixes it on startup.
+  Reply formatting: HTML escape `first_prompt` and `tg_username` before interpolation (consistent with CCR-008/CCR-018 conventions in `session.py` and `formatting.py`). The `db_factory` is already on workflow data — handler just opens a short-lived session.
+  Reconcile criteria: `Session.status == 'running' AND id != current_session_id_or_None`. On a fresh-start manager with `_proc=None`, there is no live session to exclude — the simple `WHERE status='running'` predicate is sufficient. Wrap in a single transaction; commit eagerly. Log `session_manager.orphan_reconciled` per row with `session_id`, `started_at`.
+  Recommended ordering: ship before CCR-020 so `/continue` inherits a clean DB story for "what's the most recent prior session" — without it, `/continue` would have to filter out potentially-still-running rows that aren't actually running.
+
+### Review log
+  - 2026-04-30 main: branch ccr-019-sessions-orphan-reconcile created, dispatching team-lead
+  - 2026-04-30 team-lead: scope brief issued (no architect), dispatching python-developer
+  - 2026-04-30 team-lead: approved

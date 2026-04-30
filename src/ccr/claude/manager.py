@@ -329,6 +329,41 @@ class SessionManager:
         else:
             self._telegram_pause_count[session_id] = count - 1
 
+    async def reconcile_orphans(self) -> int:
+        """Mark every DB row stuck in ``status='running'`` as ``crashed``.
+
+        On bot crash / kill the child Claude subprocess dies with the parent
+        but the :class:`Session` row stays ``status='running'`` forever
+        because :meth:`_db_finalize_session` never runs. After restart the DB
+        lies about live sessions — call this once during startup to repair
+        the lie.
+
+        Returns the number of rows reconciled. Idempotent: a second call on
+        an already-clean DB returns ``0``. Logs one structured line per row
+        so operators can audit the cleanup.
+        """
+        reconciled = 0
+        now = datetime.now(UTC)
+        async with self._db_factory() as db:
+            rows = (
+                await db.scalars(
+                    select(Session).where(Session.status == SessionStatus.RUNNING.value),
+                )
+            ).all()
+            for row in rows:
+                row.status = SessionStatus.CRASHED.value
+                row.exit_reason = "bot restart"
+                row.ended_at = now
+                log.info(
+                    "session_manager.orphan_reconciled",
+                    session_id=str(row.id),
+                    started_at=str(row.started_at),
+                )
+                reconciled += 1
+            if reconciled:
+                await db.commit()
+        return reconciled
+
     async def stop(self) -> None:
         """Idempotent shutdown: SIGTERM → grace → SIGKILL → STOPPED."""
         async with self._session_lock:
