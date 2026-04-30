@@ -49,9 +49,16 @@ class ClaudeProcess:
        SIGKILL, return the final exit code (or ``-1`` if already stopped).
     """
 
-    def __init__(self, *, settings: Settings, cwd: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        cwd: Path | None = None,
+        resume: bool | str = False,
+    ) -> None:
         self._settings = settings
         self._cwd = cwd
+        self._resume: bool | str = resume
         self._proc: asyncio.subprocess.Process | None = None
         self._stderr_tail: bytearray = bytearray()
         self._stderr_task: asyncio.Task[None] | None = None
@@ -81,6 +88,13 @@ class ClaudeProcess:
             "--output-format=stream-json",
             "--verbose",
         ]
+        # Insert resume flag(s) after our fixed control flags but before any
+        # user-supplied ``claude_extra_args`` so the user can override us by
+        # appending. ``resume=False`` / ``resume=""`` produce no flag.
+        if self._resume is True:
+            argv.append("--continue")
+        elif isinstance(self._resume, str) and self._resume:
+            argv.extend(["--resume", self._resume])
         extra = (self._settings.claude_extra_args or "").strip()
         if extra:
             argv.extend(shlex.split(extra))
