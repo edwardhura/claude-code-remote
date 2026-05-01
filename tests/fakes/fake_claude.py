@@ -1,9 +1,8 @@
 """Fake `claude` binary for SessionManager tests.
 
-Reads JSONL from stdin (so writes by ``send_user_turn`` /
-``send_permission_response`` are observable in tests), emits canned JSONL
-to stdout based on env-var directives, optionally writes to stderr, and
-exits with a configurable code.
+Reads JSONL from stdin (so writes by ``send_user_turn`` are observable in
+tests), emits canned JSONL to stdout based on env-var directives,
+optionally writes to stderr, and exits with a configurable code.
 
 Env directives:
 

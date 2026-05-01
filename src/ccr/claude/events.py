@@ -143,17 +143,6 @@ class ResultEvent(_EventBase):
     usage: ResultUsage | None = None
 
 
-class PermissionRequest(_EventBase):
-    """A permission prompt awaiting an inline-button response."""
-
-    type: Literal["permission_request"]
-    request_id: str
-    tool_use_id: str | None = None
-    tool_name: str
-    input: dict[str, Any] = Field(default_factory=dict)
-    options: list[str]
-
-
 class UnknownEvent(_EventBase):
     """Catch-all for unrecognised ``type`` values OR validation failures.
 
@@ -170,18 +159,18 @@ class UnknownEvent(_EventBase):
 
 
 _KnownEvent = Annotated[
-    SystemInit | UserTurn | AssistantTurn | ResultEvent | PermissionRequest,
+    SystemInit | UserTurn | AssistantTurn | ResultEvent,
     Field(discriminator="type"),
 ]
 
 # ``ClaudeEvent`` is the public type for downstream consumers — it is the
-# closed union of all five known variants plus the :class:`UnknownEvent`
+# closed union of all four known variants plus the :class:`UnknownEvent`
 # catch-all. Pydantic v2 requires discriminator fields to be ``Literal``,
 # so :class:`UnknownEvent` (which has ``type: str``) cannot be part of a
 # discriminated union; we fall back to a plain Union here. Validation goes
 # through :func:`parse_event`, which uses ``_KnownEvent`` first and only
 # constructs :class:`UnknownEvent` on validation failure.
-ClaudeEvent = SystemInit | UserTurn | AssistantTurn | ResultEvent | PermissionRequest | UnknownEvent
+ClaudeEvent = SystemInit | UserTurn | AssistantTurn | ResultEvent | UnknownEvent
 
 
 _ADAPTER: TypeAdapter[Any] = TypeAdapter(_KnownEvent)
@@ -242,7 +231,6 @@ __all__ = [
     "AssistantTurn",
     "ClaudeEvent",
     "ContentBlock",
-    "PermissionRequest",
     "ResultEvent",
     "ResultUsage",
     "SystemInit",

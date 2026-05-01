@@ -9,7 +9,6 @@ from pydantic import TypeAdapter
 from ccr.claude.events import (
     AssistantTurn,
     ClaudeEvent,
-    PermissionRequest,
     ResultEvent,
     SystemInit,
     TextBlock,
@@ -114,23 +113,6 @@ def test_round_trip_result_success_and_error() -> None:
     error = parse_event(json.dumps({"type": "result", "subtype": "error_during_execution"}))
     assert isinstance(error, ResultEvent)
     assert error.subtype == "error_during_execution"
-
-
-def test_round_trip_permission_request_with_options() -> None:
-    line = json.dumps(
-        {
-            "type": "permission_request",
-            "request_id": "perm-1",
-            "tool_use_id": "tu-9",
-            "tool_name": "Bash",
-            "input": {"command": "rm -rf /"},
-            "options": ["approve", "skip", "abort"],
-        }
-    )
-    event = parse_event(line)
-    assert isinstance(event, PermissionRequest)
-    assert event.options == ["approve", "skip", "abort"]
-    assert event.tool_name == "Bash"
 
 
 def test_unknown_type_falls_through_to_unknown_event() -> None:

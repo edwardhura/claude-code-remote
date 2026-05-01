@@ -43,8 +43,8 @@ class ClaudeProcess:
        raises :class:`RuntimeError`.
     2. :meth:`events` is the single permitted reader of stdout; it yields
        parsed :data:`ClaudeEvent` objects until EOF.
-    3. :meth:`send_user_turn` and :meth:`send_permission_response` write
-       JSONL lines to stdin, each followed by ``\\n`` and a drain.
+    3. :meth:`send_user_turn` writes a JSONL line to stdin, followed by
+       ``\\n`` and a drain.
     4. :meth:`stop` is idempotent: SIGTERM, wait up to ``grace`` seconds,
        SIGKILL, return the final exit code (or ``-1`` if already stopped).
     """
@@ -147,29 +147,6 @@ class ClaudeProcess:
         payload: dict[str, Any] = {
             "type": "user",
             "message": {"role": "user", "content": content_payload},
-        }
-        await self._write_line(payload)
-
-    async def send_permission_response(self, request_id: str, choice: str) -> None:
-        """Encode and write a permission-response line to stdin.
-
-        Best-effort encoding against Claude Code's stream-json input schema::
-
-            {"type": "permission_response",
-             "request_id": <id>,
-             "choice": <option>}
-
-        The exact wire format is deferred to CCR-019 (validate end-to-end
-        against a live ``claude`` session); if the upstream format diverges,
-        adjust here.
-
-        TODO(CCR-019): confirm permission_response wire format end-to-end
-        against a live claude session.
-        """
-        payload: dict[str, Any] = {
-            "type": "permission_response",
-            "request_id": request_id,
-            "choice": choice,
         }
         await self._write_line(payload)
 

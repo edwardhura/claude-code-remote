@@ -5,13 +5,11 @@ from __future__ import annotations
 from ccr.bot.formatting import (
     SAFE_CHUNK,
     TELEGRAM_HARD_LIMIT,
-    _PendingKeyboard,
     chunk_text,
     event_to_messages,
 )
 from ccr.claude.events import (
     AssistantTurn,
-    PermissionRequest,
     ResultEvent,
     ResultUsage,
     SystemInit,
@@ -274,44 +272,6 @@ def test_result_never_contains_dollar_sign_across_inputs() -> None:
     for event in cases:
         for text, _kb in event_to_messages(event):
             assert "$" not in text, f"unexpected $ in {text!r}"
-
-
-def test_permission_request_returns_message_with_keyboard_sentinel() -> None:
-    """A permission_request event renders as one tuple with a sentinel keyboard."""
-    event = PermissionRequest(
-        type="permission_request",
-        request_id="r1",
-        tool_name="bash",
-        input={"cmd": "ls"},
-        options=["approve", "skip", "abort"],
-    )
-    out = event_to_messages(event)
-    assert len(out) == 1
-    text, kb = out[0]
-    assert "Permission requested" in text
-    assert "bash" in text
-    assert "ls" in text
-    assert isinstance(kb, _PendingKeyboard)
-    assert kb.request_id == "r1"
-    assert kb.options == ["approve", "skip", "abort"]
-
-
-def test_permission_request_html_escapes_tool_name_and_input() -> None:
-    """Tool name and input repr go through ``html.escape``."""
-    event = PermissionRequest(
-        type="permission_request",
-        request_id="r2",
-        tool_name="<bash>",
-        input={"cmd": "<rm -rf>"},
-        options=["approve"],
-    )
-    out = event_to_messages(event)
-    assert len(out) == 1
-    text, _kb = out[0]
-    assert "<bash>" not in text
-    assert "&lt;bash&gt;" in text
-    # repr() wraps strings in quotes; the html-escape applies to the repr.
-    assert "<rm -rf>" not in text
 
 
 def test_system_init_returns_empty_list() -> None:
