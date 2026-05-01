@@ -686,3 +686,43 @@ Notes:
   - 2026-05-02 team-lead: dispatching architect — SessionManager has no subagent tracking; "Running" wire format unknown; (a)/(b)/(c) choice is load-bearing for manager.py public API
   - 2026-05-02 team-lead: plan reviewed (.claude/plans/CCR-022-agents-reply.md), dispatching python-developer
   - 2026-05-02 team-lead: approved
+---
+
+## CCR-030: `/skills` command — list available skills [done]
+Phase: n/a (post-CCR-010 UX polish)
+Feature: chat-bot
+Files:
+  - `src/ccr/bot/handlers/passthrough.py` — `/skills` is not currently in `WHITELIST` or `BLOCKED_INTERACTIVE`, so it falls through to `_UNKNOWN_USAGE_HINT` today. Either (a) add a dedicated branch in `passthrough.py` that builds a `/skills` reply, or (b) lift it into a new handler module — developer's call. Update `_UNKNOWN_USAGE_HINT` to include `/skills` if appropriate (it's currently absent from the hint string). Empty state renders with a stable placeholder (e.g. `"(none)"`).
+  - `src/ccr/bot/handlers/skills.py` (optional, developer's call) — if rendering grows non-trivial, lift it out of `passthrough.py` into its own handler module and register on `session_router` (or a new `skills_router`). Either layout is acceptable; do not split unless it actually reduces complexity.
+  - Possibly `src/ccr/claude/manager.py` — if "available skills" is sourced from the claude `system/init` event (which carries a top-level `"skills"` array per the smoke-test JSONL captured 2026-05-02), expose a small read-only accessor (e.g. `available_skills() -> list[str]` or similar) that snapshots the most recent `init` event's `skills` field. PM is not prescribing the shape — architect/team-lead settle in Mode 1A. If no active session exists, the reply is the existing `"No active session."` line.
+  - Possibly `src/ccr/claude/events.py` — if the current `SystemInitEvent` (or whatever the init-event model is named) doesn't already declare `skills: list[str]`, add it. The smoke-test transcript shows the field arrives on the init event verbatim (e.g. `"skills":["update-config","debug","simplify","batch","fewer-permission-prompts","loop","schedule","claude-api","implement-ticket"]`).
+  - `tests/test_bot_passthrough.py` (existing, from CCR-010) — extend: assert `/skills` returns a reply containing each skill name when an init event with skills is present; assert empty-state placeholder when the init event has an empty skills array; assert HTML-escaping of skill names containing `<`, `>`, `&`; assert `"No active session."` reply when no session is active. Manual smoke (real Claude session) is documented but unticked, mirroring CCR-010's pattern.
+Out of scope:
+  - Adding a "running skills" or "skills in use" notion — skills are static at session init per the captured JSONL; the reply is single-section.
+  - Editing / creating skill definitions from Telegram (read-only listing only).
+  - Changing the reply for `/agents`, `/mcp`, `/init` — those stay on whatever path their own tickets settle (CCR-022 for `/agents`; the others remain BLOCKED_INTERACTIVE).
+  - Sourcing skills from anywhere other than the live claude session's init event (no filesystem walk, no separate skill registry).
+Acceptance:
+  - [x] `/skills` reply contains a `"Skills"` section header (or developer's-call equivalent stable header).
+  - [x] With an active session whose init event carried a non-empty `skills` array, the reply lists each skill name; sort order developer's call but must be stable across calls (alphabetical recommended).
+  - [x] With an active session whose init event carried an empty / absent `skills` array, the reply renders the section header with the chosen stable empty-state placeholder (e.g. `"(none)"`).
+  - [x] With no active session, the reply matches the existing `"No active session."` string used by other passthrough commands when there's nothing to query.
+  - [x] `/skills` is no longer caught by `_UNKNOWN_USAGE_HINT` (regression check on the unknown-command fallthrough); the hint string itself is updated to include `/skills` if appropriate.
+  - [x] Skill names containing `<`, `>`, `&` are HTML-escaped in the reply (consistent with `formatting.py` conventions used in CCR-008/CCR-018).
+  - [x] `pytest tests/test_bot_passthrough.py` passes.
+  - [x] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [ ] Manual smoke (unticked, not blocking review per CCR-010 precedent): a real Claude session running in the project shows its skills under `/skills` matching the names listed in the `system/init` event.
+Depends on: CCR-010
+Notes:
+  Phase n/a in the plan — post-CCR-010 UX polish, same precedent as CCR-022 / CCR-023 already in the backlog. Simpler than CCR-022 (`/agents`) — there is no "running skills" concept (skills are static at session init), so the reply is single-section.
+  **Probe data already in hand.** Unlike CCR-020 / CCR-021 / CCR-023, no Step-0 probe is required: a smoke-test JSONL captured on 2026-05-02 already confirms claude's `system/init` event carries a top-level `"skills"` array (sample value: `["update-config","debug","simplify","batch","fewer-permission-prompts","loop","schedule","claude-api","implement-ticket"]`). Implementation reads that field; no live-binary probing needed at ticket time.
+  **Mode 1A note for team-lead — dev-direct path recommended.** Small, additive ticket touching ≤ 3 files (passthrough handler, possibly an init-event field on `events.py`, possibly a one-line accessor on `SessionManager`). No new abstraction, no load-bearing design call. Architect not warranted; team-lead can compose the dev brief directly.
+  **Sibling of CCR-022.** This ticket follows CCR-022's two-section template but degenerates to one section. If CCR-022 lands first and introduces a section-rendering helper in `formatting.py` or a sibling, reuse it here. If CCR-030 lands first, the helper extraction can wait for CCR-022.
+  Reply formatting: HTML escape every interpolated name; reuse `formatting.py` chunking if the list grows long (cap message body to ≤ 3500 chars consistent with CCR-019 conventions). Reply mode is HTML, matching the rest of the bot.
+  The existing `_UNKNOWN_USAGE_HINT` in `passthrough.py` does not list `/skills` today. If the developer adds `/skills` as a recognised command, update the hint string to include it for grep-stability.
+
+### Review log
+  - 2026-05-02 project-manager: filed for chat-bot UX iteration
+  - 2026-05-02 main: branch ccr-030-skills-command created, dispatching team-lead
+  - 2026-05-02 team-lead: scope brief issued (no architect), dispatching python-developer
+  - 2026-05-02 team-lead: approved

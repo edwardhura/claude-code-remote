@@ -87,6 +87,7 @@ class SystemInit(_EventBase):
     session_id: str | None = None
     model: str | None = None
     tools: list[str] | None = None
+    skills: list[str] = Field(default_factory=list)
 
 
 class _UserMessage(BaseModel):
