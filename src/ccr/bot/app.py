@@ -42,6 +42,7 @@ def build_dispatcher(
     """Build the aiogram :class:`Bot` and :class:`Dispatcher` for polling."""
     dp = Dispatcher()
     dp["db_factory"] = db_factory
+    dp["settings"] = settings
     if session_manager is not None:
         dp["session_manager"] = session_manager
 
