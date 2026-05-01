@@ -406,3 +406,78 @@ Notes:
 ### Review log
   - 2026-05-01 main: Step 0 probe executed against claude v2.1.123 from a fresh /tmp cwd; outcome (c) confirmed — `claude -p` emits ZERO `permission_request` events on stdout (types seen: system, rate_limit_event, assistant, user, result; `permission_denials: []`; init shows `permissionMode: "default"`; stderr empty; exit 0). Built-in permission gating in non-interactive mode is wired via `--permission-prompt-tool <mcp_tool>`, not via stdin/stdout JSONL. Probe transcript: tmp/ccr-021-probe-1777590778.jsonl; summary: tmp/ccr-021-probe-1777590778.summary.txt.
   - 2026-05-01 main: marked [blocked] — schema reconciliation work in this ticket is moot (no schema to reconcile to); supersedes filed as CCR-024 (remove dead permission code from CCR-009) and CCR-025 (MCP permission-prompt-tool integration). This ticket stays open as a tracking pin until CCR-025 lands; revisit if upstream Claude `-p` ever exposes a stdout permission channel.
+---
+
+## CCR-028: Implement relay socket → MCP `Server.run` bridge [todo]
+Phase: n/a (post-CCR-025 follow-up)
+Feature: claude-runtime
+Files:
+  - `src/ccr/claude/mcp.py` — implement `_handle_relay_connection(reader, writer)` (or whatever signature the dev settles on) so that on accept the listener constructs an AnyIO byte-stream pair from the asyncio socket and calls `await self._server.run(read_stream, write_stream, init_options)` instead of immediately closing the connection. Confirm the wrapping pattern against the `mcp` SDK's `stdio_server()` reference implementation. Set `os.chmod(sock_path, 0o700)` immediately after `start_unix_server` creates the socket file (reviewer F3). Address the second `# type: ignore[attr-defined]` at `mcp.py:453` (reviewer F2) — the bridge implementation should make it unnecessary; if it remains, document why in a comment.
+  - `tests/test_mcp_tool.py` — add a real-bridge integration test that round-trips through the Unix socket (instead of the in-memory `mcp.shared.memory.create_connected_server_and_client_session` path the existing tests use). The test launches the listener, connects via `asyncio.open_unix_connection`, runs an MCP `ClientSession` over those streams, calls the `ccr_permission_prompt` tool, asserts the bus envelope and response payload match. Also assert the socket file has mode `0o700` after `start()` returns.
+Out of scope:
+  - Any new MCP tools beyond `ccr_permission_prompt`.
+  - Adding a TCP transport.
+  - Web-viewer permission UI.
+Acceptance:
+  - [ ] `_handle_relay_connection` no longer closes immediately on accept; it bridges the socket bytes into `mcp.server.Server.run` via AnyIO byte-stream wrapping (or equivalent confirmed against the SDK's `stdio_server()` reference).
+  - [ ] After `McpPermissionServer.start()` returns, the Unix socket file at `sock_path` has mode `0o700` (asserted by a test via `os.stat(sock_path).st_mode & 0o777 == 0o700`).
+  - [ ] The second `# type: ignore[attr-defined]` at `src/ccr/claude/mcp.py:453` is either removed or carries a one-line comment explaining why it remains.
+  - [ ] A new test in `tests/test_mcp_tool.py` drives the tool via the Unix-socket transport (not the in-memory pair) — launches the listener, connects via `asyncio.open_unix_connection`, runs an MCP `ClientSession` over the resulting streams, calls `ccr_permission_prompt`, asserts the bus received the matching envelope and the resolved decision payload comes back through the socket.
+  - [ ] Existing `tests/test_mcp_tool.py` tests still pass unchanged.
+  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [ ] `ruff check src tests` and `ruff format --check src tests` pass.
+  - [ ] `mypy src` passes.
+  - [ ] Manual smoke (unticked, follows CCR-025/CCR-021 precedent): real claude binary launched with `--mcp-config` pointing at the temp file produced by `McpPermissionServer.start()` reaches the bridge and (paired with CCR-029) surfaces a permission prompt to Telegram on a tool call.
+Depends on: CCR-025
+Notes:
+  Phase n/a in the plan — post-CCR-025 follow-up reviewer findings. Filed under `claude-runtime` because the bridge work is owned there.
+  **Reviewer findings being addressed (verbatim from CCR-025's reviewer report / Review log):**
+    - **F1:** `_handle_relay_connection` at `src/ccr/claude/mcp.py:444` is a `# pragma: no cover` STUB. The relay subprocess (`src/ccr/claude/mcp_relay.py`) and the listener that accepts its connection are both correctly wired, but on accept the server immediately closes the connection instead of bridging the socket bytes into `mcp.server.Server.run`. This ticket implements the bridge.
+    - **F2:** The second `# type: ignore[attr-defined]` at `src/ccr/claude/mcp.py:453` should become unnecessary once the bridge is implemented; if it remains, document why.
+    - **F3:** `os.chmod(sock_path, 0o700)` must be set immediately after `start_unix_server` creates the socket file — tightening ownership before any client can connect.
+  **Manual smoke caveat.** CCR-025's manual smoke acceptance is unblocked by this ticket only if CCR-029 also lands. Default `permissionMode: "default"` (confirmed by CCR-021's probe) auto-allows every tool, so even with the bridge wired claude won't invoke `ccr_permission_prompt` until a `--permission-mode` or `--disallowed-tools` flag forces the path. The two tickets are paired for end-to-end smoke; landing CCR-028 alone gives a working transport but no observable permission prompts in chat.
+  **Mode 1A note for team-lead.** PM recommends architect path (Mode 1A architect) only if the dev needs the architect to pick between AnyIO byte-stream wrapping vs the SDK's `stdio_server()` directly — reading the SDK's stdio reference implementation should make the choice obvious. Otherwise dev-direct is fine: ≤ 2 files, no new abstraction, focused on closing reviewer-flagged gaps.
+
+### Review log
+---
+
+## CCR-029: Wire `permission_mode` / `disallowed_tools` settings into `ClaudeProcess.start()` [todo]
+Phase: n/a (post-CCR-025 follow-up)
+Feature: claude-runtime
+Files:
+  - `src/ccr/config.py` — add three settings on `Settings`:
+    - `permission_mode: Literal["default", "acceptEdits", "plan", "bypassPermissions"] | None = None` — when set, `ClaudeProcess.start()` appends `--permission-mode <value>` to claude argv.
+    - `disallowed_tools: list[str] = []` — when non-empty, appends `--disallowed-tools <comma-separated>` (or one flag per tool — dev settles by checking `claude --help`).
+    - `allowed_tools: list[str] = []` — same shape; mutually-exclusive validator with `disallowed_tools` (only one of the two can be non-empty).
+  - `src/ccr/claude/process.py` — `ClaudeProcess.__init__` accepts the three new values (or pulls them from `settings`); `start()`'s argv builder threads the flags in. Order: keep MCP tokens before user `claude_extra_args` (so user override still wins). New flags slot between resume/continue and the MCP block. Default behaviour (`permission_mode=None, allowed_tools=[], disallowed_tools=[]`) keeps the existing argv shape so existing tests stay green.
+  - `src/ccr/claude/manager.py` — read settings once at `SessionManager.__init__` and pass them into every `ClaudeProcess` it spawns.
+  - `.env.example` — document each new setting and what the recommended starting value is for triggering the MCP permission flow (suggested: `disallowed_tools=Write,Edit,Bash` so common tool calls hit the MCP path while reads stay frictionless).
+  - `tests/test_claude_process.py` — extend with cases asserting argv ordering when each new flag is set: `--permission-mode <value>` appears in the documented position; `--disallowed-tools <list>` appears; both together; user `claude_extra_args` still land last.
+  - `tests/test_config.py` — extend: validate the `permission_mode` literal (rejects invalid values); validate the mutually-exclusive allowed/disallowed validator; default values produce no argv changes.
+Out of scope:
+  - A `/plan` chat command (that's CCR-027 territory).
+  - Per-session mode override from chat (CCR-027 territory).
+  - Any UI for picking the mode at runtime (web or chat).
+Acceptance:
+  - [ ] `Settings.permission_mode` accepts `"default"`, `"acceptEdits"`, `"plan"`, `"bypassPermissions"`, or `None`; any other value raises a validation error.
+  - [ ] Setting both `allowed_tools` and `disallowed_tools` to non-empty lists raises a validation error (mutually exclusive).
+  - [ ] With `permission_mode=None, allowed_tools=[], disallowed_tools=[]` (defaults), the argv constructed by `ClaudeProcess.start()` matches the existing shape — existing argv tests stay green.
+  - [ ] With `permission_mode="acceptEdits"` and `disallowed_tools=["Write"]`, the constructed argv contains both flags in the documented position (between resume/continue and the MCP block, before user `claude_extra_args`).
+  - [ ] With `allowed_tools=["Read", "Grep"]` set and `disallowed_tools=[]`, the constructed argv contains the corresponding `--allowed-tools` flag in the same position.
+  - [ ] User-supplied `claude_extra_args` continue to land last in argv (regression — they can still override the new flags by position).
+  - [ ] `.env.example` documents `permission_mode`, `allowed_tools`, `disallowed_tools` with a recommended starting value for triggering the MCP permission flow.
+  - [ ] `pytest tests/test_claude_process.py tests/test_config.py` passes.
+  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [ ] `ruff check src tests` and `ruff format --check src tests` pass.
+  - [ ] `mypy src` passes.
+  - [ ] Manual smoke (unticked, follows CCR-025/CCR-021 precedent): with `disallowed_tools=["Write"]` set in `.env` and CCR-028 landed, a real claude session that tries to call `Write` triggers the `ccr_permission_prompt` MCP tool and surfaces an inline-button prompt in Telegram.
+Depends on: CCR-025, CCR-028
+Notes:
+  Phase n/a in the plan — post-CCR-025 follow-up surfaced by user-driven manual testing.
+  **Why this ticket exists.** Local manual-smoke run of CCR-025 surfaced the gap: a Telegram session sent "Create file foo.txt …", and claude went straight to `Write` with no MCP invocation. The MCP server was wired, but claude never asked. CCR-021's probe documented the cause: in non-interactive `-p` mode the observed default is `permissionMode: "default"`, which auto-allows every tool. To actually exercise the gating path, claude must be launched with a permission mode or tool-restriction flag that forces it to ask. This ticket adds the settings + argv plumbing so users can opt in.
+  **Mutual-exclusivity rationale.** `--allowed-tools` and `--disallowed-tools` are documented by claude as mutually exclusive (only one may be set). The Settings validator should fail loudly if both are non-empty rather than letting claude itself reject the argv at process-start time.
+  **Argv position.** The plan and CCR-025's design pin MCP tokens before `claude_extra_args` so user overrides still win. The new flags slot between the existing resume/continue block and the MCP block — this keeps the user-override invariant and groups all permission-related flags together.
+  **Mode 1A note for team-lead.** PM recommends dev-direct path (Mode 1A skip architect) — small additive ticket touching ≤ 5 files, no new abstraction, plain settings + argv builder thread-through. Architect not warranted.
+  **Pairing with CCR-028.** CCR-028 alone won't surface a prompt (no force-ask flag); this ticket alone won't have a working transport (the bridge stub closes the connection). Both must land for CCR-025's manual smoke acceptance to fire end-to-end. PM filed them as a pair so the orchestrator can sequence them naturally.
+
+### Review log

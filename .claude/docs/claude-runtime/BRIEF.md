@@ -21,4 +21,4 @@ The `claude-runtime` feature provides the core subprocess and event infrastructu
 - tests/test_session_manager.py — 8 SessionManager tests
 
 Status: IN PROGRESS
-Tickets: CCR-007, CCR-024, CCR-025
+Tickets: CCR-007, CCR-024, CCR-025, CCR-028, CCR-029
