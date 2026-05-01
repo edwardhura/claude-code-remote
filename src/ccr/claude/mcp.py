@@ -303,16 +303,31 @@ class McpPermissionServer:
                 ),
             ]
 
-        async def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        async def _call_tool(
+            name: str,
+            arguments: dict[str, Any],
+        ) -> list[mcp_types.TextContent]:
+            # Claude Code's --permission-prompt-tool requires the tool result
+            # to be a single text content block whose text is a compact
+            # JSON-encoded decision string. Returning a dict here would make
+            # the MCP SDK populate both `content` and `structuredContent` with
+            # pretty-printed JSON, which Claude Code rejects with
+            # "Expected a single text block param with type='text' and a
+            # string text value." Return list[TextContent] explicitly so the
+            # SDK leaves `structuredContent` unset.
             if name != _TOOL_NAME:
-                return {
+                decision: dict[str, Any] = {
                     "behavior": "deny",
                     "message": f"Unknown tool: {name}",
                 }
-            tool_name = str(arguments.get("tool_name", ""))
-            tool_input_raw = arguments.get("input")
-            tool_input: dict[str, Any] = tool_input_raw if isinstance(tool_input_raw, dict) else {}
-            return await self._on_tool_call(tool_name, tool_input)
+            else:
+                tool_name = str(arguments.get("tool_name", ""))
+                tool_input_raw = arguments.get("input")
+                tool_input: dict[str, Any] = (
+                    tool_input_raw if isinstance(tool_input_raw, dict) else {}
+                )
+                decision = await self._on_tool_call(tool_name, tool_input)
+            return [mcp_types.TextContent(type="text", text=json.dumps(decision))]
 
         srv.list_tools()(_list_tools)  # type: ignore[no-untyped-call]
         srv.call_tool()(_call_tool)
