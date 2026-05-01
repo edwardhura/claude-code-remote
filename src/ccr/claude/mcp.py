@@ -110,6 +110,7 @@ class McpPermissionServer:
         self._server = self._build_server()
         self._futures: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._sessions: dict[str, uuid.UUID] = {}
+        self._inputs: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
         self._started = False
         self._config_path: Path | None = None
@@ -303,16 +304,31 @@ class McpPermissionServer:
                 ),
             ]
 
-        async def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        async def _call_tool(
+            name: str,
+            arguments: dict[str, Any],
+        ) -> list[mcp_types.TextContent]:
+            # Claude Code's --permission-prompt-tool requires the tool result
+            # to be a single text content block whose text is a compact
+            # JSON-encoded decision string. Returning a dict here would make
+            # the MCP SDK populate both `content` and `structuredContent` with
+            # pretty-printed JSON, which Claude Code rejects with
+            # "Expected a single text block param with type='text' and a
+            # string text value." Return list[TextContent] explicitly so the
+            # SDK leaves `structuredContent` unset.
             if name != _TOOL_NAME:
-                return {
+                decision: dict[str, Any] = {
                     "behavior": "deny",
                     "message": f"Unknown tool: {name}",
                 }
-            tool_name = str(arguments.get("tool_name", ""))
-            tool_input_raw = arguments.get("input")
-            tool_input: dict[str, Any] = tool_input_raw if isinstance(tool_input_raw, dict) else {}
-            return await self._on_tool_call(tool_name, tool_input)
+            else:
+                tool_name = str(arguments.get("tool_name", ""))
+                tool_input_raw = arguments.get("input")
+                tool_input: dict[str, Any] = (
+                    tool_input_raw if isinstance(tool_input_raw, dict) else {}
+                )
+                decision = await self._on_tool_call(tool_name, tool_input)
+            return [mcp_types.TextContent(type="text", text=json.dumps(decision))]
 
         srv.list_tools()(_list_tools)  # type: ignore[no-untyped-call]
         srv.call_tool()(_call_tool)
@@ -338,6 +354,7 @@ class McpPermissionServer:
         )
         self._futures[request_id] = future
         self._sessions[request_id] = session_id
+        self._inputs[request_id] = tool_input
 
         envelope = McpPermissionRequest(
             request_id=request_id,
@@ -370,6 +387,7 @@ class McpPermissionServer:
         finally:
             self._futures.pop(request_id, None)
             self._sessions.pop(request_id, None)
+            self._inputs.pop(request_id, None)
 
     def _mint_request_id(self) -> str:
         for _ in range(_REQUEST_ID_RETRY_LIMIT):
@@ -386,6 +404,14 @@ class McpPermissionServer:
         future = self._futures.get(request_id)
         if future is None or future.done():
             return False
+        # Claude Code's --permission-prompt-tool requires `updatedInput` on
+        # an allow decision to be the (possibly modified) tool input object,
+        # never null. The bot handler does not have the original input, so
+        # it sends `updatedInput: None` and we fill it in here from the
+        # stored input captured at _on_tool_call time.
+        if decision.get("behavior") == "allow" and decision.get("updatedInput") is None:
+            stored_input = self._inputs.get(request_id, {})
+            decision = {**decision, "updatedInput": stored_input}
         try:
             future.set_result(decision)
         except asyncio.InvalidStateError:

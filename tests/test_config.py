@@ -172,6 +172,9 @@ def test_settings_uses_defaults_when_optional_keys_missing(
         "CLAUDE_BIN",
         "PROXY_PORT_ALLOWLIST",
         "LOG_LEVEL",
+        "PERMISSION_MODE",
+        "ALLOWED_TOOLS",
+        "DISALLOWED_TOOLS",
     ):
         monkeypatch.delenv(key, raising=False)
     env = _write_env(
@@ -186,3 +189,91 @@ def test_settings_uses_defaults_when_optional_keys_missing(
     assert settings.claude_bin == "claude"
     assert settings.proxy_port_allowlist is None
     assert settings.log_level == "INFO"
+    assert settings.permission_mode is None
+    assert settings.allowed_tools == []
+    assert settings.disallowed_tools == []
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["default", "acceptEdits", "plan", "bypassPermissions"],
+)
+def test_permission_mode_accepts_valid_literals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    monkeypatch.delenv("PERMISSION_MODE", raising=False)
+    env = _write_env(
+        tmp_path,
+        "TELEGRAM_BOT_TOKEN=t\n"
+        "PUBLIC_URL=https://example.com\n"
+        f"JWT_SECRET={VALID_SECRET}\n"
+        f"PERMISSION_MODE={mode}\n",
+    )
+    settings = _make_settings(env)
+    assert settings.permission_mode == mode
+
+
+def test_permission_mode_rejects_invalid_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PERMISSION_MODE", raising=False)
+    env = _write_env(
+        tmp_path,
+        "TELEGRAM_BOT_TOKEN=t\n"
+        "PUBLIC_URL=https://example.com\n"
+        f"JWT_SECRET={VALID_SECRET}\n"
+        "PERMISSION_MODE=invalid\n",
+    )
+    with pytest.raises(ValidationError) as exc_info:
+        _make_settings(env)
+    assert "permission_mode" in str(exc_info.value).lower()
+
+
+def test_allowed_and_disallowed_tools_mutually_exclusive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for key in ("ALLOWED_TOOLS", "DISALLOWED_TOOLS"):
+        monkeypatch.delenv(key, raising=False)
+    env = _write_env(
+        tmp_path,
+        "TELEGRAM_BOT_TOKEN=t\n"
+        "PUBLIC_URL=https://example.com\n"
+        f"JWT_SECRET={VALID_SECRET}\n"
+        "ALLOWED_TOOLS=Read,Grep\n"
+        "DISALLOWED_TOOLS=Write,Edit\n",
+    )
+    with pytest.raises(ValidationError) as exc_info:
+        _make_settings(env)
+    assert "mutually exclusive" in str(exc_info.value).lower()
+
+
+def test_default_tools_settings_produce_no_argv_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for key in ("PERMISSION_MODE", "ALLOWED_TOOLS", "DISALLOWED_TOOLS"):
+        monkeypatch.delenv(key, raising=False)
+    env = _write_env(
+        tmp_path,
+        f"TELEGRAM_BOT_TOKEN=t\nPUBLIC_URL=https://example.com\nJWT_SECRET={VALID_SECRET}\n",
+    )
+    settings = _make_settings(env)
+    assert settings.permission_mode is None
+    assert settings.allowed_tools == []
+    assert settings.disallowed_tools == []
+
+
+def test_tool_lists_parse_comma_separated_strings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for key in ("ALLOWED_TOOLS", "DISALLOWED_TOOLS"):
+        monkeypatch.delenv(key, raising=False)
+    env = _write_env(
+        tmp_path,
+        "TELEGRAM_BOT_TOKEN=t\n"
+        "PUBLIC_URL=https://example.com\n"
+        f"JWT_SECRET={VALID_SECRET}\n"
+        "DISALLOWED_TOOLS= Write , Edit , Bash \n",
+    )
+    settings = _make_settings(env)
+    assert settings.disallowed_tools == ["Write", "Edit", "Bash"]
+    assert settings.allowed_tools == []

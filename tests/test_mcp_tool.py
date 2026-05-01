@@ -300,8 +300,103 @@ async def test_concurrent_tool_calls_share_no_state(
     assert {e.tool_name for e in captured} == {"AAA", "BBB"}
     payload_a = _tool_result_payload(results[0])
     payload_b = _tool_result_payload(results[1])
-    assert payload_a == {"behavior": "allow", "updatedInput": None}
+    # `updatedInput: None` is rewritten to the original tool_input ({} here)
+    # so the result is schema-valid for Claude Code's permission tool.
+    assert payload_a == {"behavior": "allow", "updatedInput": {}}
     assert payload_b == {"behavior": "deny", "message": "no"}
+
+
+async def test_resolve_allow_with_null_updated_input_uses_original_tool_input(
+    tmp_path: Path,
+) -> None:
+    """Regression: Claude Code rejects an allow decision whose ``updatedInput``
+
+    is null. The bot callback handler does not have access to the original
+    tool input, so it sends ``{"behavior": "allow", "updatedInput": None}``.
+    The server must swap that None for the input captured at the tool-call
+    site so the resulting payload is schema-valid.
+    """
+    bus = EventBus()
+    server = McpPermissionServer(bus=bus, timeout_seconds=5.0, data_dir=tmp_path)
+    server.set_current_session(_SESSION_ID)
+
+    captured: list[McpPermissionRequest] = []
+    collector = asyncio.create_task(_collect_first_envelope(bus, captured))
+    await asyncio.sleep(0)
+
+    original_input: dict[str, Any] = {
+        "file_path": "/tmp/foo.txt",
+        "content": "Hi",
+    }
+
+    async with create_connected_server_and_client_session(server.server) as client:
+
+        async def _resolver() -> None:
+            await collector
+            ok = await server.resolve(
+                captured[0].request_id,
+                {"behavior": "allow", "updatedInput": None},
+            )
+            assert ok is True
+
+        resolver_task = asyncio.create_task(_resolver())
+        result = await client.call_tool(
+            "ccr_permission_prompt",
+            {"tool_name": "Write", "input": original_input},
+        )
+        await resolver_task
+
+    payload = _tool_result_payload(result)
+    assert payload == {"behavior": "allow", "updatedInput": original_input}
+
+
+async def test_tool_result_is_single_text_block_with_compact_json_and_no_structured_content(
+    tmp_path: Path,
+) -> None:
+    """Regression: Claude Code's --permission-prompt-tool rejects results that
+
+    are not a single text content block with a compact JSON-encoded decision.
+    The SDK's dict-return path emits pretty-printed JSON AND populates
+    structuredContent, both of which trip Claude Code's parser. Verify the
+    wire shape: exactly one TextContent block, type="text", text is a compact
+    JSON string round-tripping to the decision dict, structuredContent unset.
+    """
+    bus = EventBus()
+    server = McpPermissionServer(bus=bus, timeout_seconds=5.0, data_dir=tmp_path)
+    server.set_current_session(_SESSION_ID)
+
+    captured: list[McpPermissionRequest] = []
+    collector = asyncio.create_task(_collect_first_envelope(bus, captured))
+    await asyncio.sleep(0)
+
+    async with create_connected_server_and_client_session(server.server) as client:
+
+        async def _resolver() -> None:
+            await collector
+            await server.resolve(
+                captured[0].request_id,
+                {"behavior": "allow", "updatedInput": {"cmd": "ls"}},
+            )
+
+        resolver_task = asyncio.create_task(_resolver())
+        result = await client.call_tool(
+            "ccr_permission_prompt",
+            {"tool_name": "Bash", "input": {"cmd": "ls"}},
+        )
+        await resolver_task
+
+    assert getattr(result, "structuredContent", None) is None, (
+        "Claude Code rejects results with structuredContent set"
+    )
+    assert len(result.content) == 1, "expected exactly one content block"
+    block = result.content[0]
+    assert block.type == "text"
+    assert isinstance(block.text, str)
+    assert "\n" not in block.text, "text must be compact JSON, not pretty-printed"
+    assert json.loads(block.text) == {
+        "behavior": "allow",
+        "updatedInput": {"cmd": "ls"},
+    }
 
 
 async def test_argv_property_includes_permission_prompt_tool_and_mcp_config(
