@@ -26,6 +26,8 @@ WEB_PORT_MIN = 1
 WEB_PORT_MAX = 65535
 TOKEN_TTL_MIN = 60
 TOKEN_TTL_MAX = 86400
+MCP_TIMEOUT_MIN = 1
+MCP_TIMEOUT_MAX = 3600
 
 
 class Settings(BaseSettings):
@@ -60,6 +62,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     pairing_code_ttl_seconds: int = 900
     subprocess_grace_kill_seconds: int = 5
+    mcp_permission_timeout_seconds: int = 120
     proxy_port_allowlist: set[int] | None = None
 
     @field_validator("jwt_secret")
@@ -89,6 +92,17 @@ class Settings(BaseSettings):
             message = (
                 f"TOKEN_TTL_SECONDS must be between {TOKEN_TTL_MIN} and {TOKEN_TTL_MAX} "
                 f"(got {value})."
+            )
+            raise ValueError(message)
+        return value
+
+    @field_validator("mcp_permission_timeout_seconds")
+    @classmethod
+    def _mcp_permission_timeout_in_range(cls, value: int) -> int:
+        if not MCP_TIMEOUT_MIN <= value <= MCP_TIMEOUT_MAX:
+            message = (
+                f"MCP_PERMISSION_TIMEOUT_SECONDS must be between "
+                f"{MCP_TIMEOUT_MIN} and {MCP_TIMEOUT_MAX} (got {value})."
             )
             raise ValueError(message)
         return value

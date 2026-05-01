@@ -13,52 +13,6 @@ only flip status in the title or move the entry to `DONE.md`.
 
 ---
 
-## CCR-025: MCP permission-prompt-tool integration [todo]
-Phase: n/a (replaces CCR-009 channel)
-Feature: claude-runtime
-Files:
-  - `src/ccr/claude/mcp.py` (new) — in-process MCP server bound to `python -m ccr serve` lifecycle. Runs on the same asyncio loop as bot+web; shuts down cleanly with the rest of the process. Exposes one tool — suggested name `ccr_permission_prompt` — that receives `(tool_name, tool_input)` from claude, publishes a permission-request envelope onto `EventBus`, awaits a paired-user decision via an asyncio Future keyed on a request_id, returns `{"allow": <bool>, "input": <updated_or_passthrough>}` to claude. (Architect picks: in-process vs out-of-process, stdio vs TCP transport, Future-keying scheme, timeout policy, single-vs-concurrent permission-request semantics.)
-  - `src/ccr/claude/process.py` — `start()` argv builder appends `--permission-prompt-tool ccr_permission_prompt`. Must NOT break the `claude_extra_args` override path; the user's `claude_extra_args` should be appended after our flag so they can override if they really need to.
-  - `src/ccr/claude/manager.py` — wire the MCP server into `SessionManager` lifecycle (start with the first session / with the manager, stop on teardown). Re-introduce a minimal `pending_permissions: dict[str, asyncio.Future]` keyed on request_id that the bot's callback handler resolves on user tap. Public surface for the bot: `async resolve_permission(request_id: str, decision: dict) -> None` (or similar — architect picks shape).
-  - `src/ccr/claude/events.py` — add a NEW envelope type for the MCP-driven request — e.g. `McpPermissionRequest` (NOT `PermissionRequest`, which is being removed in CCR-024). Carries `request_id`, `tool_name`, `tool_input`, optional `options`. Publishes to the bus alongside other ClaudeEvents so the existing broadcast loop fans it out.
-  - `src/ccr/server.py` — re-introduce a buffer/pause path for the new `McpPermissionRequest` if the architect decides Telegram should pause between request and response (current CCR-009 design did this; carry the design forward but key on the new envelope). SSE keeps streaming live.
-  - `src/ccr/bot/formatting.py` — add a branch for `McpPermissionRequest` returning the same `(text, keyboard)` shape CCR-024 preserved. Reuse `permission_kb` (kept dormant in CCR-024) with the new envelope's `request_id` and `options`.
-  - `src/ccr/bot/handlers/permission.py` — replace the CCR-024 `NotImplementedError` stub with the real handler: parse `perm:{session_id}:{request_id}:{choice}`, call `manager.resolve_permission(request_id, {"allow": ..., "input": ...})`, edit message to remove keyboard and append `→ {choice} (by @{username})`. Reject taps after timeout or for unknown request_ids with `cb.answer("Stale prompt", show_alert=True)`.
-  - `tests/test_mcp_tool.py` (new) — fake MCP client that drives `ccr_permission_prompt` with synthetic `(tool_name, tool_input)` requests; assert the bot's broadcast queue receives a message with the expected buttons; simulate a callback-query tap; assert the tool's response matches the user's choice (`{"allow": true/false, "input": ...}`).
-  - `tests/test_session_manager.py` — extend with cases covering `resolve_permission` happy path, unknown-request-id rejection, timeout (if architect's design has one), teardown wakes pending Futures.
-  - `tests/test_bot_permission.py` — restore the real handler tests (keyboard shape, parse, stale id, forged choice, malformed data, concurrent taps, edit failure, HTML escape) — adapted to the new envelope and `manager.resolve_permission` signature.
-  - `tests/test_broadcast.py` — restore the buffer/drain test against `McpPermissionRequest` if the architect keeps the pause semantics; otherwise document why it's gone.
-  - `tests/fakes/fake_claude.py` — fixture for a synthetic `McpPermissionRequest` event so SessionManager-level tests don't need a real MCP transport.
-  - Manual smoke test (documented but unticked, mirroring CCR-020/CCR-021 precedent): a real-claude `python -m ccr serve` session that triggers a Bash permission and surfaces buttons in Telegram, with the user tapping Allow or Deny.
-Out of scope:
-  - Per-session permission UI in the web viewer (post-MVP; same as CCR-009 was).
-  - Plan-mode UX (CCR-027) and AskUserQuestion handler (CCR-026) — separate tickets.
-  - Real-money pricing / billing integrations or any other tool-level enrichment.
-Acceptance:
-  - [ ] `python -m ccr serve` starts the in-process MCP server alongside bot + web on the same asyncio loop and shuts it down cleanly on SIGINT/SIGTERM (no orphan processes, no port leaks if TCP is chosen).
-  - [ ] claude argv built by `ClaudeProcess.start()` includes `--permission-prompt-tool ccr_permission_prompt`; user's `claude_extra_args` still apply (verify via a test inspecting the constructed argv).
-  - [ ] `pytest tests/test_mcp_tool.py` passes — fake MCP client drives a request, the bot's broadcast queue receives the buttons, a simulated tap returns the matching `{"allow": ..., "input": ...}` payload to claude.
-  - [ ] `pytest tests/test_bot_permission.py tests/test_session_manager.py tests/test_broadcast.py` passes (restored / adapted from CCR-024's deletions).
-  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
-  - [ ] `ruff check src tests` passes; `mypy src` passes.
-  - [ ] Manual smoke (unticked, not blocking review per CCR-020/CCR-021 precedent): with a real claude binary and a permission-requiring tool call (e.g. Bash `ls -la` from a fresh cwd), the bot surfaces inline buttons in Telegram and tapping Allow lets claude proceed; tapping Deny returns a denial to claude.
-Depends on: CCR-024, CCR-008, CCR-009
-Notes:
-  Phase n/a in the plan — this is the load-bearing follow-up to CCR-021's probe. CCR-021 confirmed claude `-p` does not emit JSONL `permission_request` events; Anthropic's documented gating mechanism for non-interactive use is `--permission-prompt-tool <mcp_tool>` (claude calls a designated MCP tool to request approval; the tool returns `{"allow": bool, "input": ...}`).
-  **Strongly recommend architect dispatch (Mode 1A architect path).** Load-bearing decisions the architect must settle before the developer writes code:
-    - In-process vs out-of-process MCP server. In-process is simpler and matches the modular-monolith architecture (one asyncio loop); out-of-process means another lifecycle to manage but isolates protocol bugs.
-    - Transport: stdio vs TCP. stdio aligns with how MCP is typically configured for local tools and avoids opening a port; TCP is simpler to test in isolation but adds a port and an allowlist concern.
-    - Future-keying scheme. `request_id` from the MCP request? A monotonic counter? Caller-supplied? The Future must survive the round-trip from MCP-tool-call → bus.publish → bot button → callback handler → bus.publish (or direct call) → MCP-tool-return.
-    - Timeout policy. What happens if no paired user taps within N seconds? Default-deny? Default-allow? Re-prompt? Bubble up an error to claude?
-    - Concurrency. Can claude have multiple pending permission requests at once (e.g. parallel tool calls in a single turn)? CCR-009's design assumed yes (counter-based pause); architect picks whether MCP changes that.
-    - How the bot reuses CCR-024's preserved `keyboards.py` / `permission.py` scaffolding. The wire format the bot reacts to is now the new `McpPermissionRequest` envelope, not the old `PermissionRequest`.
-  PM is not prescribing any of these — they are exactly the kind of "first ticket of a new subsystem" load-bearing calls the team-lead Mode 1A criteria flag for the architect.
-  Architect should be told: the developer will NOT probe a real claude binary as part of this ticket — that smoke test belongs to the manual-acceptance walk, not to the architect's plan. The architect picks the design from the existing MCP spec and the JSONL event schema in `ccr.claude.events`. If the architect surfaces an open question that requires a real-binary probe (e.g. "does claude actually invoke the MCP tool with `tool_input` as a dict or a string?"), they should escalate to team-lead for a Step-0 probe ticket rather than guessing.
-  Reusing CCR-009's preserved infrastructure: per CCR-024's PM decision, `src/ccr/bot/keyboards.py` and the `cb_permission` callback shape were kept dormant. CCR-025 is where they wake up; this ticket re-implements the body of `permission.py` against the new MCP-driven envelope and resolves the awaited Future via `manager.resolve_permission`.
-
-### Review log
----
-
 ## CCR-022: Richer `/agents` reply (Running + Library) [todo]
 Phase: n/a (post-CCR-010 UX polish)
 Feature: chat-bot

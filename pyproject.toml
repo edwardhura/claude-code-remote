@@ -19,6 +19,7 @@ dependencies = [
     "pyjwt>=2.9,<3",
     "prompt_toolkit>=3.0,<4",
     "structlog>=24.4,<26",
+    "mcp>=1.0,<2",
 ]
 
 [project.scripts]

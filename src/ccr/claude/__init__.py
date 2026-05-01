@@ -17,7 +17,7 @@ MCP permission gating, CCR-010 slash passthrough, CCR-012 web SSE):
 
 from __future__ import annotations
 
-from ccr.claude.events import ClaudeEvent, ContentBlock
+from ccr.claude.events import ClaudeEvent, ContentBlock, McpPermissionRequest
 from ccr.claude.log import JsonlSessionLog
 from ccr.claude.manager import (
     NoActiveSessionError,
@@ -25,12 +25,16 @@ from ccr.claude.manager import (
     SessionManager,
     StaleSessionError,
 )
+from ccr.claude.mcp import McpPermissionServer, McpServerStartError
 from ccr.claude.state import SessionStatus
 
 __all__ = [
     "ClaudeEvent",
     "ContentBlock",
     "JsonlSessionLog",
+    "McpPermissionRequest",
+    "McpPermissionServer",
+    "McpServerStartError",
     "NoActiveSessionError",
     "SessionError",
     "SessionManager",

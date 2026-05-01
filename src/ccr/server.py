@@ -21,7 +21,8 @@ from aiogram.exceptions import TelegramAPIError
 from sqlalchemy import select
 
 from ccr.bot.app import run_polling
-from ccr.bot.formatting import OutboundMessage, event_to_messages
+from ccr.bot.formatting import OutboundMessage, _PendingKeyboard, event_to_messages
+from ccr.bot.keyboards import permission_kb
 from ccr.bot.typing import TypingKeepalive
 from ccr.claude.events import ResultEvent
 from ccr.claude.manager import SessionManager
@@ -81,6 +82,8 @@ async def serve(settings: Settings) -> None:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
         with contextlib.suppress(Exception):
+            await manager.shutdown()
+        with contextlib.suppress(Exception):
             await broadcast_bot.session.close()
         await engine.dispose()
 
@@ -97,6 +100,12 @@ async def _broadcast_loop(
     the others. One persistent sender task per chat drains its queue. Both
     the queues and the sender tasks live for the lifetime of the broadcast
     loop; cancellation of the loop cascades to every sender.
+
+    :class:`McpPermissionRequest` envelopes (CCR-025) are fanned out exactly
+    like :class:`ClaudeEvent` envelopes — there is no pause/buffer step:
+    each permission request has its own ``request_id`` and its own
+    keyboard, and resolution races between paired users are handled
+    inside :class:`McpPermissionServer.resolve` (single-shot Future).
     """
     senders: dict[int, _ChatSender] = {}
     try:
@@ -110,12 +119,33 @@ async def _broadcast_loop(
             messages = event_to_messages(event)
             if not messages:
                 continue
+            messages = _materialise_keyboards(messages, session_id)
             await _send_to_all(messages, senders, bot, db_factory)
     finally:
         for sender in senders.values():
             sender.cancel()
         for sender in senders.values():
             await sender.wait_closed()
+
+
+def _materialise_keyboards(
+    messages: list[OutboundMessage],
+    session_id: uuid.UUID,
+) -> list[OutboundMessage]:
+    """Swap :class:`_PendingKeyboard` sentinels for real ``InlineKeyboardMarkup``.
+
+    The formatter has no access to the live ``session_id``; this loop is
+    where ``permission_kb(session_id, request_id, options)`` runs.
+    """
+    out: list[OutboundMessage] = []
+    for text, slot in messages:
+        if isinstance(slot, _PendingKeyboard):
+            out.append(
+                (text, permission_kb(session_id, slot.request_id, slot.options)),
+            )
+        else:
+            out.append((text, slot))
+    return out
 
 
 async def _send_to_all(
@@ -230,6 +260,11 @@ class _ChatSender:
     async def _run(self) -> None:
         while True:
             text, reply_markup = await self._queue.get()
+            # _materialise_keyboards must have run before the message
+            # reached the queue, so reply_markup is already a real
+            # InlineKeyboardMarkup or None — never a _PendingKeyboard.
+            if isinstance(reply_markup, _PendingKeyboard):  # pragma: no cover - guard
+                continue
             try:
                 await self._bot.send_message(
                     self._chat_id,
