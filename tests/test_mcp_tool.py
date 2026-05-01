@@ -19,13 +19,18 @@ in place of the real claude binary. Asserts:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import anyio
 import pytest
+from mcp import ClientSession
+from mcp import types as mcp_types
 from mcp.shared.memory import create_connected_server_and_client_session
+from mcp.shared.message import SessionMessage
 
 from ccr.claude.events import McpPermissionRequest
 from ccr.claude.mcp import McpPermissionServer
@@ -33,8 +38,6 @@ from ccr.events import EventBus
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
-
-    from mcp import ClientSession
 
 
 _SESSION_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
@@ -369,3 +372,160 @@ def test_format_timeout_message(timeout: float, expected: str) -> None:
     from ccr.claude.mcp import _format_timeout_message  # type: ignore[attr-defined]
 
     assert _format_timeout_message(timeout) == expected
+
+
+# --------------------------------------------------------------------------- #
+# Unix-socket transport integration test (CCR-028).
+#
+# Exercises the real bridge: the listener accepts an inbound asyncio Unix
+# connection, frames raw bytes into JSON-RPC messages, and runs an MCP
+# ``Server.run`` against the resulting object streams. The client side wraps
+# the asyncio reader/writer into the same memory streams ``ClientSession``
+# uses with the in-memory transport.
+# --------------------------------------------------------------------------- #
+
+
+async def _stdio_pump_socket_to_messages(
+    reader: asyncio.StreamReader,
+    sender: anyio.streams.memory.MemoryObjectSendStream[SessionMessage | Exception],
+) -> None:
+    async with sender:
+        buffer = b""
+        try:
+            while True:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    return
+                buffer += chunk
+                while b"\n" in buffer:
+                    raw, buffer = buffer.split(b"\n", 1)
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = mcp_types.JSONRPCMessage.model_validate_json(line)
+                    except Exception as exc:  # noqa: BLE001
+                        await sender.send(exc)
+                        continue
+                    await sender.send(SessionMessage(msg))
+        except (asyncio.CancelledError, ConnectionError):
+            return
+
+
+async def _stdio_pump_messages_to_socket(
+    receiver: anyio.streams.memory.MemoryObjectReceiveStream[SessionMessage],
+    writer: asyncio.StreamWriter,
+) -> None:
+    async with receiver:
+        try:
+            async for session_message in receiver:
+                payload = session_message.message.model_dump_json(
+                    by_alias=True,
+                    exclude_none=True,
+                )
+                writer.write(payload.encode("utf-8") + b"\n")
+                await writer.drain()
+        except (asyncio.CancelledError, ConnectionError):
+            return
+
+
+@contextlib.asynccontextmanager
+async def _client_over_unix_socket(socket_path: str) -> AsyncIterator[ClientSession]:
+    """Connect via asyncio Unix socket and yield an initialized ClientSession."""
+    reader, writer = await asyncio.open_unix_connection(path=socket_path)
+
+    server_to_client_send, server_to_client_recv = anyio.create_memory_object_stream[
+        SessionMessage | Exception
+    ](0)
+    client_to_server_send, client_to_server_recv = anyio.create_memory_object_stream[
+        SessionMessage
+    ](0)
+
+    pump_in = asyncio.create_task(_stdio_pump_socket_to_messages(reader, server_to_client_send))
+    pump_out = asyncio.create_task(_stdio_pump_messages_to_socket(client_to_server_recv, writer))
+
+    try:
+        async with ClientSession(
+            read_stream=server_to_client_recv,
+            write_stream=client_to_server_send,
+        ) as session:
+            await session.initialize()
+            yield session
+    finally:
+        with contextlib.suppress(Exception):
+            writer.close()
+            await writer.wait_closed()
+        for task in (pump_in, pump_out):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        with contextlib.suppress(Exception):
+            await server_to_client_recv.aclose()
+        with contextlib.suppress(Exception):
+            await client_to_server_send.aclose()
+
+
+async def test_bridge_unix_socket_roundtrip(tmp_path: Path) -> None:
+    """End-to-end: relay → bridge → Server.run → tool call → resolve → reply."""
+    bus = EventBus()
+    server = McpPermissionServer(bus=bus, timeout_seconds=5.0, data_dir=tmp_path)
+    server.set_current_session(_SESSION_ID)
+
+    captured: list[McpPermissionRequest] = []
+    collector = asyncio.create_task(_collect_first_envelope(bus, captured))
+    await asyncio.sleep(0)
+
+    try:
+        await server.start()
+
+        # F3: socket file mode is 0o700 after start().
+        sock_path = server._socket_path()  # noqa: SLF001 — test asserts on the implementation detail
+        mode = Path(sock_path).stat().st_mode & 0o777  # noqa: ASYNC240 — single sync stat is fine in tests
+        assert mode == 0o700, f"expected 0o700, got 0o{mode:o}"
+
+        async def _resolver() -> None:
+            await collector
+            assert len(captured) == 1
+            ok = await server.resolve(
+                captured[0].request_id,
+                {"behavior": "allow", "updatedInput": {"cmd": "echo hi"}},
+            )
+            assert ok is True
+
+        resolver_task = asyncio.create_task(_resolver())
+
+        async with _client_over_unix_socket(sock_path) as client:
+            result = await client.call_tool(
+                "ccr_permission_prompt",
+                {"tool_name": "Bash", "input": {"cmd": "echo"}},
+            )
+
+        await resolver_task
+
+        assert len(captured) == 1
+        envelope = captured[0]
+        assert envelope.tool_name == "Bash"
+        assert envelope.tool_input == {"cmd": "echo"}
+        assert envelope.session_id == _SESSION_ID
+
+        payload = _tool_result_payload(result)
+        assert payload == {"behavior": "allow", "updatedInput": {"cmd": "echo hi"}}
+    finally:
+        await server.stop()
+        if not collector.done():
+            collector.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await collector
+
+
+async def test_socket_listener_chmods_socket_to_owner_only(tmp_path: Path) -> None:
+    """F3: ``start()`` tightens the socket file to mode ``0o700``."""
+    bus = EventBus()
+    server = McpPermissionServer(bus=bus, timeout_seconds=5.0, data_dir=tmp_path)
+    try:
+        await server.start()
+        sock_path = server._socket_path()  # noqa: SLF001 — test asserts on impl detail
+        mode = Path(sock_path).stat().st_mode & 0o777  # noqa: ASYNC240 — single sync stat is fine in tests
+        assert mode == 0o700
+    finally:
+        await server.stop()

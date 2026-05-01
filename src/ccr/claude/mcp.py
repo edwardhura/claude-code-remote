@@ -37,6 +37,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import os
 import secrets
 import tempfile
 import uuid
@@ -45,13 +46,16 @@ from typing import TYPE_CHECKING, Any
 
 import anyio
 import structlog
+from mcp import types as mcp_types
 from mcp.server import Server
+from mcp.shared.message import SessionMessage
 from mcp.types import Tool
 
 from ccr.claude.events import McpPermissionRequest
 
 if TYPE_CHECKING:
-    from anyio.abc import SocketListener
+    from anyio.abc import SocketListener, SocketStream
+    from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 
     from ccr.events import EventBus
 
@@ -429,7 +433,12 @@ class McpPermissionServer:
         # Synchronous filesystem prep — these are tiny stat / unlink calls,
         # not blocking I/O of substance, but the lint rule prefers anyio.
         await anyio.to_thread.run_sync(_prepare_socket_path, sock_path)
-        return await anyio.create_unix_listener(sock_path)
+        listener = await anyio.create_unix_listener(sock_path)
+        # Restrict the socket file to the owner before any client can connect.
+        # anyio creates the socket with the umask-derived mode; tighten it
+        # synchronously before we publish the path via the config file.
+        os.chmod(sock_path, 0o700)  # noqa: PTH101 — chmod on a path is the natural API here
+        return listener
 
     async def _serve_listener(self) -> None:
         if self._listener is None:
@@ -441,16 +450,92 @@ class McpPermissionServer:
         except Exception:
             log.exception("mcp_permission_server.listener_error")
 
-    async def _handle_relay_connection(self, stream: object) -> None:  # pragma: no cover
+    async def _handle_relay_connection(self, stream: SocketStream) -> None:
         """Bridge one relay's socket stream into ``Server.run``.
 
-        Production-path only — unit tests drive ``self._server`` via
-        :func:`mcp.shared.memory.create_connected_server_and_client_session`.
-        Closing the stream signals end-of-relay so the listener task can
-        accept subsequent connections.
+        The relay forwards newline-delimited JSON-RPC frames between
+        claude's stdio and this Unix socket. We frame those raw bytes
+        into :class:`SessionMessage` objects using the same pattern as the
+        SDK's ``mcp.server.stdio.stdio_server`` and feed the resulting
+        memory object streams into ``Server.run``.
+
+        Three concurrent tasks run in a task group:
+
+        * :func:`_socket_reader` — reads newline-delimited JSON frames
+          from the socket, parses each into a :class:`JSONRPCMessage`,
+          forwards a :class:`SessionMessage` to the server's read stream.
+        * :func:`_socket_writer` — drains the server's write stream and
+          writes each framed message back to the socket.
+        * ``Server.run`` — drives the MCP request lifecycle.
+
+        Exceptions are swallowed so a single misbehaving relay cannot
+        crash the listener task; the socket is closed on exit.
         """
-        with contextlib.suppress(Exception):
-            await stream.aclose()  # type: ignore[attr-defined]
+        send_to_server, recv_from_socket = anyio.create_memory_object_stream[
+            SessionMessage | Exception
+        ](0)
+        send_to_socket, recv_from_server = anyio.create_memory_object_stream[SessionMessage](0)
+        try:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(_socket_reader, stream, send_to_server)
+                tg.start_soon(_socket_writer, stream, recv_from_server)
+                try:
+                    await self._server.run(
+                        recv_from_socket,
+                        send_to_socket,
+                        self._server.create_initialization_options(),
+                    )
+                finally:
+                    # Closing the write side drains the writer; closing the
+                    # socket unblocks the reader.
+                    with contextlib.suppress(Exception):
+                        await send_to_socket.aclose()
+                    with contextlib.suppress(Exception):
+                        await stream.aclose()
+        except Exception:
+            log.exception("mcp_permission_server.relay_connection_error")
+
+
+async def _socket_reader(
+    stream: SocketStream,
+    send_to_server: MemoryObjectSendStream[SessionMessage | Exception],
+) -> None:
+    """Forward newline-delimited JSON frames from the socket to the MCP server."""
+    buffer = b""
+    try:
+        async with send_to_server:
+            async for chunk in stream:
+                buffer += chunk
+                while b"\n" in buffer:
+                    raw, buffer = buffer.split(b"\n", 1)
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = mcp_types.JSONRPCMessage.model_validate_json(line)
+                    except Exception as exc:  # noqa: BLE001 — forward parse errors to MCP
+                        await send_to_server.send(exc)
+                        continue
+                    await send_to_server.send(SessionMessage(msg))
+    except (anyio.EndOfStream, anyio.ClosedResourceError, anyio.BrokenResourceError):
+        return
+
+
+async def _socket_writer(
+    stream: SocketStream,
+    recv_from_server: MemoryObjectReceiveStream[SessionMessage],
+) -> None:
+    """Drain the MCP server's outgoing stream into the socket as JSON frames."""
+    try:
+        async with recv_from_server:
+            async for session_message in recv_from_server:
+                payload = session_message.message.model_dump_json(
+                    by_alias=True,
+                    exclude_none=True,
+                )
+                await stream.send(payload.encode("utf-8") + b"\n")
+    except (anyio.ClosedResourceError, anyio.BrokenResourceError):
+        return
 
 
 __all__ = ["McpPermissionServer", "McpServerStartError"]
