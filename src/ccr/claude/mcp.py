@@ -110,6 +110,7 @@ class McpPermissionServer:
         self._server = self._build_server()
         self._futures: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._sessions: dict[str, uuid.UUID] = {}
+        self._inputs: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
         self._started = False
         self._config_path: Path | None = None
@@ -353,6 +354,7 @@ class McpPermissionServer:
         )
         self._futures[request_id] = future
         self._sessions[request_id] = session_id
+        self._inputs[request_id] = tool_input
 
         envelope = McpPermissionRequest(
             request_id=request_id,
@@ -385,6 +387,7 @@ class McpPermissionServer:
         finally:
             self._futures.pop(request_id, None)
             self._sessions.pop(request_id, None)
+            self._inputs.pop(request_id, None)
 
     def _mint_request_id(self) -> str:
         for _ in range(_REQUEST_ID_RETRY_LIMIT):
@@ -401,6 +404,14 @@ class McpPermissionServer:
         future = self._futures.get(request_id)
         if future is None or future.done():
             return False
+        # Claude Code's --permission-prompt-tool requires `updatedInput` on
+        # an allow decision to be the (possibly modified) tool input object,
+        # never null. The bot handler does not have the original input, so
+        # it sends `updatedInput: None` and we fill it in here from the
+        # stored input captured at _on_tool_call time.
+        if decision.get("behavior") == "allow" and decision.get("updatedInput") is None:
+            stored_input = self._inputs.get(request_id, {})
+            decision = {**decision, "updatedInput": stored_input}
         try:
             future.set_result(decision)
         except asyncio.InvalidStateError:
