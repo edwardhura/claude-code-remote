@@ -12,14 +12,15 @@ Field validators enforce the constraints documented in the project plan:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     HttpUrl,
     SecretStr,
     field_validator,
+    model_validator,
 )
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 JWT_SECRET_MIN_LENGTH = 32
 WEB_PORT_MIN = 1
@@ -63,6 +64,9 @@ class Settings(BaseSettings):
     pairing_code_ttl_seconds: int = 900
     subprocess_grace_kill_seconds: int = 5
     mcp_permission_timeout_seconds: int = 120
+    permission_mode: Literal["default", "acceptEdits", "plan", "bypassPermissions"] | None = None
+    allowed_tools: Annotated[list[str], NoDecode] = []
+    disallowed_tools: Annotated[list[str], NoDecode] = []
     proxy_port_allowlist: set[int] | None = None
 
     @field_validator("jwt_secret")
@@ -106,6 +110,34 @@ class Settings(BaseSettings):
             )
             raise ValueError(message)
         return value
+
+    @field_validator("allowed_tools", "disallowed_tools", mode="before")
+    @classmethod
+    def _parse_tool_list(cls, value: Any) -> list[str]:
+        """Parse a comma-separated string of tool names into a list.
+
+        Mirrors the env-friendly handling for ``proxy_port_allowlist``: blank
+        / whitespace-only values yield an empty list, already-parsed iterables
+        are passed through, and individual entries are stripped.
+        """
+        if value is None:
+            return []
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            return [token.strip() for token in stripped.split(",") if token.strip()]
+        if isinstance(value, (list, tuple)):
+            return [str(item) for item in value]
+        message = f"tool list must be a string or iterable, got {type(value).__name__}."
+        raise TypeError(message)
+
+    @model_validator(mode="after")
+    def _tools_mutually_exclusive(self) -> Settings:
+        if self.allowed_tools and self.disallowed_tools:
+            message = "ALLOWED_TOOLS and DISALLOWED_TOOLS are mutually exclusive; set at most one."
+            raise ValueError(message)
+        return self
 
     @field_validator("proxy_port_allowlist", mode="before")
     @classmethod

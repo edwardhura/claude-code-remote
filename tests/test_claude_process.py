@@ -23,7 +23,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 FAKE_CLAUDE = REPO_ROOT / "tests" / "fakes" / "fake_claude"
 
 
-def _make_settings(tmp_path: Path, *, extra_args: str = "") -> Settings:
+def _make_settings(
+    tmp_path: Path,
+    *,
+    extra_args: str = "",
+    permission_mode: str | None = None,
+    allowed_tools: list[str] | None = None,
+    disallowed_tools: list[str] | None = None,
+) -> Settings:
     return Settings(
         telegram_bot_token="dummy-token",  # type: ignore[arg-type]
         public_url="http://localhost",  # type: ignore[arg-type]
@@ -32,6 +39,9 @@ def _make_settings(tmp_path: Path, *, extra_args: str = "") -> Settings:
         claude_bin=str(FAKE_CLAUDE),
         claude_extra_args=extra_args,
         subprocess_grace_kill_seconds=2,
+        permission_mode=permission_mode,  # type: ignore[arg-type]
+        allowed_tools=allowed_tools or [],
+        disallowed_tools=disallowed_tools or [],
     )
 
 
@@ -132,3 +142,125 @@ async def test_argv_continue_appears_before_mcp_flags_when_resume_true(
     cont_idx = argv_lines.index("--continue")
     perm_idx = argv_lines.index("--permission-prompt-tool")
     assert cont_idx < perm_idx
+
+
+async def test_argv_permission_mode_inserted_between_resume_and_mcp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv_file = tmp_path / "argv.txt"
+    monkeypatch.setenv("FAKE_CLAUDE_ARGV_FILE", str(argv_file))
+    monkeypatch.setenv("PYTHONPATH", str(REPO_ROOT))
+    monkeypatch.setenv("FAKE_CLAUDE_SCRIPT", "")
+
+    settings = _make_settings(
+        tmp_path,
+        extra_args="--my-extra-flag value",
+        permission_mode="acceptEdits",
+    )
+    proc = ClaudeProcess(
+        settings=settings,
+        resume=True,
+        mcp_argv=[
+            "--permission-prompt-tool",
+            "mcp__ccr__ccr_permission_prompt",
+            "--mcp-config",
+            "/tmp/x.json",
+        ],
+    )
+    await proc.start()
+    await proc.wait()
+
+    argv_lines = argv_file.read_text(encoding="utf-8").splitlines()
+    cont_idx = argv_lines.index("--continue")
+    mode_idx = argv_lines.index("--permission-mode")
+    perm_idx = argv_lines.index("--permission-prompt-tool")
+    extra_idx = argv_lines.index("--my-extra-flag")
+
+    assert argv_lines[mode_idx + 1] == "acceptEdits"
+    # Order: --continue, --permission-mode, --permission-prompt-tool, user extras.
+    assert cont_idx < mode_idx < perm_idx < extra_idx
+    # User extras land last in argv.
+    assert argv_lines[extra_idx + 1] == "value"
+    assert extra_idx + 1 == len(argv_lines) - 1
+
+
+async def test_argv_disallowed_tools_inserted_before_mcp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv_file = tmp_path / "argv.txt"
+    monkeypatch.setenv("FAKE_CLAUDE_ARGV_FILE", str(argv_file))
+    monkeypatch.setenv("PYTHONPATH", str(REPO_ROOT))
+    monkeypatch.setenv("FAKE_CLAUDE_SCRIPT", "")
+
+    settings = _make_settings(tmp_path, disallowed_tools=["Write", "Edit"])
+    proc = ClaudeProcess(
+        settings=settings,
+        mcp_argv=[
+            "--permission-prompt-tool",
+            "mcp__ccr__ccr_permission_prompt",
+            "--mcp-config",
+            "/tmp/x.json",
+        ],
+    )
+    await proc.start()
+    await proc.wait()
+
+    argv_lines = argv_file.read_text(encoding="utf-8").splitlines()
+    dis_idx = argv_lines.index("--disallowed-tools")
+    perm_idx = argv_lines.index("--permission-prompt-tool")
+    assert argv_lines[dis_idx + 1] == "Write,Edit"
+    assert dis_idx < perm_idx
+    # No --allowed-tools flag in argv when only disallowed is set.
+    assert "--allowed-tools" not in argv_lines
+
+
+async def test_argv_allowed_tools_inserted_before_mcp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv_file = tmp_path / "argv.txt"
+    monkeypatch.setenv("FAKE_CLAUDE_ARGV_FILE", str(argv_file))
+    monkeypatch.setenv("PYTHONPATH", str(REPO_ROOT))
+    monkeypatch.setenv("FAKE_CLAUDE_SCRIPT", "")
+
+    settings = _make_settings(tmp_path, allowed_tools=["Read", "Grep"])
+    proc = ClaudeProcess(
+        settings=settings,
+        mcp_argv=[
+            "--permission-prompt-tool",
+            "mcp__ccr__ccr_permission_prompt",
+            "--mcp-config",
+            "/tmp/x.json",
+        ],
+    )
+    await proc.start()
+    await proc.wait()
+
+    argv_lines = argv_file.read_text(encoding="utf-8").splitlines()
+    allow_idx = argv_lines.index("--allowed-tools")
+    perm_idx = argv_lines.index("--permission-prompt-tool")
+    assert argv_lines[allow_idx + 1] == "Read,Grep"
+    assert allow_idx < perm_idx
+    assert "--disallowed-tools" not in argv_lines
+
+
+async def test_argv_defaults_unchanged_with_no_new_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv_file = tmp_path / "argv.txt"
+    monkeypatch.setenv("FAKE_CLAUDE_ARGV_FILE", str(argv_file))
+    monkeypatch.setenv("PYTHONPATH", str(REPO_ROOT))
+    monkeypatch.setenv("FAKE_CLAUDE_SCRIPT", "")
+
+    settings = _make_settings(tmp_path)
+    proc = ClaudeProcess(settings=settings)
+    await proc.start()
+    await proc.wait()
+
+    argv_lines = argv_file.read_text(encoding="utf-8").splitlines()
+    assert "--permission-mode" not in argv_lines
+    assert "--allowed-tools" not in argv_lines
+    assert "--disallowed-tools" not in argv_lines
