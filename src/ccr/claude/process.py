@@ -74,6 +74,15 @@ class ClaudeProcess:
         --output-format=stream-json --verbose`` plus any
         ``settings.claude_extra_args`` (whitespace-split via :mod:`shlex`).
 
+        Permission-related flags from settings (CCR-029) slot between the
+        resume/continue block and the MCP block:
+
+        * ``settings.permission_mode`` → ``--permission-mode <value>``
+        * ``settings.disallowed_tools`` → ``--disallowed-tools a,b,c``
+        * ``settings.allowed_tools`` → ``--allowed-tools a,b,c`` (mutually
+          exclusive with ``disallowed_tools``; the validator on
+          :class:`~ccr.config.Settings` enforces that only one is set).
+
         Raises :class:`RuntimeError` if called more than once on the same
         instance, or :class:`FileNotFoundError` if ``claude_bin`` is not
         on PATH (caller is expected to wrap that into a friendlier error).
@@ -92,14 +101,21 @@ class ClaudeProcess:
         ]
         # Argv ordering: our fixed control flags first; then resume /
         # continue (so the user's --resume override at the tail wins);
-        # then MCP permission-prompt-tool tokens (so the user's
-        # --permission-prompt-tool override at the tail wins); and finally
-        # ``claude_extra_args`` last so the user can still override every
-        # one of our flags by appending.
+        # then permission-related settings (CCR-029) so they group with
+        # the MCP block; then MCP permission-prompt-tool tokens (so the
+        # user's --permission-prompt-tool override at the tail wins); and
+        # finally ``claude_extra_args`` last so the user can still override
+        # every one of our flags by appending.
         if self._resume is True:
             argv.append("--continue")
         elif isinstance(self._resume, str) and self._resume:
             argv.extend(["--resume", self._resume])
+        if self._settings.permission_mode is not None:
+            argv.extend(["--permission-mode", self._settings.permission_mode])
+        if self._settings.disallowed_tools:
+            argv.extend(["--disallowed-tools", ",".join(self._settings.disallowed_tools)])
+        elif self._settings.allowed_tools:
+            argv.extend(["--allowed-tools", ",".join(self._settings.allowed_tools)])
         if self._mcp_argv:
             argv.extend(self._mcp_argv)
         extra = (self._settings.claude_extra_args or "").strip()
