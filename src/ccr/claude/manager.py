@@ -138,6 +138,8 @@ class SessionManager:
         # tool_use_id -> subagent_type. Populated when a Task/Agent tool fires;
         # entry removed when the matching tool_result arrives.
         self._running_subagents: dict[str, str] = {}
+        # Snapshot of skill names from the most recent system/init event.
+        self._skills: list[str] = []
 
         # MCP permission gate (CCR-025). Lifetime = manager lifetime; lazily
         # started on the first new_session / continue_session call so a
@@ -223,6 +225,7 @@ class SessionManager:
             self._last_event_at_write_ts = 0.0
             self._last_event_at_pending = None
             self._running_subagents = {}
+            self._skills = []
             self._mcp.set_current_session(session_id)
 
             now = datetime.now(UTC)
@@ -350,6 +353,7 @@ class SessionManager:
             self._last_event_at_write_ts = 0.0
             self._last_event_at_pending = None
             self._running_subagents = {}
+            self._skills = []
             self._mcp.set_current_session(session_id)
 
             now = datetime.now(UTC)
@@ -529,6 +533,7 @@ class SessionManager:
         self._consumer_task = None
         self._exit_task = None
         self._running_subagents = {}
+        self._skills = []
 
     async def _consume_events(self) -> None:
         """Drain :meth:`ClaudeProcess.events` into the log + bus.
@@ -554,6 +559,7 @@ class SessionManager:
 
                 if isinstance(event, SystemInit):
                     self._init_event.set()
+                    self._skills = list(event.skills)
                 elif isinstance(event, ResultEvent) and event.subtype == "success":
                     self._saw_result_success = True
 
@@ -831,6 +837,17 @@ class SessionManager:
         been dispatched.
         """
         return sorted(set(self._running_subagents.values()))
+
+    def available_skills(self) -> list[str]:
+        """Return a sorted snapshot of skills from the most recent system/init event.
+
+        Returns ``[]`` when no session is running or the init event carried no skills.
+        """
+        return sorted(self._skills)
+
+    def is_session_active(self) -> bool:
+        """Return ``True`` iff a Claude subprocess is currently held."""
+        return self._proc is not None
 
 
 __all__ = [

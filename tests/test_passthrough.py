@@ -57,16 +57,28 @@ class FakeManager:
         *,
         send_side_effect: Exception | None = None,
         running: list[str] | None = None,
+        skills: list[str] | None = None,
+        active: bool = True,
     ) -> None:
         self.send_slash = AsyncMock()
         if send_side_effect is not None:
             self.send_slash.side_effect = send_side_effect
         self._running = list(running) if running is not None else []
+        self._skills = list(skills) if skills is not None else []
+        self._active = active
 
     def running_subagents(self) -> list[str]:
         # Mirror SessionManager.running_subagents()'s contract: alphabetically
         # sorted, deduplicated.
         return sorted(set(self._running))
+
+    def available_skills(self) -> list[str]:
+        # Mirror SessionManager.available_skills()'s contract: alphabetically
+        # sorted snapshot.
+        return sorted(self._skills)
+
+    def is_session_active(self) -> bool:
+        return self._active
 
 
 # --------------------------------------------------------------------------- #
@@ -214,7 +226,7 @@ async def test_unknown_command_returns_usage(tmp_path: Path) -> None:
     manager.send_slash.assert_not_awaited()
     msg.answer.assert_awaited_once_with(
         "Unknown command. Whitelisted: /new /stop /clear /view /last /preview "
-        "/cost /model /compact /who.",
+        "/cost /model /compact /who /agents /skills.",
     )
 
 
@@ -422,3 +434,115 @@ async def test_agents_library_skips_non_md_and_hidden(tmp_path: Path) -> None:
     assert "bar" not in text
     assert "hidden" not in text
     assert "subdir" not in text
+
+
+# --------------------------------------------------------------------------- #
+# /skills — list skills carried on the session/init event.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_skills_renders_alphabetical_bullet_list(tmp_path: Path) -> None:
+    """``/skills`` with a non-empty list renders the header + each skill as a bullet."""
+    manager = FakeManager(
+        skills=["update-config", "debug", "simplify", "implement-ticket"],
+        active=True,
+    )
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/skills")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("skills"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    text = _captured_text(msg)
+    assert "<b>Skills</b>" in text
+    assert "• debug" in text
+    assert "• implement-ticket" in text
+    assert "• simplify" in text
+    assert "• update-config" in text
+    # Alphabetical.
+    i_debug = text.index("• debug")
+    i_impl = text.index("• implement-ticket")
+    i_simp = text.index("• simplify")
+    i_upd = text.index("• update-config")
+    assert i_debug < i_impl < i_simp < i_upd
+
+
+@pytest.mark.asyncio
+async def test_skills_empty_with_active_session_renders_placeholder(tmp_path: Path) -> None:
+    """``/skills`` with an active session and no skills renders the empty placeholder."""
+    manager = FakeManager(skills=[], active=True)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/skills")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("skills"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    text = _captured_text(msg)
+    assert text == "<b>Skills</b>\n(none)"
+
+
+@pytest.mark.asyncio
+async def test_skills_no_active_session(tmp_path: Path) -> None:
+    """``/skills`` with no active session returns the canonical idle string."""
+    manager = FakeManager(skills=[], active=False)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/skills")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("skills"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    msg.answer.assert_awaited_once_with("No active session.")
+
+
+@pytest.mark.asyncio
+async def test_skills_html_escapes_special_chars(tmp_path: Path) -> None:
+    """Skill names containing ``<``, ``>``, ``&`` are HTML-escaped before rendering."""
+    manager = FakeManager(skills=["a&b", "<weird>"], active=True)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/skills")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("skills"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    text = _captured_text(msg)
+    assert "&lt;weird&gt;" in text
+    assert "a&amp;b" in text
+    # Raw special chars must not appear in the rendered payload.
+    assert "<weird>" not in text
+    assert "• a&b" not in text
+
+
+@pytest.mark.asyncio
+async def test_skills_branch_fires_before_unknown_fallthrough(tmp_path: Path) -> None:
+    """Regression: ``/skills`` is handled by its own branch, not the unknown hint."""
+    manager = FakeManager(skills=["alpha"], active=True)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/skills")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("skills"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    text = _captured_text(msg)
+    assert "Unknown command" not in text
+    assert "<b>Skills</b>" in text

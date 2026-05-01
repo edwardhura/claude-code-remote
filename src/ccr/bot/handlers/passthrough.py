@@ -47,7 +47,7 @@ BLOCKED_INTERACTIVE: frozenset[str] = frozenset({"mcp", "init"})
 
 _UNKNOWN_USAGE_HINT = (
     "Unknown command. Whitelisted: /new /stop /clear /view /last /preview "
-    "/cost /model /compact /who."
+    "/cost /model /compact /who /agents /skills."
 )
 
 _AGENTS_LIBRARY_GLOB_REL = ".claude/agents"
@@ -93,6 +93,22 @@ async def _reply_agents(
     await msg.answer(text)
 
 
+def _render_skills_reply(skills: list[str]) -> str:
+    if not skills:
+        body = _EMPTY_PLACEHOLDER
+    else:
+        body = "\n".join(f"• {html.escape(name)}" for name in skills)
+    return f"<b>Skills</b>\n{body}"
+
+
+async def _reply_skills(msg: Message, session_manager: SessionManager) -> None:
+    if not session_manager.is_session_active():
+        await msg.answer("No active session.")
+        return
+    skills = session_manager.available_skills()
+    await msg.answer(_render_skills_reply(skills))
+
+
 @router.message(Command(re.compile(r".+")))
 async def cmd_passthrough(
     msg: Message,
@@ -106,6 +122,10 @@ async def cmd_passthrough(
 
     if name == "agents":
         await _reply_agents(msg, session_manager, settings)
+        return
+
+    if name == "skills":
+        await _reply_skills(msg, session_manager)
         return
 
     if name in WHITELIST:
