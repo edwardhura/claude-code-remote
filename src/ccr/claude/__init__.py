@@ -1,7 +1,7 @@
 """Claude subprocess wrapper, event schema, JSONL log, session manager.
 
-Public surface consumed by downstream tickets (CCR-008 chat-bot, CCR-009
-permission gating, CCR-010 slash passthrough, CCR-012 web SSE):
+Public surface consumed by downstream tickets (CCR-008 chat-bot, CCR-025
+MCP permission gating, CCR-010 slash passthrough, CCR-012 web SSE):
 
 * :class:`SessionManager` — globally enforces a single running Claude
   session; owns a :class:`ClaudeProcess`, a :class:`JsonlSessionLog`, the

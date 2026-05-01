@@ -469,3 +469,44 @@ Notes:
   - 2026-04-30 team-lead: approved
   - 2026-05-01 main: scope extended (optional 8-hex session-id argument) before publish; ticket reopened from DONE.md, dispatching python-developer with fix scope
   - 2026-05-01 team-lead: re-approved (extension verified)
+---
+
+## CCR-024: Remove dead permission-gating code (CCR-009 cleanup) [done]
+Phase: n/a (post-CCR-021 cleanup)
+Feature: claude-runtime
+Files:
+  - `src/ccr/claude/events.py` — remove the `PermissionRequest` Pydantic variant from the discriminated union and from the `_KnownEvent` union; remove any permission-related fields/imports it pulled in. Keep the `UnknownEvent` fallback intact.
+  - `src/ccr/claude/process.py` — remove `send_permission_response` method (currently around lines 153-174); remove the misattributed `TODO(CCR-019)` comment around line 152 (do not repoint — the work it referenced is dead).
+  - `src/ccr/claude/manager.py` — remove the permission-gating dicts (`_pending_permissions`, `_pending_options`, `_telegram_pause_count`, `_telegram_resume`) and their public accessors (`is_telegram_paused`, `wait_for_resume`, `is_permission_choice_valid`); remove `_record_pending_permission` / `_clear_pending_permission` helpers; simplify `_teardown_locked` to drop the gate cleanup; remove `send_permission` method.
+  - `src/ccr/server.py` — remove the broadcast-loop pause/buffer logic in `_broadcast_loop` keyed on `is_telegram_paused` / `_PendingKeyboard` materialisation for `PermissionRequest`. The non-permission broadcast path stays intact.
+  - `src/ccr/bot/formatting.py` — remove the `PermissionRequest` branch and the `_PendingKeyboard` sentinel; revert `OutboundMessage` to a plain-text shape if no other path needs the keyboard slot, OR keep the tuple shape if `keyboards.py` is being preserved for reuse (see Notes).
+  - `tests/fakes/fake_claude.py` — remove permission-request fixture lines and any directives that emitted them.
+  - `tests/test_claude_events.py` — remove or skip `PermissionRequest` round-trip cases.
+  - `tests/test_session_manager.py` — remove the four CCR-009 permission-gating test cases (pause/clear on response, concurrent counting, forged-choice rejection, teardown clears pending permissions).
+  - `tests/test_claude_process.py` — remove cases exercising `send_permission_response`.
+  - `tests/test_formatting.py` — remove `test_permission_request_returns_message_with_keyboard_sentinel` and `test_permission_request_html_escapes_tool_name_and_input`.
+  - `tests/test_broadcast.py` — remove `test_broadcast_permission_message_carries_keyboard`, `test_broadcast_buffers_text_event_during_permission_then_drains_in_order`, `test_broadcast_sse_subscriber_not_paused`.
+  - `tests/test_bot_permission.py` — delete the file outright if `permission.py` is removed; otherwise keep only the keyboard-shape unit tests if the keyboards module is being preserved (see Notes).
+  - `src/ccr/bot/handlers/permission.py` and `src/ccr/bot/keyboards.py` — see Notes for the keep-or-delete decision.
+  - `src/ccr/bot/app.py` — if `permission_router` is removed, drop its registration.
+Out of scope:
+  - Building the new MCP permission channel — that is CCR-025.
+  - Refactoring any other part of the broadcast/event pipeline.
+  - Touching the inline-button machinery for non-permission features (none today, but the keyboard helpers may be reused — see Notes).
+Acceptance:
+  - [x] No symbol named `PermissionRequest` survives anywhere in `src/ccr/` (verify via `grep -r "PermissionRequest" src/`).
+  - [x] No symbol named `send_permission_response` survives in `src/ccr/` (verify via `grep -r "send_permission_response" src/`).
+  - [x] No `TODO(CCR-019)` comment survives in `src/ccr/claude/process.py` (verify via `grep -n "TODO(CCR-019)" src/ccr/claude/process.py`).
+  - [x] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [x] `ruff check src tests` passes.
+  - [x] `mypy src` passes.
+Depends on: CCR-009
+Notes:
+  This is a *deletion* ticket, not a refactor. CCR-021's Step-0 probe (transcript at `tmp/ccr-021-probe-1777590778.jsonl`, summary at `tmp/ccr-021-probe-1777590778.summary.txt`) confirmed claude `-p` does not emit `permission_request` events on stdout — Anthropic's documented mechanism for non-interactive permission gating is `--permission-prompt-tool <mcp_tool>`, which is the load-bearing follow-up tracked in CCR-025. Everything CCR-009 added that is keyed on the never-arriving JSONL `permission_request` channel is dead code and must come out before CCR-025 lands.
+  **PM decision on the bot-side button infrastructure.** The user's PM-context note left the keep-or-delete call for `src/ccr/bot/keyboards.py`, `src/ccr/bot/handlers/permission.py`, and the callback router up to PM. Decision: **keep the keyboards/callback-router scaffolding dormant** — `permission_kb` and the `cb_permission` callback shape are reusable for the MCP path (the MCP tool publishes a permission-request envelope onto the EventBus; the bot will render the same buttons and route the same `perm:` callback prefix back into the awaiting Future). Concretely: keep `src/ccr/bot/keyboards.py` as-is; keep `src/ccr/bot/handlers/permission.py` registered on the dispatcher but stub the body to raise `NotImplementedError("MCP integration pending — see CCR-025")` so any tap during the cleanup window fails loudly rather than silently no-ops; keep the `OutboundMessage` tuple shape in `formatting.py` (the MCP envelope reuses it). The `_PendingKeyboard` sentinel and the permission-specific buffer/drain logic in `server.py` are NOT reusable in this form — they are keyed on `PermissionRequest` events that no longer exist — so they go.
+  If the developer disagrees with this keep-vs-delete split during implementation (e.g. the keyboards module is too tightly coupled to the dead code to keep cleanly), they should call it out in the work summary — team-lead can adjust scope rather than the developer guessing.
+  Mode 1A note for team-lead: skip the architect — small, additive, deletion-only; scope is "remove dead code, run the suite". This is developer-direct.
+
+### Review log
+  - 2026-05-01 main: branch ccr-024-remove-dead-permission-code created, dispatching team-lead
+  - 2026-05-01 team-lead: approved
