@@ -22,7 +22,7 @@ import structlog
 from ccr.claude.events import ContentBlock, parse_event
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Sequence
     from pathlib import Path
 
     from ccr.config import Settings
@@ -55,10 +55,12 @@ class ClaudeProcess:
         settings: Settings,
         cwd: Path | None = None,
         resume: bool | str = False,
+        mcp_argv: Sequence[str] | None = None,
     ) -> None:
         self._settings = settings
         self._cwd = cwd
         self._resume: bool | str = resume
+        self._mcp_argv: tuple[str, ...] | None = tuple(mcp_argv) if mcp_argv is not None else None
         self._proc: asyncio.subprocess.Process | None = None
         self._stderr_tail: bytearray = bytearray()
         self._stderr_task: asyncio.Task[None] | None = None
@@ -88,13 +90,18 @@ class ClaudeProcess:
             "--output-format=stream-json",
             "--verbose",
         ]
-        # Insert resume flag(s) after our fixed control flags but before any
-        # user-supplied ``claude_extra_args`` so the user can override us by
-        # appending. ``resume=False`` / ``resume=""`` produce no flag.
+        # Argv ordering: our fixed control flags first; then resume /
+        # continue (so the user's --resume override at the tail wins);
+        # then MCP permission-prompt-tool tokens (so the user's
+        # --permission-prompt-tool override at the tail wins); and finally
+        # ``claude_extra_args`` last so the user can still override every
+        # one of our flags by appending.
         if self._resume is True:
             argv.append("--continue")
         elif isinstance(self._resume, str) and self._resume:
             argv.extend(["--resume", self._resume])
+        if self._mcp_argv:
+            argv.extend(self._mcp_argv)
         extra = (self._settings.claude_extra_args or "").strip()
         if extra:
             argv.extend(shlex.split(extra))

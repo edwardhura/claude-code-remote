@@ -754,3 +754,157 @@ async def test_db_lookup_session_by_prefix_returns_none_for_no_match(
     prior_id, claude_id = await manager._db_lookup_session_by_prefix("12345678")  # noqa: SLF001
     assert prior_id is None
     assert claude_id is None
+
+
+# --------------------------------------------------------------------------- #
+# CCR-025: MCP permission gate plumbing.
+# --------------------------------------------------------------------------- #
+
+
+async def test_resolve_permission_happy_path(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Manager forwards :meth:`resolve_permission` to the MCP server's Future map."""
+    import uuid as _uuid_mod
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+    sid = _uuid_mod.UUID("88888888-8888-8888-8888-888888888888")
+    manager._mcp.set_current_session(sid)  # noqa: SLF001 — direct internal probe
+
+    async def _drive_tool_call() -> dict[str, object]:
+        return await manager._mcp._on_tool_call("Bash", {"cmd": "ls"})  # noqa: SLF001
+
+    tool_task = asyncio.create_task(_drive_tool_call())
+    # Give the tool call a tick to register the Future before we resolve.
+    await asyncio.sleep(0.01)
+    pending = list(manager._mcp._futures.keys())  # noqa: SLF001
+    assert len(pending) == 1
+    request_id = pending[0]
+    assert manager.is_permission_pending(request_id) is True
+
+    ok = await manager.resolve_permission(
+        request_id,
+        {"behavior": "allow", "updatedInput": {"x": 1}},
+    )
+    assert ok is True
+
+    payload = await asyncio.wait_for(tool_task, timeout=1.0)
+    assert payload == {"behavior": "allow", "updatedInput": {"x": 1}}
+
+
+async def test_resolve_permission_unknown_request_id_returns_false(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+    ok = await manager.resolve_permission("nope", {"behavior": "deny", "message": "x"})
+    assert ok is False
+    assert manager.is_permission_pending("nope") is False
+
+
+async def test_teardown_cancels_pending_permissions_with_deny(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``manager.stop()`` must cancel any outstanding permission Futures with deny."""
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script, delay_ms=200)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    session_id = await manager.new_session(prompt=None, started_by_tg_user_id=None)
+
+    # Drive an in-flight permission tool call against the manager's MCP server.
+    async def _drive() -> dict[str, object]:
+        return await manager._mcp._on_tool_call("Edit", {})  # noqa: SLF001
+
+    tool_task = asyncio.create_task(_drive())
+    await asyncio.sleep(0.01)
+    request_ids = list(manager._mcp._futures.keys())  # noqa: SLF001
+    assert request_ids, "expected one in-flight permission Future"
+
+    await manager.stop()
+    payload = await asyncio.wait_for(tool_task, timeout=1.0)
+    assert payload["behavior"] == "deny"
+    assert manager.is_permission_pending(request_ids[0]) is False
+    import uuid as _uuid_mod
+
+    assert isinstance(session_id, _uuid_mod.UUID)
+
+
+async def test_new_session_starts_mcp_server_idempotently(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two ``new_session`` calls share one MCP server start."""
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    call_count = 0
+    real_start = manager._mcp.start  # noqa: SLF001
+
+    async def _spy_start() -> None:
+        nonlocal call_count
+        call_count += 1
+        await real_start()
+
+    manager._mcp.start = _spy_start  # type: ignore[method-assign] # noqa: SLF001
+
+    await manager.new_session(prompt=None, started_by_tg_user_id=None)
+    await _drain_status(bus, SessionStatus.COMPLETED, timeout=5.0)
+
+    await manager.new_session(prompt=None, started_by_tg_user_id=None)
+    await _drain_status(bus, SessionStatus.COMPLETED, timeout=5.0)
+
+    # Real start always returns early on the second call (idempotency
+    # guard inside McpPermissionServer); the spy still counts every
+    # invocation, but only the first should trigger work because
+    # _mcp_started flips to True after the first new_session.
+    assert call_count == 1
+
+
+async def test_new_session_argv_includes_mcp_flags(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The subprocess argv must carry ``--permission-prompt-tool`` and ``--mcp-config``."""
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script)
+    argv_file = tmp_path / "argv.txt"
+    monkeypatch.setenv("FAKE_CLAUDE_ARGV_FILE", str(argv_file))
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    await manager.new_session(prompt=None, started_by_tg_user_id=None)
+    await _drain_status(bus, SessionStatus.COMPLETED, timeout=5.0)
+
+    argv_lines = argv_file.read_text(encoding="utf-8").splitlines()
+    assert "--permission-prompt-tool" in argv_lines
+    assert "mcp__ccr__ccr_permission_prompt" in argv_lines
+    assert "--mcp-config" in argv_lines

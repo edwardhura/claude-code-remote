@@ -264,3 +264,56 @@ async def test_broadcast_skips_events_with_no_messages(
     loop_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await loop_task
+
+
+async def test_broadcast_renders_mcp_permission_request_with_keyboard(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An :class:`McpPermissionRequest` envelope produces one keyboard message per chat."""
+    from aiogram.types import InlineKeyboardMarkup
+
+    from ccr.bot.keyboards import permission_kb
+    from ccr.claude.events import McpPermissionRequest
+
+    await _seed_user(session_factory, tg_user_id=1, last_chat_id=1001, is_owner=True)
+    await _seed_user(session_factory, tg_user_id=2, last_chat_id=1002)
+
+    bus = EventBus()
+    bot = AsyncMock()
+    bot.send_message = AsyncMock()
+
+    loop_task = asyncio.create_task(_broadcast_loop(bus, bot, session_factory))
+    await asyncio.sleep(0)
+
+    envelope = McpPermissionRequest(
+        request_id="abcd1234",
+        session_id=_SESSION_ID,
+        tool_name="Bash",
+        tool_input={"cmd": "ls"},
+    )
+    # Synthetic envelope: no ``seq`` key in the bus payload.
+    await bus.publish(
+        "session.event",
+        {"session_id": _SESSION_ID, "event": envelope},
+    )
+    await _wait_for_call_count(bot.send_message, 2)
+
+    expected_kb = permission_kb(_SESSION_ID, "abcd1234", ["approve", "deny"])
+    chat_ids = {call.args[0] for call in bot.send_message.await_args_list}
+    assert chat_ids == {1001, 1002}
+    for call in bot.send_message.await_args_list:
+        kb = call.kwargs.get("reply_markup")
+        assert isinstance(kb, InlineKeyboardMarkup)
+        # Compare callback_data tuples since the InlineKeyboardMarkup
+        # equality semantics include extra metadata.
+        sent = [(btn.text, btn.callback_data) for row in kb.inline_keyboard for btn in row]
+        expected = [
+            (btn.text, btn.callback_data) for row in expected_kb.inline_keyboard for btn in row
+        ]
+        assert sent == expected
+        assert "Permission requested" in call.args[1]
+        assert "<code>Bash</code>" in call.args[1]
+
+    loop_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await loop_task

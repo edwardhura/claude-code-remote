@@ -39,6 +39,7 @@ from ccr.claude.events import (
     UnknownEvent,
 )
 from ccr.claude.log import JsonlSessionLog
+from ccr.claude.mcp import McpPermissionServer, McpServerStartError
 from ccr.claude.process import ClaudeProcess
 from ccr.claude.state import SessionStatus
 from ccr.db.models import Session
@@ -126,6 +127,17 @@ class SessionManager:
         self._last_event_at_write_ts: float = 0.0
         self._last_event_at_pending: asyncio.Task[None] | None = None
 
+        # MCP permission gate (CCR-025). Lifetime = manager lifetime; lazily
+        # started on the first new_session / continue_session call so a
+        # SessionManager constructed in tests that never spins claude does
+        # not pay the listener cost.
+        self._mcp = McpPermissionServer(
+            bus=bus,
+            timeout_seconds=float(settings.mcp_permission_timeout_seconds),
+            data_dir=settings.data_dir,
+        )
+        self._mcp_started = False
+
     # ------------------------------------------------------------------ #
     # Public API.
     # ------------------------------------------------------------------ #
@@ -175,12 +187,14 @@ class SessionManager:
             if self._proc is not None:
                 await self._teardown_locked(final_status=SessionStatus.STOPPED)
 
+            await self._ensure_mcp_started()
+
             session_id = uuid.uuid4()
             log_path = self._logs_dir / f"{session_id}.jsonl"
             session_log = JsonlSessionLog(log_path)
             await session_log.open()
 
-            proc = ClaudeProcess(settings=self._settings)
+            proc = ClaudeProcess(settings=self._settings, mcp_argv=self._mcp.claude_argv)
             try:
                 await proc.start()
             except FileNotFoundError as exc:
@@ -196,6 +210,7 @@ class SessionManager:
             self._init_event = asyncio.Event()
             self._last_event_at_write_ts = 0.0
             self._last_event_at_pending = None
+            self._mcp.set_current_session(session_id)
 
             now = datetime.now(UTC)
             self._started_at = now
@@ -294,12 +309,18 @@ class SessionManager:
                     message = f"No session found with id {session_id_prefix}."
                     raise SessionNotFoundError(message)
 
+            await self._ensure_mcp_started()
+
             session_id = uuid.uuid4()
             log_path = self._logs_dir / f"{session_id}.jsonl"
             session_log = JsonlSessionLog(log_path)
             await session_log.open()
 
-            proc = ClaudeProcess(settings=self._settings, resume=True)
+            proc = ClaudeProcess(
+                settings=self._settings,
+                resume=True,
+                mcp_argv=self._mcp.claude_argv,
+            )
             try:
                 await proc.start()
             except FileNotFoundError as exc:
@@ -315,6 +336,7 @@ class SessionManager:
             self._init_event = asyncio.Event()
             self._last_event_at_write_ts = 0.0
             self._last_event_at_pending = None
+            self._mcp.set_current_session(session_id)
 
             now = datetime.now(UTC)
             self._started_at = now
@@ -400,9 +422,51 @@ class SessionManager:
                 return
             await self._teardown_locked(final_status=SessionStatus.STOPPED)
 
+    async def shutdown(self) -> None:
+        """Stop the active session AND tear the MCP permission server down.
+
+        Called from :func:`ccr.server.serve`'s ``finally`` block. Idempotent.
+        """
+        await self.stop()
+        if self._mcp_started:
+            await self._mcp.stop()
+            self._mcp_started = False
+
+    async def resolve_permission(
+        self,
+        request_id: str,
+        decision: dict[str, object],
+    ) -> bool:
+        """Forward to :meth:`McpPermissionServer.resolve`.
+
+        Returns ``True`` if the Future was set by THIS call, ``False`` if
+        ``request_id`` was unknown or already resolved (the bot maps both
+        to "Stale prompt").
+        """
+        return await self._mcp.resolve(request_id, dict(decision))
+
+    def is_permission_pending(self, request_id: str) -> bool:
+        """Return ``True`` iff a Future is registered for ``request_id``."""
+        return self._mcp.is_pending(request_id)
+
     # ------------------------------------------------------------------ #
     # Internals.
     # ------------------------------------------------------------------ #
+
+    async def _ensure_mcp_started(self) -> None:
+        """Lazily start the MCP permission server (idempotent).
+
+        Mirrors the ``FileNotFoundError`` → :class:`SessionError` mapping
+        used for the claude binary so callers see one error type.
+        """
+        if self._mcp_started:
+            return
+        try:
+            await self._mcp.start()
+        except McpServerStartError as exc:
+            message = f"failed to start MCP permission server: {exc}"
+            raise SessionError(message) from exc
+        self._mcp_started = True
 
     async def _teardown_locked(self, *, final_status: SessionStatus) -> None:
         """Tear the current session down. Caller holds ``_session_lock``."""
@@ -415,6 +479,12 @@ class SessionManager:
             return
 
         self._stop_requested = final_status == SessionStatus.STOPPED
+
+        # Resolve any outstanding permission Futures with deny BEFORE we
+        # send SIGTERM so claude's tool dispatch sees a clean deny rather
+        # than a hung MCP socket.
+        await self._mcp.cancel_pending(session_id)
+        self._mcp.set_current_session(None)
 
         await proc.stop()
 
