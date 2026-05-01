@@ -34,9 +34,13 @@ import structlog
 from sqlalchemy import select
 
 from ccr.claude.events import (
+    AssistantTurn,
     ResultEvent,
     SystemInit,
+    ToolResultBlock,
+    ToolUseBlock,
     UnknownEvent,
+    UserTurn,
 )
 from ccr.claude.log import JsonlSessionLog
 from ccr.claude.mcp import McpPermissionServer, McpServerStartError
@@ -58,6 +62,11 @@ _FIRST_PROMPT_TRUNCATE = 500
 _LAST_EVENT_DEBOUNCE_SECONDS = 1.0
 _INIT_WAIT_TIMEOUT_SECONDS = 30.0
 _CRASH_REASON_TAIL_BYTES = 200
+
+# Tool names that mark a subagent dispatch in stream-json. ``Task`` is the
+# modern name (per ``SystemInit.tools`` in v2.1.123 logs); ``Agent`` appears
+# in older session logs. Both are accepted to be forward/backward compatible.
+_SUBAGENT_DISPATCH_TOOL_NAMES: frozenset[str] = frozenset({"Task", "Agent"})
 
 
 class SessionError(Exception):
@@ -126,6 +135,9 @@ class SessionManager:
         self._saw_result_success = False
         self._last_event_at_write_ts: float = 0.0
         self._last_event_at_pending: asyncio.Task[None] | None = None
+        # tool_use_id -> subagent_type. Populated when a Task/Agent tool fires;
+        # entry removed when the matching tool_result arrives.
+        self._running_subagents: dict[str, str] = {}
 
         # MCP permission gate (CCR-025). Lifetime = manager lifetime; lazily
         # started on the first new_session / continue_session call so a
@@ -210,6 +222,7 @@ class SessionManager:
             self._init_event = asyncio.Event()
             self._last_event_at_write_ts = 0.0
             self._last_event_at_pending = None
+            self._running_subagents = {}
             self._mcp.set_current_session(session_id)
 
             now = datetime.now(UTC)
@@ -336,6 +349,7 @@ class SessionManager:
             self._init_event = asyncio.Event()
             self._last_event_at_write_ts = 0.0
             self._last_event_at_pending = None
+            self._running_subagents = {}
             self._mcp.set_current_session(session_id)
 
             now = datetime.now(UTC)
@@ -514,6 +528,7 @@ class SessionManager:
         self._log = None
         self._consumer_task = None
         self._exit_task = None
+        self._running_subagents = {}
 
     async def _consume_events(self) -> None:
         """Drain :meth:`ClaudeProcess.events` into the log + bus.
@@ -542,6 +557,8 @@ class SessionManager:
                 elif isinstance(event, ResultEvent) and event.subtype == "success":
                     self._saw_result_success = True
 
+                self._track_subagents(event)
+
                 self._schedule_last_event_at_update(session_id)
         except asyncio.CancelledError:
             raise
@@ -550,6 +567,27 @@ class SessionManager:
                 "session_manager.consumer_error",
                 session_id=str(session_id),
             )
+
+    def _track_subagents(self, event: object) -> None:
+        """Update ``_running_subagents`` from a stream-json event.
+
+        Adds an entry on a ``Task``/``Agent`` ``ToolUseBlock`` carrying a
+        non-empty ``subagent_type``; removes the matching entry when a
+        ``ToolResultBlock`` for the same ``tool_use_id`` arrives. All other
+        events are ignored.
+        """
+        if isinstance(event, AssistantTurn):
+            for block in event.message.content:
+                if isinstance(block, ToolUseBlock) and block.name in _SUBAGENT_DISPATCH_TOOL_NAMES:
+                    subagent_type = str(block.input.get("subagent_type") or "").strip()
+                    if subagent_type:
+                        self._running_subagents[block.id] = subagent_type
+        elif isinstance(event, UserTurn):
+            content = event.message.content
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, ToolResultBlock):
+                        self._running_subagents.pop(block.tool_use_id, None)
 
     def _schedule_last_event_at_update(self, session_id: uuid.UUID) -> None:
         """Debounce ``last_event_at`` writes to ≤ 1 per second, fire-and-forget."""
@@ -781,6 +819,18 @@ class SessionManager:
     def current_log(self) -> JsonlSessionLog | None:
         """Currently running session's :class:`JsonlSessionLog` or ``None``."""
         return self._log
+
+    def running_subagents(self) -> list[str]:
+        """Return a snapshot of subagent types currently running.
+
+        A subagent is "running" iff a ``tool_use`` block with name in
+        :data:`_SUBAGENT_DISPATCH_TOOL_NAMES` has been observed in this
+        session and no ``tool_result`` for that ``tool_use_id`` has been
+        observed yet. Returns an alphabetically sorted, deduplicated list.
+        Returns ``[]`` when no session is running OR no subagents have
+        been dispatched.
+        """
+        return sorted(set(self._running_subagents.values()))
 
 
 __all__ = [

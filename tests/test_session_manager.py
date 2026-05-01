@@ -908,3 +908,128 @@ async def test_new_session_argv_includes_mcp_flags(
     assert "--permission-prompt-tool" in argv_lines
     assert "mcp__ccr__ccr_permission_prompt" in argv_lines
     assert "--mcp-config" in argv_lines
+
+
+# --------------------------------------------------------------------------- #
+# CCR-022: running_subagents() — Task/Agent tool tracking.
+# --------------------------------------------------------------------------- #
+
+
+async def test_running_subagents_tracks_agent_tool_use_and_clears_on_result(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A ``Task`` tool_use registers the subagent; the matching tool_result clears it.
+
+    Drives synthetic events through ``SessionManager._track_subagents`` —
+    the same code path :meth:`SessionManager._consume_events` runs after
+    each event publishes — which lets the test exercise the snapshot
+    accessor deterministically without subprocess timing.
+    """
+    from ccr.claude.events import parse_event
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    # No session running → empty snapshot.
+    assert manager.running_subagents() == []
+
+    tool_use_id = "toolu_test_001"
+    task_event = parse_event(
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": tool_use_id,
+                        "name": "Task",
+                        "input": {
+                            "subagent_type": "python-developer",
+                            "description": "Test dispatch",
+                            "prompt": "go",
+                        },
+                    },
+                ],
+            },
+        }
+    )
+    manager._track_subagents(task_event)  # noqa: SLF001 — direct internal probe
+    assert manager.running_subagents() == ["python-developer"]
+
+    result_event = parse_event(
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": "done",
+                        "is_error": False,
+                    },
+                ],
+            },
+        }
+    )
+    manager._track_subagents(result_event)  # noqa: SLF001 — direct internal probe
+    assert manager.running_subagents() == []
+
+
+async def test_running_subagents_ignores_non_subagent_tools(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """``Bash`` tool_use is not tracked; ``Agent`` (legacy) is.
+
+    Confirms the :data:`_SUBAGENT_DISPATCH_TOOL_NAMES` filter and the
+    legacy ``"Agent"`` name. Same direct-probe rationale as above.
+    """
+    from ccr.claude.events import parse_event
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    bash_event = parse_event(
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_bash_001",
+                        "name": "Bash",
+                        "input": {"command": "ls"},
+                    },
+                ],
+            },
+        }
+    )
+    manager._track_subagents(bash_event)  # noqa: SLF001
+    assert manager.running_subagents() == []
+
+    agent_event = parse_event(
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_agent_001",
+                        "name": "Agent",
+                        "input": {
+                            "subagent_type": "architect",
+                            "description": "design",
+                            "prompt": "design something",
+                        },
+                    },
+                ],
+            },
+        }
+    )
+    manager._track_subagents(agent_event)  # noqa: SLF001
+    assert manager.running_subagents() == ["architect"]

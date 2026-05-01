@@ -642,3 +642,47 @@ Notes:
   - 2026-05-02 main: branch ccr-029-permission-mode-flags created, dispatching team-lead
   - 2026-05-02 team-lead: scope brief issued (no architect), dispatching python-developer
   - 2026-05-02 team-lead: approved — all 11 automatable criteria verified by reviewer (24 new tests pass; coverage 87.40%; ruff/mypy clean); F1 (LOW) elif guard informational, not blocking
+---
+
+## CCR-022: Richer `/agents` reply (Running + Library) [done]
+Phase: n/a (post-CCR-010 UX polish)
+Feature: chat-bot
+Files:
+  - `src/ccr/bot/handlers/passthrough.py` — remove `"agents"` from `BLOCKED_INTERACTIVE`; add a dedicated `cmd_agents`-style branch (or a dispatch to a new `agents.py` handler — developer's call) that builds a two-section reply: "Running" (currently active subagents — see Notes for the data-source decision) and "Library" (configured agents on disk). Replace the canned `f"Interactive command — run /{name} in your local Claude Code terminal."` reply for `/agents` only; the other entries in `BLOCKED_INTERACTIVE` (`mcp`, `init`) stay as-is. Empty sections render with a stable placeholder (e.g. `"(none)"`).
+  - `src/ccr/bot/handlers/agents.py` (optional, developer's call) — if the rendering is non-trivial, lift it out of `passthrough.py` into its own handler module and register on `session_router` (or a new `agents_router`) instead of letting `passthrough.py` carry it. Either layout is acceptable; do not split into two files unless it actually reduces complexity.
+  - Possibly `src/ccr/claude/manager.py` — if "Running" is sourced from the `SessionManager` (e.g. tracked subagent ids from `tool_use` / `tool_result` events seen on the bus or in the JSONL log), expose a small read-only accessor (e.g. `running_subagents() -> list[str]` or similar). PM is not prescribing the shape — architect/team-lead settle this in Mode 1A. If "Running" turns out to be unsourceable from our side (Claude does not surface it in `-p` stream-json), drop the section gracefully or mark it `"(unknown — not exposed by claude -p)"`.
+  - `tests/test_bot_passthrough.py` (existing, from CCR-010) — extend: assert `/agents` no longer returns the BLOCKED_INTERACTIVE canned line; assert the reply contains both `"Running"` and `"Library"` section headers; assert empty-state placeholder when no library agents and no running subagents; assert HTML-escaping of agent names containing `<`, `>`, `&`. Manual smoke (real Claude session with one running subagent + at least one `.claude/agents/*.md` on disk) is documented but unticked, mirroring CCR-010's pattern.
+Out of scope:
+  - Adding a `/subagents` command or any per-subagent tab in the web viewer.
+  - Editing / creating agent library files from Telegram (read-only listing only).
+  - Changing the reply for `/mcp` and `/init` — they remain in `BLOCKED_INTERACTIVE` with the existing canned text.
+  - Globbing agent libraries outside `.claude/agents/` (no `~/.claude/agents/`, no project-tree walking) unless the architect decides otherwise during Mode 1A.
+Acceptance:
+  - [x] `/agents` reply contains a `"Running"` section header and a `"Library"` section header.
+  - [x] With no `.claude/agents/*.md` on disk and no running subagents, the reply renders both section headers with the chosen stable empty-state placeholder (e.g. `"(none)"`) under each.
+  - [x] With `.claude/agents/foo.md` and `.claude/agents/bar.md` present, the Library section lists `foo` and `bar` (sort order developer's call but must be stable across calls — alphabetical recommended).
+  - [x] `/agents` no longer returns the literal `"Interactive command — run /agents in your local Claude Code terminal."` string returned by CCR-010 (regression check on the BLOCKED_INTERACTIVE removal).
+  - [x] `/mcp` and `/init` still return the BLOCKED_INTERACTIVE canned text (regression — only `/agents` is being lifted out).
+  - [x] Agent names containing `<`, `>`, `&` are HTML-escaped in the reply (consistent with `formatting.py` conventions used in CCR-008/CCR-018).
+  - [x] `pytest tests/test_bot_passthrough.py` passes.
+  - [x] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [ ] Manual smoke (unticked, not blocking review per CCR-010 precedent): with a real Claude session running a subagent and `.claude/agents/*.md` on disk, `/agents` shows the running subagent under "Running" and the library files under "Library".
+Depends on: CCR-010
+Notes:
+  Phase n/a in the plan — post-CCR-010 UX polish, same precedent as CCR-018, CCR-019, CCR-020, CCR-021. The router from CCR-010 is the surface this ticket extends.
+  **Design decision for team-lead Mode 1A (architect candidate).** What sources "Running" and "Library"?
+    - "Library" is straightforward — glob `.claude/agents/*.md` from the project working directory, parse just the filename (or YAML frontmatter `name:` if present, mirroring how `dev-stack-agents` formats them under `templates/`). Filesystem-only, no claude-binary dependency.
+    - "Running" is the open question:
+      (a) Source from `SessionManager`: track subagent ids as they appear in `tool_use` / `Task`-style events in the JSONL log; expose a snapshot accessor. Most accurate, but requires deciding what "running" means (started but not yet returned a result?) and whether we trust those events to map cleanly.
+      (b) Source from disk-only: drop the "Running" section entirely and just rename to a single "Library" reply.
+      (c) Hybrid: render both sections, but mark "Running" as `"(unknown — not exposed by claude -p)"` until a follow-up ticket can wire it.
+    PM recommends team-lead consider dispatching the architect (Mode 1A architect path) — this is a load-bearing call about whether `SessionManager` gains a new public accessor and whether we start tracking subagents at all. The architect should be told the developer will *not* probe a real Claude binary as part of this ticket (unlike CCR-020/CCR-021); the architect picks (a)/(b)/(c) from the existing JSONL event schema in `ccr.claude.events`.
+  Reply formatting: HTML escape every interpolated name; reuse `formatting.py` chunking if the library section grows long (cap message body to ≤ 3500 chars consistent with CCR-019 conventions). Reply mode is HTML, matching the rest of the bot.
+  The existing `_UNKNOWN_USAGE_HINT` in `passthrough.py` does not list `/agents` today — that hint is for unrecognised commands, not the whitelist. No change required there.
+
+### Review log
+  - 2026-05-01 project-manager: reordered — chat-bot iteration prioritized
+  - 2026-05-02 main: branch ccr-022-agents-reply created, dispatching team-lead
+  - 2026-05-02 team-lead: dispatching architect — SessionManager has no subagent tracking; "Running" wire format unknown; (a)/(b)/(c) choice is load-bearing for manager.py public API
+  - 2026-05-02 team-lead: plan reviewed (.claude/plans/CCR-022-agents-reply.md), dispatching python-developer
+  - 2026-05-02 team-lead: approved
