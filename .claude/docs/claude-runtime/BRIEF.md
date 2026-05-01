@@ -20,5 +20,5 @@ The `claude-runtime` feature provides the core subprocess and event infrastructu
 - tests/test_claude_log.py — 13 JSONL-log tests
 - tests/test_session_manager.py — 8 SessionManager tests
 
-Status: COMPLETE
-Tickets: CCR-007
+Status: IN PROGRESS
+Tickets: CCR-007, CCR-024, CCR-025
