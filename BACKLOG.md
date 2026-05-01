@@ -374,6 +374,85 @@ Notes:
   - 2026-05-01 project-manager: reordered — chat-bot iteration prioritized
 ---
 
+## CCR-030: `/skills` command — list available skills [todo]
+Phase: n/a (post-CCR-010 UX polish)
+Feature: chat-bot
+Files:
+  - `src/ccr/bot/handlers/passthrough.py` — `/skills` is not currently in `WHITELIST` or `BLOCKED_INTERACTIVE`, so it falls through to `_UNKNOWN_USAGE_HINT` today. Either (a) add a dedicated branch in `passthrough.py` that builds a `/skills` reply, or (b) lift it into a new handler module — developer's call. Update `_UNKNOWN_USAGE_HINT` to include `/skills` if appropriate (it's currently absent from the hint string). Empty state renders with a stable placeholder (e.g. `"(none)"`).
+  - `src/ccr/bot/handlers/skills.py` (optional, developer's call) — if rendering grows non-trivial, lift it out of `passthrough.py` into its own handler module and register on `session_router` (or a new `skills_router`). Either layout is acceptable; do not split unless it actually reduces complexity.
+  - Possibly `src/ccr/claude/manager.py` — if "available skills" is sourced from the claude `system/init` event (which carries a top-level `"skills"` array per the smoke-test JSONL captured 2026-05-02), expose a small read-only accessor (e.g. `available_skills() -> list[str]` or similar) that snapshots the most recent `init` event's `skills` field. PM is not prescribing the shape — architect/team-lead settle in Mode 1A. If no active session exists, the reply is the existing `"No active session."` line.
+  - Possibly `src/ccr/claude/events.py` — if the current `SystemInitEvent` (or whatever the init-event model is named) doesn't already declare `skills: list[str]`, add it. The smoke-test transcript shows the field arrives on the init event verbatim (e.g. `"skills":["update-config","debug","simplify","batch","fewer-permission-prompts","loop","schedule","claude-api","implement-ticket"]`).
+  - `tests/test_bot_passthrough.py` (existing, from CCR-010) — extend: assert `/skills` returns a reply containing each skill name when an init event with skills is present; assert empty-state placeholder when the init event has an empty skills array; assert HTML-escaping of skill names containing `<`, `>`, `&`; assert `"No active session."` reply when no session is active. Manual smoke (real Claude session) is documented but unticked, mirroring CCR-010's pattern.
+Out of scope:
+  - Adding a "running skills" or "skills in use" notion — skills are static at session init per the captured JSONL; the reply is single-section.
+  - Editing / creating skill definitions from Telegram (read-only listing only).
+  - Changing the reply for `/agents`, `/mcp`, `/init` — those stay on whatever path their own tickets settle (CCR-022 for `/agents`; the others remain BLOCKED_INTERACTIVE).
+  - Sourcing skills from anywhere other than the live claude session's init event (no filesystem walk, no separate skill registry).
+Acceptance:
+  - [ ] `/skills` reply contains a `"Skills"` section header (or developer's-call equivalent stable header).
+  - [ ] With an active session whose init event carried a non-empty `skills` array, the reply lists each skill name; sort order developer's call but must be stable across calls (alphabetical recommended).
+  - [ ] With an active session whose init event carried an empty / absent `skills` array, the reply renders the section header with the chosen stable empty-state placeholder (e.g. `"(none)"`).
+  - [ ] With no active session, the reply matches the existing `"No active session."` string used by other passthrough commands when there's nothing to query.
+  - [ ] `/skills` is no longer caught by `_UNKNOWN_USAGE_HINT` (regression check on the unknown-command fallthrough); the hint string itself is updated to include `/skills` if appropriate.
+  - [ ] Skill names containing `<`, `>`, `&` are HTML-escaped in the reply (consistent with `formatting.py` conventions used in CCR-008/CCR-018).
+  - [ ] `pytest tests/test_bot_passthrough.py` passes.
+  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [ ] Manual smoke (unticked, not blocking review per CCR-010 precedent): a real Claude session running in the project shows its skills under `/skills` matching the names listed in the `system/init` event.
+Depends on: CCR-010
+Notes:
+  Phase n/a in the plan — post-CCR-010 UX polish, same precedent as CCR-022 / CCR-023 already in the backlog. Simpler than CCR-022 (`/agents`) — there is no "running skills" concept (skills are static at session init), so the reply is single-section.
+  **Probe data already in hand.** Unlike CCR-020 / CCR-021 / CCR-023, no Step-0 probe is required: a smoke-test JSONL captured on 2026-05-02 already confirms claude's `system/init` event carries a top-level `"skills"` array (sample value: `["update-config","debug","simplify","batch","fewer-permission-prompts","loop","schedule","claude-api","implement-ticket"]`). Implementation reads that field; no live-binary probing needed at ticket time.
+  **Mode 1A note for team-lead — dev-direct path recommended.** Small, additive ticket touching ≤ 3 files (passthrough handler, possibly an init-event field on `events.py`, possibly a one-line accessor on `SessionManager`). No new abstraction, no load-bearing design call. Architect not warranted; team-lead can compose the dev brief directly.
+  **Sibling of CCR-022.** This ticket follows CCR-022's two-section template but degenerates to one section. If CCR-022 lands first and introduces a section-rendering helper in `formatting.py` or a sibling, reuse it here. If CCR-030 lands first, the helper extraction can wait for CCR-022.
+  Reply formatting: HTML escape every interpolated name; reuse `formatting.py` chunking if the list grows long (cap message body to ≤ 3500 chars consistent with CCR-019 conventions). Reply mode is HTML, matching the rest of the bot.
+  The existing `_UNKNOWN_USAGE_HINT` in `passthrough.py` does not list `/skills` today. If the developer adds `/skills` as a recognised command, update the hint string to include it for grep-stability.
+
+### Review log
+  - 2026-05-02 project-manager: filed for chat-bot UX iteration
+---
+
+## CCR-031: `/clear` command — reset session and clear chat history [todo]
+Phase: n/a (post-CCR-010 UX polish)
+Feature: chat-bot
+Files:
+  - `src/ccr/bot/handlers/session.py` — `/clear` already exists here (added in earlier work; currently does `stop` + `new_session`). Extend the existing `cmd_clear` (or split into a sibling handler module — developer's call) so it ALSO performs the chat-history-clear behaviour after the session reset. The session-reset half of the behaviour is already implemented; the new work is the message-deletion half plus whatever divider / acknowledgement the architect picks.
+  - `src/ccr/bot/handlers/clear.py` (optional, developer's call) — if the message-deletion logic grows non-trivial, lift it out of `session.py` into its own handler module. Either layout is acceptable.
+  - Possibly `src/ccr/claude/manager.py` — if the new "clear" semantics imply a different lifecycle than the current `stop` + `new_session` pair (e.g. an explicit `reset()` that snapshots message-id state, or a `last_chat_id` snapshot), expose the small accessors needed. PM is not prescribing the shape; architect/team-lead settle in Mode 1A.
+  - Possibly `src/ccr/bot/app.py` (or wherever bot-side message tracking lives) — message-id tracking is the open question. Telegram bots can only delete messages they posted, only within the 48-hour bot-API window, only via `delete_message`. To delete bot-posted messages on `/clear`, the bot must have remembered their message-ids. PM did not find an existing message-id-tracking ticket in the backlog — if the architect picks a delete-based behaviour, this ticket likely needs to introduce simple in-memory (or DB-backed) message-id tracking as part of its scope. Architect/team-lead settle in Mode 1A.
+  - Possibly a new column on `sessions` (or a sibling table) — only if the architect picks a behaviour that requires persisting message-ids across restarts. PM defaults to NOT persisting (in-memory ring buffer is enough); persistence is out of scope unless the architect explicitly opts in.
+  - `tests/test_bot_session.py` (or wherever existing `/clear` coverage lives) — extend with cases that exercise whichever clear-behaviour the architect picks: bulk-delete called on each tracked bot message-id; divider message posted; both; stale message-ids handled gracefully (Telegram returns "message can't be deleted" past the 48h window — the bot should swallow and continue).
+  - `tests/fakes/` — extend the aiogram fake / fixture set if the developer needs to stub `bot.delete_message` calls.
+Out of scope:
+  - Deleting messages older than 48 hours — Telegram bot API forbids this; the ticket explicitly does not work around it.
+  - Deleting user-sent messages (the bot can only delete its own posts; user messages stay).
+  - Persisting cleared-message-ids across restarts — in-memory tracking is the default; a SQL column / migration for message-id history is out of scope unless the architect explicitly opts in during Mode 1A.
+  - A separate `/wipe` or `/purge` command for "delete every bot message ever, ignore the 48h limit" — the API does not allow it, so we do not pretend to.
+  - Touching `/new` or `/continue` semantics — `/clear` keeps its own handler; the other lifecycle commands are unchanged.
+Acceptance:
+  - [ ] Architect's chosen clear-behaviour documented in the developer's work summary: which of (a) bulk-delete every bot message-id the bot remembers from the cleared session, (b) post a `--- new session ---` divider without deleting, (c) hybrid (delete + divider) was implemented, and why.
+  - [ ] `/clear` terminates the running claude session (if any) and starts a fresh one, preserving the existing `"Session <id8> started (pid <pid>)."` reply or whatever new acknowledgement string the architect picks. Regression: a pre-existing test for the current `/clear` reply must either still pass or be updated as part of this ticket with the new expected string.
+  - [ ] `/clear` performs the chat-history-clear half of the behaviour as picked by the architect — verified by a test that asserts either (a) `bot.delete_message` was called for each tracked bot message-id, or (b) a divider message was posted, or (c) both, depending on the path taken.
+  - [ ] Telegram API failures during message deletion (e.g. message past 48h, message already deleted, message belongs to another chat) are caught and ignored — `/clear` still completes and posts its acknowledgement. Verified by a test that simulates `delete_message` raising on one of N tracked ids.
+  - [ ] `/clear` with no active session and no tracked bot messages still produces a clean acknowledgement (no crash, no spurious deletion errors).
+  - [ ] `pytest tests/test_bot_session.py` (or the ticket's chosen test file) passes.
+  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [ ] Manual smoke (unticked, not blocking review per CCR-010 precedent): a real Telegram chat with several bot-posted messages (forward chain, tool-use lines, permission prompts), `/clear` deletes / dividers them per the architect's choice and starts a fresh session.
+Depends on: CCR-010
+Notes:
+  Phase n/a in the plan — post-CCR-010 UX polish, same precedent as CCR-022 / CCR-023 already in the backlog.
+  **Larger surface than CCR-030 — architect candidate for team-lead Mode 1A.** This ticket spans `bot/handlers/session.py` (lifecycle), possibly `claude/manager.py` (reset semantics), and likely `bot/app.py` or a new module (message-id tracking). The chat-history-clear half is a load-bearing UX call that PM is not prescribing; the architect picks from:
+    (a) Bulk-delete every bot message-id the bot remembers from this session — concrete "wipe", but bounded by the 48h API window and by however far back the bot's in-memory tracking goes. User experience: chat scrolls back to a clean slate (within the window).
+    (b) Post a `--- new session ---` divider without deleting anything — visual separator only. Simplest, no message-id tracking needed, no API-failure paths. User experience: old messages remain visible above the divider.
+    (c) Hybrid: delete-when-possible + always post a divider. Best of both, most code, most failure paths.
+  PM recommends team-lead consider dispatching the architect (Mode 1A architect path). The user's verbatim ask was "start new session and clear chat history" — interpret "clear chat history" as the deliverable, but pick the concrete behaviour that fits Telegram's bot-API constraints rather than over-promising.
+  **Existing `/clear` already implements the session-reset half.** See `src/ccr/bot/handlers/session.py` lines 150–170 for the current `cmd_clear` (stop + `new_session`). This ticket extends, not replaces. Regression coverage on the existing reset behaviour is required.
+  **No prior message-id-tracking ticket.** PM searched BACKLOG.md and DONE.md for prior message-id-tracking work and found none. If the architect picks behaviour (a) or (c), this ticket needs to introduce simple message-id tracking as part of its scope — a per-session in-memory list of bot-posted message-ids, populated by an aiogram outgoing-message middleware (or by every `msg.answer(...)` call site routing through a small helper). Architect should pick the tracking strategy in Mode 1A. PM defaults to NOT persisting across restarts (in-memory only).
+  **Telegram API constraints (load-bearing).** `bot.delete_message(chat_id, message_id)` requires: (1) the message was sent by the bot itself (or in groups, the bot has admin rights), (2) the message is < 48h old. Failures past the window return a Bad Request error; the handler must catch and continue. Reply formatting / chunking unchanged — reuse `formatting.py` conventions.
+
+### Review log
+  - 2026-05-02 project-manager: filed for chat-bot UX iteration
+---
+
 ## CCR-021: Probe Claude `-p` permission wire format and reconcile schema [blocked]
 Phase: 8 (post-CCR-009 wire-format reconciliation)
 Feature: claude-runtime
