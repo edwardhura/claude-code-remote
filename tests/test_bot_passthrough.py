@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -12,6 +13,7 @@ from aiogram.types import Chat, Message, User
 
 from ccr.bot.handlers.passthrough import cmd_passthrough
 from ccr.claude.manager import NoActiveSessionError
+from ccr.claude.usage import SessionUsage
 from ccr.config import Settings
 
 # --------------------------------------------------------------------------- #
@@ -50,7 +52,7 @@ def _make_fake_settings(tmp_path: Path) -> Settings:
 
 
 class FakeManager:
-    """Stub :class:`SessionManager` exposing only ``send_slash`` and ``running_subagents``."""
+    """Stub :class:`SessionManager` exposing only the accessors passthrough needs."""
 
     def __init__(
         self,
@@ -59,6 +61,8 @@ class FakeManager:
         running: list[str] | None = None,
         skills: list[str] | None = None,
         active: bool = True,
+        usage: SessionUsage | None = None,
+        session_id: uuid.UUID | None = None,
     ) -> None:
         self.send_slash = AsyncMock()
         if send_side_effect is not None:
@@ -66,6 +70,8 @@ class FakeManager:
         self._running = list(running) if running is not None else []
         self._skills = list(skills) if skills is not None else []
         self._active = active
+        self._usage = usage
+        self._session_id = session_id
 
     def running_subagents(self) -> list[str]:
         # Mirror SessionManager.running_subagents()'s contract: alphabetically
@@ -80,45 +86,72 @@ class FakeManager:
     def is_session_active(self) -> bool:
         return self._active
 
+    def current_session_usage(self) -> SessionUsage | None:
+        # Mirror SessionManager.current_session_usage(): None when idle.
+        return self._usage
+
+    @property
+    def current_session_id(self) -> uuid.UUID | None:
+        # Mirror SessionManager.current_session_id: None when idle.
+        return self._session_id
+
 
 # --------------------------------------------------------------------------- #
-# Whitelist branch.
+# Whitelist branch — /model and /compact still forward verbatim.
 # --------------------------------------------------------------------------- #
 
 
 @pytest.mark.asyncio
-async def test_cost_calls_send_slash(tmp_path: Path) -> None:
-    """``/cost`` is whitelisted → forwarded via ``send_slash`` with empty args."""
+async def test_model_calls_send_slash(tmp_path: Path) -> None:
+    """``/model`` stays in WHITELIST → forwarded via ``send_slash``."""
     manager = FakeManager()
     settings = _make_fake_settings(tmp_path)
-    msg = _make_message(text="/cost")
+    msg = _make_message(text="/model")
 
     await cmd_passthrough(
         msg,
-        command=_command("cost"),
+        command=_command("model"),
         session_manager=manager,
         settings=settings,
     )
 
-    manager.send_slash.assert_awaited_once_with("cost", "")
+    manager.send_slash.assert_awaited_once_with("model", "")
     msg.answer.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_cost_no_session(tmp_path: Path) -> None:
-    """``/cost`` while idle → ``NoActiveSessionError`` is caught and replied politely."""
-    manager = FakeManager(send_side_effect=NoActiveSessionError("No active session."))
+async def test_compact_calls_send_slash(tmp_path: Path) -> None:
+    """``/compact`` stays in WHITELIST → forwarded via ``send_slash``."""
+    manager = FakeManager()
     settings = _make_fake_settings(tmp_path)
-    msg = _make_message(text="/cost")
+    msg = _make_message(text="/compact")
 
     await cmd_passthrough(
         msg,
-        command=_command("cost"),
+        command=_command("compact"),
         session_manager=manager,
         settings=settings,
     )
 
-    manager.send_slash.assert_awaited_once_with("cost", "")
+    manager.send_slash.assert_awaited_once_with("compact", "")
+    msg.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_model_no_session_returns_canned_string(tmp_path: Path) -> None:
+    """``/model`` while idle → ``NoActiveSessionError`` is caught and replied politely."""
+    manager = FakeManager(send_side_effect=NoActiveSessionError("No active session."))
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/model")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("model"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    manager.send_slash.assert_awaited_once_with("model", "")
     msg.answer.assert_awaited_once_with("No active session.")
 
 
@@ -137,6 +170,155 @@ async def test_model_with_args_passes_args_through(tmp_path: Path) -> None:
     )
 
     manager.send_slash.assert_awaited_once_with("model", "claude-3-opus")
+
+
+# --------------------------------------------------------------------------- #
+# /cost — locally-computed rich reply (no ``send_slash`` forward).
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_cost_renders_rich_reply_from_session_usage(tmp_path: Path) -> None:
+    """``/cost`` answers locally with HTML labels for every aggregated field."""
+    session_id = uuid.UUID("d562aef3-12ea-435b-a588-9aa4d8b39a29")
+    usage = SessionUsage(
+        input_tokens=12,
+        output_tokens=158,
+        cache_creation_input_tokens=10373,
+        cache_read_input_tokens=42711,
+        tool_call_count=2,
+        num_turns=2,
+        elapsed_ms=5077,
+        total_cost_usd=0.0906,
+    )
+    manager = FakeManager(usage=usage, session_id=session_id, active=True)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/cost")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("cost"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    # /cost is no longer in WHITELIST — must NOT call send_slash.
+    manager.send_slash.assert_not_awaited()
+    text = _captured_text(msg)
+    # First eight hex chars of the UUID are surfaced as the session id.
+    assert "<b>Session:</b> d562aef3" in text
+    assert "<b>Turns:</b> 2" in text
+    assert "<b>Input tokens:</b> 12" in text
+    assert "<b>Output tokens:</b> 158" in text
+    assert "<b>Cache read tokens:</b> 42711" in text
+    assert "<b>Tool calls:</b> 2" in text
+    assert "<b>Elapsed:</b> 5.1s" in text
+    assert "<b>Cost (USD):</b> $0.0906" in text
+
+
+@pytest.mark.asyncio
+async def test_cost_no_active_session_returns_canned_string(tmp_path: Path) -> None:
+    """``/cost`` while idle → returns the canonical no-session string (CCR-010 regression)."""
+    manager = FakeManager(usage=None, session_id=None, active=False)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/cost")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("cost"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    manager.send_slash.assert_not_awaited()
+    msg.answer.assert_awaited_once_with("No active session.")
+
+
+@pytest.mark.asyncio
+async def test_cost_omits_cost_line_when_total_cost_is_zero(tmp_path: Path) -> None:
+    """Subscription users (``total_cost_usd == 0``) do not see a stray ``$0.0000`` line."""
+    session_id = uuid.uuid4()
+    usage = SessionUsage(
+        input_tokens=6,
+        output_tokens=15,
+        num_turns=1,
+        elapsed_ms=1500,
+        total_cost_usd=0.0,
+    )
+    manager = FakeManager(usage=usage, session_id=session_id, active=True)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/cost")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("cost"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    text = _captured_text(msg)
+    assert "Cost (USD)" not in text
+    # Other fields still present.
+    assert "<b>Input tokens:</b> 6" in text
+    assert "<b>Output tokens:</b> 15" in text
+
+
+def test_render_cost_reply_html_escapes_session_id() -> None:
+    """Defensive: ``_render_cost_reply`` escapes its session-id input.
+
+    UUIDs in production are always 32 hex chars, so this codepath is
+    unreachable in real life. The test exists so a future refactor that
+    swaps :class:`uuid.UUID` for a stringly-typed id still emits safe
+    HTML — every interpolated value passes through ``html.escape``.
+    """
+    from ccr.bot.handlers.passthrough import _render_cost_reply
+
+    text = _render_cost_reply(
+        "<bad&id>extra-padding-here",
+        SessionUsage(num_turns=0, elapsed_ms=0),
+    )
+    assert "&lt;bad&amp;id" in text
+    # Raw metacharacters must not leak.
+    assert "<bad&id>" not in text
+
+
+@pytest.mark.asyncio
+async def test_cost_renders_long_elapsed_in_minute_format(tmp_path: Path) -> None:
+    """Elapsed >= 60s renders as ``"Nm Ms"``."""
+    session_id = uuid.uuid4()
+    usage = SessionUsage(num_turns=3, elapsed_ms=125_000)  # 2m 5s
+    manager = FakeManager(usage=usage, session_id=session_id, active=True)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/cost")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("cost"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    text = _captured_text(msg)
+    assert "<b>Elapsed:</b> 2m 5s" in text
+
+
+@pytest.mark.asyncio
+async def test_cost_does_not_call_send_slash(tmp_path: Path) -> None:
+    """Regression: ``/cost`` is lifted out of WHITELIST and never forwards to Claude."""
+    session_id = uuid.uuid4()
+    usage = SessionUsage()
+    manager = FakeManager(usage=usage, session_id=session_id, active=True)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/cost")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("cost"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    manager.send_slash.assert_not_awaited()
 
 
 # --------------------------------------------------------------------------- #
