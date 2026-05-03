@@ -1,18 +1,28 @@
-"""Slash-command passthrough whitelist — `/cost`, `/model`, `/compact`, etc.
+"""Slash-command passthrough whitelist — `/model`, `/compact`, etc.
 
 This router is the *last* one registered on the dispatcher (see
 ``ccr.bot.app.build_dispatcher``). aiogram resolves routers in registration
 order, so by the time a slash-command update reaches this router every
 command claimed by the pairing / session / permission routers has already
 been handled. Anything left over is matched here by the regex-Command
-filter ``Command(re.compile(r".+"))`` and routed into one of three
+filter ``Command(re.compile(r".+"))`` and routed into one of these
 branches:
 
 * ``/agents`` — answered locally with a Running + Library snapshot
   (subagents the live Claude session has dispatched, plus the
   ``.claude/agents/*.md`` files on disk).
-* whitelisted (`/cost`, `/model`, `/compact`) — forwarded to Claude as a
-  user turn via :meth:`SessionManager.send_slash`. Claude Code interprets
+* ``/skills`` — answered locally with the skill list reported by the most
+  recent ``system/init`` event.
+* ``/cost`` — answered locally with a rich, HTML-formatted summary derived
+  by walking the current session's JSONL log via
+  :func:`ccr.claude.usage.aggregate_session_usage`. Claude Code's `-p`
+  non-interactive mode does NOT execute ``/cost`` as a slash command (it
+  treats the leading ``/cost`` as plain user text), so forwarding via
+  :meth:`SessionManager.send_slash` would just produce a confused
+  assistant turn. The probe captured for CCR-023 confirmed this — see
+  the ticket's Step 0 probe transcript.
+* whitelisted (`/model`, `/compact`) — forwarded to Claude as a user
+  turn via :meth:`SessionManager.send_slash`. Claude Code interprets
   the leading slash exactly as if it were typed in its TTY.
 * blocked-interactive (`/mcp`, `/init`) — replied with a fixed string
   telling the user to run the command in their local terminal.
@@ -31,6 +41,7 @@ from typing import TYPE_CHECKING
 from aiogram import Router
 from aiogram.filters import Command, CommandObject
 
+from ccr.bot.formatting import SAFE_CHUNK
 from ccr.claude.manager import NoActiveSessionError
 
 if TYPE_CHECKING:
@@ -39,10 +50,11 @@ if TYPE_CHECKING:
     from aiogram.types import Message
 
     from ccr.claude.manager import SessionManager
+    from ccr.claude.usage import SessionUsage
     from ccr.config import Settings
 
 
-WHITELIST: frozenset[str] = frozenset({"cost", "model", "compact"})
+WHITELIST: frozenset[str] = frozenset({"model", "compact"})
 BLOCKED_INTERACTIVE: frozenset[str] = frozenset({"mcp", "init"})
 
 _UNKNOWN_USAGE_HINT = (
@@ -52,6 +64,9 @@ _UNKNOWN_USAGE_HINT = (
 
 _AGENTS_LIBRARY_GLOB_REL = ".claude/agents"
 _EMPTY_PLACEHOLDER = "(none)"
+
+_SESSION_ID_HEX_PREFIX_LEN = 8
+_ONE_MINUTE_MS = 60_000
 
 
 router = Router(name="passthrough")
@@ -109,6 +124,77 @@ async def _reply_skills(msg: Message, session_manager: SessionManager) -> None:
     await msg.answer(_render_skills_reply(skills))
 
 
+def _format_elapsed(elapsed_ms: int) -> str:
+    """Render ``elapsed_ms`` as ``"2.2s"`` or ``"1m 5s"``.
+
+    Mirrors :func:`ccr.bot.formatting._format_duration` so the ``/cost``
+    elapsed segment is consistent with the per-turn ``✅ done · {s}s``
+    line. ``0`` is rendered as ``"0.0s"`` rather than omitted so the user
+    sees that no Claude turns have completed yet.
+    """
+    if elapsed_ms < _ONE_MINUTE_MS:
+        return f"{elapsed_ms / 1000:.1f}s"
+    minutes = elapsed_ms // _ONE_MINUTE_MS
+    seconds = (elapsed_ms % _ONE_MINUTE_MS) // 1000
+    return f"{minutes}m {seconds}s"
+
+
+def _render_cost_reply(session_id_hex: str, usage: SessionUsage) -> str:
+    """Render a rich HTML ``/cost`` reply.
+
+    Layout — seven lines (eight when ``total_cost_usd > 0``), every
+    interpolated value HTML-escaped:
+
+    .. code-block:: text
+
+        <b>Session:</b> {id8}
+        <b>Turns:</b> {n}
+        <b>Input tokens:</b> {n}
+        <b>Output tokens:</b> {n}
+        <b>Cache read tokens:</b> {n}
+        <b>Tool calls:</b> {n}
+        <b>Elapsed:</b> {duration}
+        <b>Cost (USD):</b> ${cost:.4f}
+
+    The cost line is included only when ``total_cost_usd > 0`` so users on
+    a subscription plan (where Claude reports ``0.0``) do not see a stray
+    ``$0.0000``. Output is truncated to :data:`SAFE_CHUNK` characters so a
+    pathological ``Session:`` value cannot blow past Telegram's 4096 cap;
+    the layout itself is well under the cap, the truncation is defensive.
+    """
+    id8 = html.escape(session_id_hex[:_SESSION_ID_HEX_PREFIX_LEN])
+    lines = [
+        f"<b>Session:</b> {id8}",
+        f"<b>Turns:</b> {usage.num_turns}",
+        f"<b>Input tokens:</b> {usage.input_tokens}",
+        f"<b>Output tokens:</b> {usage.output_tokens}",
+        f"<b>Cache read tokens:</b> {usage.cache_read_input_tokens}",
+        f"<b>Tool calls:</b> {usage.tool_call_count}",
+        f"<b>Elapsed:</b> {_format_elapsed(usage.elapsed_ms)}",
+    ]
+    if usage.total_cost_usd > 0:
+        lines.append(f"<b>Cost (USD):</b> ${usage.total_cost_usd:.4f}")
+    text = "\n".join(lines)
+    if len(text) > SAFE_CHUNK:
+        text = text[:SAFE_CHUNK]
+    return text
+
+
+async def _reply_cost(msg: Message, session_manager: SessionManager) -> None:
+    """Answer ``/cost`` with a locally-computed usage summary.
+
+    Returns ``"No active session."`` (regression: same string CCR-010
+    used to emit when ``send_slash`` raised :class:`NoActiveSessionError`)
+    if no Claude subprocess is currently held.
+    """
+    usage = session_manager.current_session_usage()
+    session_id = session_manager.current_session_id
+    if usage is None or session_id is None:
+        await msg.answer("No active session.")
+        return
+    await msg.answer(_render_cost_reply(session_id.hex, usage))
+
+
 @router.message(Command(re.compile(r".+")))
 async def cmd_passthrough(
     msg: Message,
@@ -126,6 +212,10 @@ async def cmd_passthrough(
 
     if name == "skills":
         await _reply_skills(msg, session_manager)
+        return
+
+    if name == "cost":
+        await _reply_cost(msg, session_manager)
         return
 
     if name in WHITELIST:

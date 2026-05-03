@@ -772,3 +772,47 @@ Notes:
   - 2026-05-02 team-lead: dispatching architect — new message-id-tracking abstraction spans _ChatSender (server.py) + cmd_clear (session.py) with a load-bearing UX choice between three deletion strategies
   - 2026-05-02 team-lead: plan reviewed (.claude/plans/CCR-031-clear-command.md), dispatching python-developer
   - 2026-05-02 team-lead: approved
+---
+
+## CCR-023: Richer `/cost` reply (more detail than the upstream one-liner) [done]
+Phase: n/a (post-CCR-010 UX polish)
+Feature: chat-bot
+Files:
+  - `src/ccr/bot/handlers/passthrough.py` — `/cost` is currently in `WHITELIST` and forwards verbatim via `SessionManager.send_slash("cost", "")`. Lift `/cost` out of the verbatim-forward branch into a dedicated handler (or keep it in `passthrough.py` behind an early-return check — developer's call) that either (a) still forwards but enriches Claude's reply with locally computed context, or (b) computes a richer reply entirely on our side from the JSONL log, depending on the Step 0 probe outcome.
+  - `src/ccr/bot/handlers/cost.py` (optional, developer's call) — if the enrichment logic is non-trivial, lift into its own handler module. Either layout is acceptable.
+  - Possibly `src/ccr/claude/manager.py` — if the richer reply pulls from session-level aggregates (per-session token counts, per-tool call counts, elapsed time, etc.), expose a read-only accessor that walks the current session's JSONL log or maintains running counters. PM is not prescribing the shape; architect/team-lead settle in Mode 1A.
+  - Possibly `src/ccr/claude/log.py` (or a new `src/ccr/claude/usage.py`) — if a JSONL-walking aggregator is needed, that's where it lives. Read-only, no schema changes.
+  - `tests/test_bot_passthrough.py` (existing, from CCR-010) — extend with `/cost` cases that match whichever path the probe selects: assert the reply includes the additional fields the team picks (e.g. `Tokens:`, `Tools:`, `Elapsed:`, `Session:`); assert HTML-escaping of any interpolated values; assert behaviour with no active session matches the existing `"No active session."` reply where applicable.
+  - `tests/fakes/fake_claude.py` — extend the canned JSONL fixture if the richer reply parses Claude's response (e.g. emit a synthetic `result` line with usage stats) so the tests do not need a real claude binary.
+Out of scope:
+  - Real-money pricing / billing integrations (we only enrich what's already in the local session — no API calls to Anthropic billing, no model-specific price tables).
+  - Persisting cost / usage history across sessions in the SQL schema (the current session's JSONL is the only source — cross-session aggregates are a follow-up ticket).
+  - Changing how `/cost` arguments are parsed (the whitelist forwards `/cost args`; our enriched reply ignores args unless the probe shows otherwise).
+  - Modifying any other whitelist commands (`/model`, `/compact` stay verbatim-forward).
+Acceptance:
+  - [x] Step 0 probe outcome documented in the developer's work summary (which of the three outcomes from Notes was hit, and which path the implementation took).
+  - [x] `/cost` reply contains at least one piece of information beyond the upstream one-liner — the exact fields are settled by the architect/team-lead in Mode 1A from the probe data, but the reply must be visibly richer than `"You are currently using your subscription to power your Claude Code usage"`.
+  - [x] `/cost` with no active session returns the existing `"No active session."` reply (regression — current CCR-010 behaviour preserved when our handler cannot enrich).
+  - [x] Interpolated values are HTML-escaped (consistent with `formatting.py` conventions used in CCR-008/CCR-018).
+  - [x] `/model` and `/compact` continue to forward verbatim via `SessionManager.send_slash` (regression — only `/cost` is being lifted out).
+  - [x] `pytest tests/test_bot_passthrough.py` passes.
+  - [x] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [ ] Manual smoke (unticked, not blocking review per CCR-010 precedent): real Claude session with a few user turns; `/cost` shows our enrichment alongside (or instead of) Claude's terse line.
+Depends on: CCR-010
+Notes:
+  Phase n/a in the plan — post-CCR-010 UX polish, same precedent as CCR-018, CCR-019, CCR-020, CCR-021. The router and whitelist from CCR-010 are the surface this ticket extends.
+  **Step 0 probe — required before writing any code.** Mirror the CCR-020 / CCR-021 pattern: run `claude -p --input-format=stream-json --output-format=stream-json --verbose`, send a few user turns, then send `/cost` as a user turn (`{"type":"user","message":{"role":"user","content":"/cost"}}`) and capture the full stdout JSONL. Three documented outcomes:
+    1. Claude emits `usage` / token-count fields on every `result` event (or on a dedicated `cost`-style event) — implementation pulls from the running JSONL log via a read-only aggregator (`src/ccr/claude/usage.py` or similar) and replies with a richer summary computed on our side, ignoring the upstream one-liner. Smallest path, no enrichment of Claude's text.
+    2. Claude's `/cost` reply itself contains structured detail (multi-line text, JSON-in-text, fields beyond the one-liner the user saw) but only for some accounts / modes — implementation forwards `/cost` and post-processes the captured text events into a parsed reply. Brittle (text-format dependency); document fragility in the work summary.
+    3. Claude emits nothing structured for `/cost` and does not include usage on `result` events — implementation either (a) computes a coarse local summary from JSONL line counts + elapsed time + parsed `assistant` text length (no real token counts) and labels it as approximate, or (b) returns BLOCKED with notes for follow-up. Default to (a) unless the architect says BLOCKED is preferable.
+  The developer must document which outcome they hit and which path they took in the work summary.
+  **Design decision for team-lead Mode 1A (architect candidate).** This is a load-bearing call: whether to introduce a new aggregator module, whether `SessionManager` gains a public usage accessor, and which fields the reply carries. PM recommends team-lead consider dispatching the architect, especially if outcome 1 is hit (new module, JSONL walking) or outcome 3 (a) is taken (approximation labelling matters for user trust). For outcome 2 the developer can probably proceed without an architect.
+  The user's verbatim ask was "Usage should include more" — interpret that as "more than the one terse line currently returned", not as a fixed field list. The team-lead/architect picks the field list from what the probe makes available.
+  Reply formatting: HTML escape every interpolated value; reuse `formatting.py` chunking if needed; cap message body to ≤ 3500 chars consistent with CCR-019. Reply mode is HTML, matching the rest of the bot.
+  Note that the user said "Usage should include more" — they may be conflating `/cost` with a separate `/usage` command. Claude Code's TUI exposes both: `/cost` (this session's spend) and `/usage` (account-wide quota). If the probe shows `/usage` as a separate slash command not currently in our whitelist, flag it for a follow-up ticket; do NOT expand this ticket's scope to cover both. This ticket is scoped to `/cost` only.
+
+### Review log
+  - 2026-05-01 project-manager: reordered — chat-bot iteration prioritized
+  - 2026-05-03 main: branch ccr-023-richer-cost-reply created, dispatching team-lead
+  - 2026-05-03 main: team-lead Mode 1A returned DISPATCH: python-developer (dev-direct, no architect); dispatching python-developer
+  - 2026-05-03 team-lead: approved

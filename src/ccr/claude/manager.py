@@ -46,6 +46,7 @@ from ccr.claude.log import JsonlSessionLog
 from ccr.claude.mcp import McpPermissionServer, McpServerStartError
 from ccr.claude.process import ClaudeProcess
 from ccr.claude.state import SessionStatus
+from ccr.claude.usage import SessionUsage, aggregate_session_usage
 from ccr.db.models import Session
 
 if TYPE_CHECKING:
@@ -848,6 +849,20 @@ class SessionManager:
     def is_session_active(self) -> bool:
         """Return ``True`` iff a Claude subprocess is currently held."""
         return self._proc is not None
+
+    def current_session_usage(self) -> SessionUsage | None:
+        """Return aggregated usage for the live session, or ``None`` if idle.
+
+        Walks the running session's JSONL log via
+        :func:`ccr.claude.usage.aggregate_session_usage`. Read-only — does
+        not block the consumer task. Returns ``None`` when no Claude
+        subprocess is currently held; the bot's ``/cost`` handler maps
+        that to the canonical ``"No active session."`` reply.
+        """
+        session_id = self._session_id
+        if session_id is None or self._proc is None:
+            return None
+        return aggregate_session_usage(self._logs_dir / f"{session_id}.jsonl")
 
 
 __all__ = [

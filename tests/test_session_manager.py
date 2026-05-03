@@ -1033,3 +1033,113 @@ async def test_running_subagents_ignores_non_subagent_tools(
     )
     manager._track_subagents(agent_event)  # noqa: SLF001
     assert manager.running_subagents() == ["architect"]
+
+
+# --------------------------------------------------------------------------- #
+# CCR-023: current_session_usage() — JSONL aggregator wired to live session.
+# --------------------------------------------------------------------------- #
+
+
+async def test_current_session_usage_returns_none_when_idle(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """``current_session_usage()`` returns ``None`` while no subprocess is held."""
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+    assert manager.current_session_usage() is None
+
+
+async def test_current_session_usage_aggregates_running_session_jsonl(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """While a session is running, the accessor walks ``data/logs/<id>.jsonl``."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "fake"},
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"cmd": "ls"}},
+                ],
+            },
+        },
+        {
+            "type": "result",
+            "subtype": "success",
+            "duration_ms": 1500,
+            "total_cost_usd": 0.01,
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 20,
+                "cache_creation_input_tokens": 100,
+                "cache_read_input_tokens": 500,
+            },
+        },
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    received: list[ClaudeEvent] = []
+
+    async def consumer() -> None:
+        async for payload in bus.subscribe("session.event"):
+            assert isinstance(payload, dict)
+            received.append(payload["event"])  # type: ignore[arg-type]
+            if len(received) == len(events):
+                break
+
+    task = asyncio.create_task(consumer())
+    await asyncio.sleep(0)
+
+    await manager.new_session(prompt=None, started_by_tg_user_id=1)
+    await asyncio.wait_for(task, timeout=5.0)
+
+    # Subprocess is still being torn down at this point — the in-memory
+    # status is RUNNING but new_session has returned. Aggregator should
+    # see all three events on disk because _consume_events writes to the
+    # log before publishing to the bus.
+    usage = manager.current_session_usage()
+    assert usage is not None
+    assert usage.input_tokens == 10
+    assert usage.output_tokens == 20
+    assert usage.cache_creation_input_tokens == 100
+    assert usage.cache_read_input_tokens == 500
+    assert usage.tool_call_count == 1
+    assert usage.num_turns == 1
+    assert usage.elapsed_ms == 1500
+    assert abs(usage.total_cost_usd - 0.01) < 1e-9
+
+    # Wait for the session to complete so the test does not leak tasks.
+    await _drain_status(bus, SessionStatus.COMPLETED)
+
+
+async def test_current_session_usage_returns_none_after_stop(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once :meth:`SessionManager.stop` tears down, the accessor returns ``None``."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "fake"},
+        {"type": "result", "subtype": "success", "duration_ms": 10},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    await manager.new_session(prompt=None, started_by_tg_user_id=1)
+    await _drain_status(bus, SessionStatus.COMPLETED)
+    await manager.stop()
+
+    assert manager.current_session_usage() is None
