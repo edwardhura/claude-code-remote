@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
 import pytest_asyncio
+from aiogram.exceptions import TelegramAPIError
 from aiogram.types import Chat, Message, User
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -24,6 +25,7 @@ from sqlalchemy.ext.asyncio import (
 
 from ccr.auth.pairing import approve, create_code
 from ccr.bot.handlers.session import (
+    _DIVIDER_MESSAGE,
     cmd_clear,
     cmd_new,
     cmd_pid,
@@ -35,7 +37,7 @@ from ccr.bot.handlers.session import (
 from ccr.claude.manager import NoActiveSessionError, SessionError
 from ccr.claude.state import SessionStatus
 from ccr.db.engine import AsyncSessionMaker
-from ccr.db.models import Base, Session
+from ccr.db.models import Base, PairedUser, Session
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -70,6 +72,7 @@ def _make_message(
     user_id: int = 42,
     username: str | None = "alice",
     chat_id: int = 1000,
+    bot: object | None = None,
 ) -> Message:
     msg = Message(
         message_id=1,
@@ -79,7 +82,33 @@ def _make_message(
         text=text,
     )
     object.__setattr__(msg, "answer", AsyncMock())
+    if bot is not None:
+        # ``Message.bot`` is an aiogram ``@property`` over ``_bot`` — direct
+        # ``object.__setattr__(msg, "bot", ...)`` raises (no setter). The
+        # canonical aiogram way to attach a Bot to a fabricated message is the
+        # ``as_(bot)`` helper, which sets ``_bot`` and returns ``self``.
+        msg.as_(bot)  # type: ignore[arg-type]
     return msg
+
+
+async def _seed_paired_user(
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    tg_user_id: int,
+    last_chat_id: int | None,
+    is_owner: bool = False,
+) -> None:
+    async with factory() as db:
+        db.add(
+            PairedUser(
+                tg_user_id=tg_user_id,
+                tg_username=f"u{tg_user_id}",
+                is_owner=is_owner,
+                approved_at=datetime.now(UTC),
+                last_chat_id=last_chat_id,
+            ),
+        )
+        await db.commit()
 
 
 _DEFAULT_SESSION_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
@@ -202,7 +231,16 @@ async def test_cmd_clear_stops_then_starts_fresh(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     manager = FakeManager(status=SessionStatus.RUNNING, pid=9999)
-    msg = _make_message(text="/clear", user_id=7)
+    await _seed_paired_user(
+        session_factory,
+        tg_user_id=1,
+        last_chat_id=1001,
+        is_owner=True,
+    )
+    await _seed_paired_user(session_factory, tg_user_id=2, last_chat_id=1002)
+    bot_mock = AsyncMock()
+    bot_mock.send_message = AsyncMock()
+    msg = _make_message(text="/clear", user_id=7, bot=bot_mock)
 
     await cmd_clear(msg, session_manager=manager, db_factory=session_factory)
 
@@ -212,6 +250,99 @@ async def test_cmd_clear_stops_then_starts_fresh(
     reply = msg.answer.await_args.args[0]
     assert "started" in reply
     assert re.search(r"\(pid \d+\)", reply) is not None
+
+    assert bot_mock.send_message.await_count == 2
+    sent_chat_ids = {call.args[0] for call in bot_mock.send_message.await_args_list}
+    assert sent_chat_ids == {1001, 1002}
+    for call in bot_mock.send_message.await_args_list:
+        assert call.args[1] == _DIVIDER_MESSAGE
+
+
+async def test_cmd_clear_idle_skips_divider(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    manager = FakeManager(status=SessionStatus.IDLE)
+    await _seed_paired_user(
+        session_factory,
+        tg_user_id=1,
+        last_chat_id=1001,
+        is_owner=True,
+    )
+    await _seed_paired_user(session_factory, tg_user_id=2, last_chat_id=1002)
+
+    async def _start(*, prompt: str | None, started_by_tg_user_id: int) -> uuid.UUID:
+        del prompt, started_by_tg_user_id
+        manager.set_status(SessionStatus.RUNNING)
+        return _DEFAULT_SESSION_ID
+
+    manager.new_session.side_effect = _start
+
+    bot_mock = AsyncMock()
+    bot_mock.send_message = AsyncMock()
+    msg = _make_message(text="/clear", user_id=7, bot=bot_mock)
+
+    await cmd_clear(msg, session_manager=manager, db_factory=session_factory)
+
+    bot_mock.send_message.assert_not_awaited()
+    manager.new_session.assert_awaited_once_with(prompt=None, started_by_tg_user_id=7)
+    msg.answer.assert_awaited_once()
+    reply = msg.answer.await_args.args[0]
+    assert "started" in reply
+
+
+async def test_cmd_clear_swallows_broadcast_failures(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    manager = FakeManager(status=SessionStatus.RUNNING, pid=4321)
+    await _seed_paired_user(
+        session_factory,
+        tg_user_id=1,
+        last_chat_id=1001,
+        is_owner=True,
+    )
+    await _seed_paired_user(session_factory, tg_user_id=2, last_chat_id=1002)
+
+    async def _send(chat_id: int, text: str, **kwargs: object) -> None:
+        del text, kwargs
+        if chat_id == 1001:
+            raise TelegramAPIError(method=None, message="blocked")  # type: ignore[arg-type]
+
+    bot_mock = AsyncMock()
+    bot_mock.send_message = AsyncMock(side_effect=_send)
+    msg = _make_message(text="/clear", user_id=7, bot=bot_mock)
+
+    await cmd_clear(msg, session_manager=manager, db_factory=session_factory)
+
+    assert bot_mock.send_message.await_count == 2
+    sent_chat_ids = [call.args[0] for call in bot_mock.send_message.await_args_list]
+    assert 1002 in sent_chat_ids
+    manager.new_session.assert_awaited_once_with(prompt=None, started_by_tg_user_id=7)
+    msg.answer.assert_awaited_once()
+    reply = msg.answer.await_args.args[0]
+    assert "started" in reply
+
+
+async def test_cmd_clear_no_paired_users_with_chat_id_completes(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    manager = FakeManager(status=SessionStatus.RUNNING, pid=5555)
+    await _seed_paired_user(
+        session_factory,
+        tg_user_id=1,
+        last_chat_id=None,
+        is_owner=True,
+    )
+    bot_mock = AsyncMock()
+    bot_mock.send_message = AsyncMock()
+    msg = _make_message(text="/clear", user_id=7, bot=bot_mock)
+
+    await cmd_clear(msg, session_manager=manager, db_factory=session_factory)
+
+    bot_mock.send_message.assert_not_awaited()
+    manager.new_session.assert_awaited_once_with(prompt=None, started_by_tg_user_id=7)
+    msg.answer.assert_awaited_once()
+    reply = msg.answer.await_args.args[0]
+    assert "started" in reply
 
 
 # --------------------------------------------------------------------------- #

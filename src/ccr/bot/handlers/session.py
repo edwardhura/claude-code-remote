@@ -19,6 +19,7 @@ from sqlalchemy import select
 
 from ccr.auth import pairing
 from ccr.bot.formatting import chunk_text
+from ccr.bot.notify import broadcast_paired
 from ccr.claude.manager import (
     NoActiveSessionError,
     NoPriorSessionError,
@@ -46,6 +47,7 @@ _HEX8_RE = re.compile(r"^[0-9a-f]{8}$")
 _INVALID_CONTINUE_ARG_REPLY = (
     "Invalid session id. Expected 8 hex characters (e.g. /continue 76581b99)."
 )
+_DIVIDER_MESSAGE = "— — — new session — — —"
 
 
 def _short_id(session_id: object) -> str:
@@ -151,12 +153,26 @@ async def cmd_continue(
 async def cmd_clear(
     msg: Message,
     session_manager: SessionManager,
-    db_factory: async_sessionmaker[AsyncSession],  # noqa: ARG001 — kept for parity with siblings
+    db_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Stop any running session and immediately start a fresh empty one."""
+    """Stop any running session, post a divider, then start a fresh empty one.
+
+    The divider broadcast is gated on ``prior_status != IDLE`` (read before
+    :meth:`SessionManager.stop`) so a ``/clear`` from a clean state does not
+    drop a misleading "new session" boundary into chat with nothing above it.
+    The broadcast is sent before :meth:`SessionManager.new_session` so the new
+    session's first events land *after* the divider in chat order.
+    """
     if msg.from_user is None:
         return
+
+    prior_status = await session_manager.status()
     await session_manager.stop()
+
+    if prior_status != SessionStatus.IDLE and msg.bot is not None:
+        async with db_factory() as db:
+            await broadcast_paired(msg.bot, db, _DIVIDER_MESSAGE)
+
     try:
         session_id = await session_manager.new_session(
             prompt=None,
