@@ -1143,3 +1143,161 @@ async def test_current_session_usage_returns_none_after_stop(
     await manager.stop()
 
     assert manager.current_session_usage() is None
+
+
+# --------------------------------------------------------------------------- #
+# CCR-032: current_rate_limit_status() — last-one-wins per-line snapshot.
+# --------------------------------------------------------------------------- #
+
+
+async def test_current_rate_limit_status_idle_returns_none(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """``current_rate_limit_status()`` returns ``None`` while no subprocess is held."""
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+    assert manager.current_rate_limit_status() is None
+
+
+async def test_current_rate_limit_status_populates_after_event(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``rate_limit_event`` in the JSONL stream is captured into the snapshot."""
+    from ccr.claude.events import RateLimitEvent
+
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "fake"},
+        {
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "allowed",
+                "resetsAt": 1777861800,
+                "rateLimitType": "five_hour",
+                "overageStatus": "rejected",
+                "overageDisabledReason": "group_zero_credit_limit",
+                "isUsingOverage": False,
+            },
+            "uuid": "758cb741-0e54-4af1-9c32-0b76648f795f",
+            "session_id": "fake",
+        },
+        {"type": "result", "subtype": "success", "duration_ms": 10},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    received: list[ClaudeEvent] = []
+
+    async def consumer() -> None:
+        async for payload in bus.subscribe("session.event"):
+            assert isinstance(payload, dict)
+            received.append(payload["event"])  # type: ignore[arg-type]
+            if len(received) == len(events):
+                break
+
+    task = asyncio.create_task(consumer())
+    await asyncio.sleep(0)
+
+    await manager.new_session(prompt=None, started_by_tg_user_id=None)
+    await asyncio.wait_for(task, timeout=5.0)
+
+    rl = manager.current_rate_limit_status()
+    assert isinstance(rl, RateLimitEvent)
+    assert rl.rate_limit_info is not None
+    assert rl.rate_limit_info.rate_limit_type == "five_hour"
+    assert rl.rate_limit_info.status == "allowed"
+    assert rl.rate_limit_info.is_using_overage is False
+
+    await _drain_status(bus, SessionStatus.COMPLETED)
+
+
+async def test_current_rate_limit_status_last_event_wins(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When two ``rate_limit_event`` lines arrive, the second snapshot wins."""
+    from ccr.claude.events import RateLimitEvent
+
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "fake"},
+        {
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "allowed",
+                "rateLimitType": "five_hour",
+            },
+        },
+        {
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "warning",
+                "rateLimitType": "weekly",
+            },
+        },
+        {"type": "result", "subtype": "success", "duration_ms": 10},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    received: list[ClaudeEvent] = []
+
+    async def consumer() -> None:
+        async for payload in bus.subscribe("session.event"):
+            assert isinstance(payload, dict)
+            received.append(payload["event"])  # type: ignore[arg-type]
+            if len(received) == len(events):
+                break
+
+    task = asyncio.create_task(consumer())
+    await asyncio.sleep(0)
+
+    await manager.new_session(prompt=None, started_by_tg_user_id=None)
+    await asyncio.wait_for(task, timeout=5.0)
+
+    rl = manager.current_rate_limit_status()
+    assert isinstance(rl, RateLimitEvent)
+    assert rl.rate_limit_info is not None
+    # The second event must overwrite the first.
+    assert rl.rate_limit_info.rate_limit_type == "weekly"
+    assert rl.rate_limit_info.status == "warning"
+
+    await _drain_status(bus, SessionStatus.COMPLETED)
+
+
+async def test_current_rate_limit_status_resets_on_stop(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``manager.stop()`` resets the snapshot to ``None`` (no leak across sessions)."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "fake"},
+        {
+            "type": "rate_limit_event",
+            "rate_limit_info": {"status": "allowed", "rateLimitType": "five_hour"},
+        },
+        {"type": "result", "subtype": "success", "duration_ms": 10},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    await manager.new_session(prompt=None, started_by_tg_user_id=None)
+    await _drain_status(bus, SessionStatus.COMPLETED)
+    await manager.stop()
+
+    assert manager.current_rate_limit_status() is None

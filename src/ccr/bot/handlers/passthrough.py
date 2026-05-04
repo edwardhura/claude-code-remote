@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import html
 import re
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from aiogram import Router
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
 
     from aiogram.types import Message
 
+    from ccr.claude.events import RateLimitEvent
     from ccr.claude.manager import SessionManager
     from ccr.claude.usage import SessionUsage
     from ccr.config import Settings
@@ -59,7 +61,7 @@ BLOCKED_INTERACTIVE: frozenset[str] = frozenset({"mcp", "init"})
 
 _UNKNOWN_USAGE_HINT = (
     "Unknown command. Whitelisted: /new /stop /clear /view /last /preview "
-    "/cost /model /compact /who /agents /skills."
+    "/cost /usage /model /compact /who /agents /skills."
 )
 
 _AGENTS_LIBRARY_GLOB_REL = ".claude/agents"
@@ -67,6 +69,8 @@ _EMPTY_PLACEHOLDER = "(none)"
 
 _SESSION_ID_HEX_PREFIX_LEN = 8
 _ONE_MINUTE_MS = 60_000
+_SECONDS_PER_MINUTE = 60
+_SECONDS_PER_HOUR = 3600
 
 
 router = Router(name="passthrough")
@@ -195,6 +199,98 @@ async def _reply_cost(msg: Message, session_manager: SessionManager) -> None:
     await msg.answer(_render_cost_reply(session_id.hex, usage))
 
 
+def _format_resets_at(epoch_seconds: int | None) -> str:
+    """Render ``epoch_seconds`` as a UTC ISO timestamp + relative delta.
+
+    Returns ``"unknown"`` when ``epoch_seconds`` is ``None`` or non-positive
+    (claude does not emit zero/negative epochs in practice but the field
+    is forward-compat optional). For epochs in the past the absolute UTC
+    timestamp is rendered followed by ``"in the past"`` rather than a
+    negative duration. Future epochs render as ``"in Xm Ys"`` for < 1 h
+    and ``"in Xh Ym"`` otherwise.
+    """
+    if epoch_seconds is None or epoch_seconds <= 0:
+        return "unknown"
+    target = datetime.fromtimestamp(epoch_seconds, tz=UTC)
+    iso = target.strftime("%Y-%m-%dT%H:%M:%SZ")
+    delta_seconds = int(epoch_seconds - datetime.now(tz=UTC).timestamp())
+    if delta_seconds <= 0:
+        return f"{iso} (in the past)"
+    if delta_seconds < _SECONDS_PER_HOUR:
+        minutes = delta_seconds // _SECONDS_PER_MINUTE
+        seconds = delta_seconds % _SECONDS_PER_MINUTE
+        return f"{iso} (in {minutes}m {seconds}s)"
+    hours = delta_seconds // _SECONDS_PER_HOUR
+    minutes = (delta_seconds % _SECONDS_PER_HOUR) // _SECONDS_PER_MINUTE
+    return f"{iso} (in {hours}h {minutes}m)"
+
+
+def _render_usage_reply(rl: RateLimitEvent) -> str:
+    """Render a rich HTML ``/usage`` reply.
+
+    Layout — every interpolated string field HTML-escaped, every field
+    optional (a missing field is skipped, never rendered as the literal
+    ``"None"``):
+
+    .. code-block:: text
+
+        <b>Rate-limit window:</b> {rate_limit_type}
+        <b>Status:</b> {status}
+        <b>Resets at:</b> {iso} (in {delta})
+        <b>Overage:</b> {overage_status}{ — overage_disabled_reason }
+        <b>Using overage:</b> yes|no
+
+    ``is_using_overage`` distinguishes ``False`` (renders ``"no"``) from
+    ``None`` (line omitted entirely) via an ``is not None`` guard.
+    Output is truncated to :data:`SAFE_CHUNK` defensively, mirroring
+    :func:`_render_cost_reply`.
+    """
+    info = rl.rate_limit_info
+    if info is None:
+        return "Rate-limit info unavailable."
+    lines: list[str] = []
+    if info.rate_limit_type:
+        lines.append(f"<b>Rate-limit window:</b> {html.escape(info.rate_limit_type)}")
+    if info.status:
+        lines.append(f"<b>Status:</b> {html.escape(info.status)}")
+    if info.resets_at:
+        lines.append(f"<b>Resets at:</b> {_format_resets_at(info.resets_at)}")
+    if info.overage_status:
+        suffix = ""
+        if info.overage_disabled_reason:
+            suffix = f" — {html.escape(info.overage_disabled_reason)}"
+        lines.append(f"<b>Overage:</b> {html.escape(info.overage_status)}{suffix}")
+    if info.is_using_overage is not None:
+        lines.append(f"<b>Using overage:</b> {'yes' if info.is_using_overage else 'no'}")
+    if not lines:
+        return "Rate-limit info unavailable."
+    text = "\n".join(lines)
+    if len(text) > SAFE_CHUNK:
+        text = text[:SAFE_CHUNK]
+    return text
+
+
+async def _reply_usage(msg: Message, session_manager: SessionManager) -> None:
+    """Answer ``/usage`` with the most recent rate-limit snapshot.
+
+    Three distinct states (per plan §Edge cases 2 + 3):
+
+    1. No active Claude subprocess → ``"No active session."``.
+    2. Active session but no ``rate_limit_event`` observed yet →
+       ``"No rate-limit data received yet on this session."`` (distinct
+       string so users and tests can tell it apart from state 1).
+    3. Active session with a snapshot → :func:`_render_usage_reply`.
+    """
+    if not session_manager.is_session_active():
+        await msg.answer("No active session.")
+        return
+    rl = session_manager.current_rate_limit_status()
+    if rl is None:
+        await msg.answer("No rate-limit data received yet on this session.")
+        return
+    await msg.answer(_render_usage_reply(rl))
+
+
 @router.message(Command(re.compile(r".+")))
 async def cmd_passthrough(
     msg: Message,
@@ -216,6 +312,10 @@ async def cmd_passthrough(
 
     if name == "cost":
         await _reply_cost(msg, session_manager)
+        return
+
+    if name == "usage":
+        await _reply_usage(msg, session_manager)
         return
 
     if name in WHITELIST:

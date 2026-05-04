@@ -816,3 +816,49 @@ Notes:
   - 2026-05-03 main: branch ccr-023-richer-cost-reply created, dispatching team-lead
   - 2026-05-03 main: team-lead Mode 1A returned DISPATCH: python-developer (dev-direct, no architect); dispatching python-developer
   - 2026-05-03 team-lead: approved
+---
+
+## CCR-032: `/usage` command — account-wide quota / rate-limit summary [done]
+Phase: n/a (post-CCR-023 chat-bot iteration)
+Feature: chat-bot
+Files:
+  - `src/ccr/bot/handlers/passthrough.py` — add a dedicated `/usage` branch (mirroring the `/cost` lift-out from CCR-023). Whether `usage` lands in `WHITELIST` for verbatim forward, gets lifted out for local rendering, or hybridises (forward + post-process) depends on the Step 0 probe outcome — leave the layout to the developer's call, same precedent as CCR-023.
+  - Possibly `src/ccr/claude/manager.py` — if the probe shows `rate_limit_event` (already observed in CCR-023's probe transcript) is what `/usage` surfaces, expose a small read-only accessor (e.g. `current_rate_limit_status() -> RateLimitStatus | None` or similar). Developer's call on shape and naming.
+  - Possibly `src/ccr/claude/usage.py` — extend the existing module (created in CCR-023 for `SessionUsage` / `aggregate_session_usage`) with a rate-limit / quota aggregator if the data shape composes naturally with the per-session walker. If the shape doesn't fit (e.g. `rate_limit_event` is per-line state, not per-`result` accumulation), introduce a sibling helper or a new module. PM does not prescribe.
+  - `tests/test_bot_passthrough.py` (existing, renamed from `tests/test_passthrough.py` in CCR-023) — extend with `/usage` cases mirroring the seven new CCR-023 `/cost` cases: rich HTML reply with the chosen fields, no-active-session canned string, HTML escaping of any interpolated values, regression assertions that `/cost`, `/model`, `/compact` still behave per CCR-023 / CCR-010, and explicit `send_slash` non-call (or call) assertions per the path the probe selects.
+  - `tests/fakes/fake_claude.py` — extend the canned JSONL fixture with synthetic `rate_limit_event` lines (and / or whatever shape the probe reveals) so the tests do not depend on a real claude binary.
+Out of scope:
+  - Real-money pricing tables or billing API calls (we only surface what the local JSONL stream / live process exposes — no calls to Anthropic billing).
+  - Persisting quota / rate-limit history across sessions in the SQL schema (read-only summary of the live state — cross-session aggregates are a follow-up ticket if ever asked for).
+  - Account-management UX (changing plans, viewing invoices, top-up flows, etc.) — out of scope; this ticket is a read-only summary surface.
+  - Modifying `/cost` (the per-session command — CCR-023 just landed and is its own surface).
+  - Modifying any other whitelist commands (`/model`, `/compact` stay verbatim-forward; `/agents`, `/skills`, `/cost`, `/clear` keep their current locally-rendered shape).
+Acceptance:
+  - [x] Step 0 probe outcome documented in the developer's work summary (which of the three outcomes from Notes was hit, and which path the implementation took). The probe transcript path should be cited the way CCR-023's review log cited `tmp/ccr-023-probe-1777812587.jsonl`.
+  - [x] `/usage` reply contains visibly more detail than the upstream one-liner (or whatever the upstream raw reply turns out to be) — exact fields are settled by team-lead / architect from the probe data.
+  - [x] `/usage` with no active session returns the existing `"No active session."` canned reply (mirror CCR-023 / the rest of the passthrough handlers).
+  - [x] Interpolated values are HTML-escaped (consistent with `formatting.py` conventions used in CCR-008 / CCR-018 / CCR-022 / CCR-023).
+  - [x] `/cost` (CCR-023 enrichment), `/model`, `/compact` regressions preserved — explicit assertions in the test extension.
+  - [x] `pytest tests/test_bot_passthrough.py` passes.
+  - [x] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [ ] Manual smoke (unticked, not blocking review per CCR-020 / CCR-021 / CCR-023 precedent): real claude session with a few user turns; `/usage` shows our richer summary alongside (or instead of) claude's terse line.
+Depends on: CCR-010, CCR-023
+Notes:
+  Phase n/a in the plan — post-CCR-023 chat-bot iteration, same precedent as CCR-022 / CCR-023. The router and whitelist from CCR-010 plus the `usage.py` aggregator from CCR-023 are the surfaces this ticket extends.
+  **User priority signal — most important command for them.** The user explicitly flagged `/usage` as the highest-priority follow-up after CCR-023 landed. PM is NOT reordering the queue (that is the team-lead / main session's call), but flagging this so the orchestrator knows to consider dispatching CCR-032 ahead of CCR-026 / CCR-027 (both deferred per their own Notes) when picking the next ticket.
+  **Why this ticket exists — distinction from `/cost`.** Claude Code's interactive TUI exposes two related commands: `/cost` (this session's spend — already enriched in CCR-023) and `/usage` (account-wide quota / rate-limit / subscription-window state). CCR-023's Notes section flagged this distinction verbatim and deferred `/usage` to a follow-up. CCR-023's Step 0 probe transcript (`tmp/ccr-023-probe-1777812587.jsonl`, since deleted but documented in DONE.md's CCR-023 review log) did NOT reveal a `/usage` slash command in the JSONL stream — only `system/init`, `rate_limit_event`, `assistant`, `result/success` event types were observed. Notably `rate_limit_event` IS one of the observed event types and is the most likely substrate for what `/usage` would surface; the developer should confirm in Step 0 whether `/usage` itself is also a recognised slash command on claude's side, or whether the data must be sourced from `rate_limit_event` lines emitted independently of any slash command.
+  **Step 0 probe — required before writing any code.** Mirror the CCR-020 / CCR-021 / CCR-023 pattern: run `claude -p --input-format=stream-json --output-format=stream-json --verbose`, send a few user turns, then send `/usage` as a user turn (`{"type":"user","message":{"role":"user","content":"/usage"}}`) and capture the full stdout JSONL. Three documented outcomes:
+    1. Claude `-p` emits `rate_limit_event` lines (already observed in CCR-023's probe) with usage / quota / window data on stdout — implementation pulls from the running JSONL log (potentially extending `usage.py`'s aggregator to also collect rate-limit state alongside `SessionUsage`) and renders a richer summary on our side. Smallest path, no enrichment of claude's own text. Likely the path this ticket lands on given CCR-023's findings.
+    2. Claude's `/usage` reply itself contains structured detail (multi-line text, JSON-in-text, fields beyond a one-liner) — implementation forwards `/usage` and post-processes the captured text events. Brittle (text-format dependency); document fragility in the work summary.
+    3. Claude emits nothing structured for `/usage` (mirroring CCR-023's secondary finding for `/cost`) — implementation either (a) falls back to a rate-limit-only summary if outcome 1 is partially available (the CCR-023 probe already saw `rate_limit_event` in passing), labelled as approximate, or (b) returns BLOCKED with notes for follow-up. Default to (a) unless the architect says BLOCKED is preferable.
+  The developer must document which outcome was hit and which path was taken in the work summary, citing the probe transcript path.
+  **Mode 1A note for team-lead.** Architect candidate IF outcome 1 is hit — the data shape of `rate_limit_event` is unknown today, and whether to extend `usage.py`'s aggregator (composing with `SessionUsage`) or introduce a sibling module / accessor is a load-bearing design call (CCR-023's `usage.py` is per-`result` accumulation; rate-limit state is per-line snapshot — those may or may not compose cleanly). Outcome 2 is likely dev-direct (forward + parse text). Outcome 3 (a) is borderline architect — approximation labelling matters for user trust, same as CCR-023's outcome-3 fallback.
+  Reply formatting: HTML escape every interpolated value; reuse `formatting.py` chunking if needed; cap message body to ≤ 3500 chars consistent with CCR-019 / CCR-023. Reply mode is HTML, matching the rest of the bot.
+  The existing `_UNKNOWN_USAGE_HINT` in `passthrough.py` does not list `/usage` today. If the developer adds `/usage` as a recognised command, update the hint string to include it for grep-stability (mirroring the CCR-030 `/skills` precedent).
+
+### Review log
+  - 2026-05-03 project-manager: created — user flagged /usage as highest priority
+  - 2026-05-04 main: branch ccr-032-usage-command created, dispatching team-lead
+  - 2026-05-04 team-lead: dispatching architect — rate_limit_event field shape unknown; outcome 1 design call (in-memory state vs JSONL aggregator) spans events.py + manager.py + usage.py
+  - 2026-05-04 team-lead: plan reviewed (.claude/plans/CCR-032-usage-command.md), dispatching python-developer
+  - 2026-05-04 team-lead: approved

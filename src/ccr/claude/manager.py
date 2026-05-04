@@ -35,6 +35,7 @@ from sqlalchemy import select
 
 from ccr.claude.events import (
     AssistantTurn,
+    RateLimitEvent,
     ResultEvent,
     SystemInit,
     ToolResultBlock,
@@ -141,6 +142,9 @@ class SessionManager:
         self._running_subagents: dict[str, str] = {}
         # Snapshot of skill names from the most recent system/init event.
         self._skills: list[str] = []
+        # Most recent rate_limit_event snapshot. ``None`` until the first
+        # event arrives; reset to ``None`` on every session boundary.
+        self._rate_limit_status: RateLimitEvent | None = None
 
         # MCP permission gate (CCR-025). Lifetime = manager lifetime; lazily
         # started on the first new_session / continue_session call so a
@@ -227,6 +231,7 @@ class SessionManager:
             self._last_event_at_pending = None
             self._running_subagents = {}
             self._skills = []
+            self._rate_limit_status = None
             self._mcp.set_current_session(session_id)
 
             now = datetime.now(UTC)
@@ -355,6 +360,7 @@ class SessionManager:
             self._last_event_at_pending = None
             self._running_subagents = {}
             self._skills = []
+            self._rate_limit_status = None
             self._mcp.set_current_session(session_id)
 
             now = datetime.now(UTC)
@@ -535,6 +541,7 @@ class SessionManager:
         self._exit_task = None
         self._running_subagents = {}
         self._skills = []
+        self._rate_limit_status = None
 
     async def _consume_events(self) -> None:
         """Drain :meth:`ClaudeProcess.events` into the log + bus.
@@ -563,6 +570,8 @@ class SessionManager:
                     self._skills = list(event.skills)
                 elif isinstance(event, ResultEvent) and event.subtype == "success":
                     self._saw_result_success = True
+                elif isinstance(event, RateLimitEvent):
+                    self._rate_limit_status = event
 
                 self._track_subagents(event)
 
@@ -863,6 +872,20 @@ class SessionManager:
         if session_id is None or self._proc is None:
             return None
         return aggregate_session_usage(self._logs_dir / f"{session_id}.jsonl")
+
+    def current_rate_limit_status(self) -> RateLimitEvent | None:
+        """Return the most recent rate-limit snapshot for the live session.
+
+        Returns ``None`` if no session is running OR no ``rate_limit_event``
+        has been observed yet on this session. Last-one-wins: a later
+        ``rate_limit_event`` replaces the snapshot. The bot's ``/usage``
+        handler renders this snapshot directly — claude's own ``-p`` reply
+        to ``/usage`` is a useless one-liner (probe CCR-032), so the local
+        render is strictly better than forwarding.
+        """
+        if self._proc is None:
+            return None
+        return self._rate_limit_status
 
 
 __all__ = [
