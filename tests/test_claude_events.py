@@ -9,6 +9,8 @@ from pydantic import TypeAdapter
 from ccr.claude.events import (
     AssistantTurn,
     ClaudeEvent,
+    RateLimitEvent,
+    RateLimitInfo,
     ResultEvent,
     SystemInit,
     TextBlock,
@@ -168,3 +170,108 @@ def test_dict_input_accepted() -> None:
     obj = {"type": "system", "subtype": "init"}
     event = parse_event(obj)
     assert isinstance(event, SystemInit)
+
+
+# --------------------------------------------------------------------------- #
+# CCR-032: rate_limit_event — typed model surfaces from the discriminated union.
+# --------------------------------------------------------------------------- #
+
+
+def test_parse_rate_limit_event_returns_typed_model() -> None:
+    """A probe-shape ``rate_limit_event`` line surfaces as :class:`RateLimitEvent`,
+    not :class:`UnknownEvent`. CamelCase wire fields land on snake_case attrs."""
+    line = json.dumps(
+        {
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "allowed",
+                "resetsAt": 1777861800,
+                "rateLimitType": "five_hour",
+                "overageStatus": "rejected",
+                "overageDisabledReason": "group_zero_credit_limit",
+                "isUsingOverage": False,
+            },
+            "uuid": "758cb741-0e54-4af1-9c32-0b76648f795f",
+            "session_id": "831d0859-e616-4ad0-9ff4-047eb0ae1b81",
+        }
+    )
+    event = parse_event(line)
+    assert isinstance(event, RateLimitEvent)
+    assert event.session_id == "831d0859-e616-4ad0-9ff4-047eb0ae1b81"
+    assert event.uuid == "758cb741-0e54-4af1-9c32-0b76648f795f"
+    info = event.rate_limit_info
+    assert info is not None
+    assert info.status == "allowed"
+    assert info.resets_at == 1777861800
+    assert info.rate_limit_type == "five_hour"
+    assert info.overage_status == "rejected"
+    assert info.overage_disabled_reason == "group_zero_credit_limit"
+    assert info.is_using_overage is False
+
+
+def test_parse_rate_limit_event_alias_round_trip() -> None:
+    """``RateLimitInfo`` accepts both camelCase wire input and snake_case
+    fixture input; both round-trip to the same Python attribute names."""
+    camel = RateLimitInfo.model_validate(
+        {
+            "status": "allowed",
+            "resetsAt": 100,
+            "rateLimitType": "five_hour",
+            "overageStatus": "rejected",
+            "overageDisabledReason": "x",
+            "isUsingOverage": True,
+        }
+    )
+    snake = RateLimitInfo.model_validate(
+        {
+            "status": "allowed",
+            "resets_at": 100,
+            "rate_limit_type": "five_hour",
+            "overage_status": "rejected",
+            "overage_disabled_reason": "x",
+            "is_using_overage": True,
+        }
+    )
+    assert camel.resets_at == snake.resets_at == 100
+    assert camel.rate_limit_type == snake.rate_limit_type == "five_hour"
+    assert camel.overage_status == snake.overage_status == "rejected"
+    assert camel.overage_disabled_reason == snake.overage_disabled_reason == "x"
+    assert camel.is_using_overage is snake.is_using_overage is True
+
+
+def test_parse_rate_limit_event_extra_fields_fall_through_model_extra() -> None:
+    """Forward-compat: an unknown sub-field lands in ``model_extra``
+    rather than failing validation."""
+    line = json.dumps(
+        {
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "allowed",
+                "newField": "future-server-side-thing",
+            },
+        }
+    )
+    event = parse_event(line)
+    assert isinstance(event, RateLimitEvent)
+    info = event.rate_limit_info
+    assert info is not None
+    assert info.status == "allowed"
+    assert info.model_extra == {"newField": "future-server-side-thing"}
+
+
+def test_parse_rate_limit_event_missing_info_object() -> None:
+    """A ``rate_limit_event`` line without ``rate_limit_info`` parses
+    cleanly with ``rate_limit_info is None`` (forward-compat)."""
+    line = json.dumps({"type": "rate_limit_event"})
+    event = parse_event(line)
+    assert isinstance(event, RateLimitEvent)
+    assert event.rate_limit_info is None
+
+
+def test_claude_event_union_includes_rate_limit_event() -> None:
+    """Sanity: :class:`RateLimitEvent` is part of the public ``ClaudeEvent``
+    union so consumers branching on ``isinstance(..., RateLimitEvent)``
+    get accurate static typing."""
+    # The union includes the type at runtime; this is mostly a guard
+    # against an accidental drop from the union in a future refactor.
+    assert RateLimitEvent in ClaudeEvent.__args__  # type: ignore[attr-defined]

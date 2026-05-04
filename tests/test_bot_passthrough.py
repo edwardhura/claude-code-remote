@@ -12,6 +12,7 @@ from aiogram.filters import CommandObject
 from aiogram.types import Chat, Message, User
 
 from ccr.bot.handlers.passthrough import cmd_passthrough
+from ccr.claude.events import RateLimitEvent, RateLimitInfo
 from ccr.claude.manager import NoActiveSessionError
 from ccr.claude.usage import SessionUsage
 from ccr.config import Settings
@@ -63,6 +64,7 @@ class FakeManager:
         active: bool = True,
         usage: SessionUsage | None = None,
         session_id: uuid.UUID | None = None,
+        rate_limit: RateLimitEvent | None = None,
     ) -> None:
         self.send_slash = AsyncMock()
         if send_side_effect is not None:
@@ -72,6 +74,7 @@ class FakeManager:
         self._active = active
         self._usage = usage
         self._session_id = session_id
+        self._rate_limit = rate_limit
 
     def running_subagents(self) -> list[str]:
         # Mirror SessionManager.running_subagents()'s contract: alphabetically
@@ -89,6 +92,11 @@ class FakeManager:
     def current_session_usage(self) -> SessionUsage | None:
         # Mirror SessionManager.current_session_usage(): None when idle.
         return self._usage
+
+    def current_rate_limit_status(self) -> RateLimitEvent | None:
+        # Mirror SessionManager.current_rate_limit_status(): None when idle
+        # OR when no rate_limit_event has been observed yet on this session.
+        return self._rate_limit
 
     @property
     def current_session_id(self) -> uuid.UUID | None:
@@ -408,7 +416,7 @@ async def test_unknown_command_returns_usage(tmp_path: Path) -> None:
     manager.send_slash.assert_not_awaited()
     msg.answer.assert_awaited_once_with(
         "Unknown command. Whitelisted: /new /stop /clear /view /last /preview "
-        "/cost /model /compact /who /agents /skills.",
+        "/cost /usage /model /compact /who /agents /skills.",
     )
 
 
@@ -728,3 +736,259 @@ async def test_skills_branch_fires_before_unknown_fallthrough(tmp_path: Path) ->
     text = _captured_text(msg)
     assert "Unknown command" not in text
     assert "<b>Skills</b>" in text
+
+
+# --------------------------------------------------------------------------- #
+# CCR-032: /usage — local render of rate_limit_event snapshot.
+# --------------------------------------------------------------------------- #
+
+
+def _probe_rate_limit_event(
+    *,
+    status: str | None = "allowed",
+    resets_at: int | None = 1777861800,
+    rate_limit_type: str | None = "five_hour",
+    overage_status: str | None = "rejected",
+    overage_disabled_reason: str | None = "group_zero_credit_limit",
+    is_using_overage: bool | None = False,
+) -> RateLimitEvent:
+    """Build a probe-shape :class:`RateLimitEvent` for /usage tests."""
+    return RateLimitEvent(
+        type="rate_limit_event",
+        rate_limit_info=RateLimitInfo(
+            status=status,
+            resets_at=resets_at,
+            rate_limit_type=rate_limit_type,
+            overage_status=overage_status,
+            overage_disabled_reason=overage_disabled_reason,
+            is_using_overage=is_using_overage,
+        ),
+        session_id="831d0859-e616-4ad0-9ff4-047eb0ae1b81",
+        uuid="758cb741-0e54-4af1-9c32-0b76648f795f",
+    )
+
+
+@pytest.mark.asyncio
+async def test_usage_active_session_with_rate_limit_renders_html(tmp_path: Path) -> None:
+    """``/usage`` with a snapshot renders HTML labels and never forwards via send_slash."""
+    rl = _probe_rate_limit_event()
+    manager = FakeManager(active=True, rate_limit=rl)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/usage")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("usage"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    # /usage is locally rendered — the canned claude reply is degenerate.
+    manager.send_slash.assert_not_awaited()
+    text = _captured_text(msg)
+    assert "<b>Rate-limit window:</b> five_hour" in text
+    assert "<b>Status:</b> allowed" in text
+    assert "<b>Overage:</b> rejected" in text
+    # group_zero_credit_limit appears as a suffix on the overage line.
+    assert "group_zero_credit_limit" in text
+    assert "<b>Using overage:</b> no" in text
+
+
+@pytest.mark.asyncio
+async def test_usage_no_active_session_returns_canned_string(tmp_path: Path) -> None:
+    """``/usage`` while idle → the canonical no-session string."""
+    manager = FakeManager(active=False, rate_limit=None)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/usage")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("usage"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    manager.send_slash.assert_not_awaited()
+    msg.answer.assert_awaited_once_with("No active session.")
+
+
+@pytest.mark.asyncio
+async def test_usage_active_session_no_rate_limit_yet_returns_distinct_string(
+    tmp_path: Path,
+) -> None:
+    """Active session + no event yet → distinct string, NOT ``"No active session."``."""
+    manager = FakeManager(active=True, rate_limit=None)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/usage")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("usage"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    manager.send_slash.assert_not_awaited()
+    msg.answer.assert_awaited_once_with(
+        "No rate-limit data received yet on this session.",
+    )
+
+
+@pytest.mark.asyncio
+async def test_usage_html_escapes_interpolated_values(tmp_path: Path) -> None:
+    """Interpolated string fields are HTML-escaped — no raw markup leaks."""
+    rl = _probe_rate_limit_event(
+        rate_limit_type="<script>",
+        overage_disabled_reason="a&b<c",
+    )
+    manager = FakeManager(active=True, rate_limit=rl)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/usage")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("usage"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    text = _captured_text(msg)
+    assert "&lt;script&gt;" in text
+    assert "a&amp;b&lt;c" in text
+    # Raw metacharacters must not leak.
+    assert "<script>" not in text
+    assert "a&b<c" not in text
+
+
+@pytest.mark.asyncio
+async def test_usage_omits_missing_optional_fields(tmp_path: Path) -> None:
+    """Only ``status`` set → only the status line renders; no literal ``"None"``."""
+    rl = RateLimitEvent(
+        type="rate_limit_event",
+        rate_limit_info=RateLimitInfo(status="allowed"),
+    )
+    manager = FakeManager(active=True, rate_limit=rl)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/usage")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("usage"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    text = _captured_text(msg)
+    assert "<b>Status:</b> allowed" in text
+    # Other lines must NOT appear.
+    assert "Rate-limit window" not in text
+    assert "Resets at" not in text
+    assert "Overage" not in text
+    assert "Using overage" not in text
+    # And the literal "None" must never leak.
+    assert "None" not in text
+
+
+@pytest.mark.asyncio
+async def test_usage_renders_using_overage_false_distinct_from_none(
+    tmp_path: Path,
+) -> None:
+    """``is_using_overage=False`` renders ``"no"``; ``None`` omits the line."""
+    rl_false = RateLimitEvent(
+        type="rate_limit_event",
+        rate_limit_info=RateLimitInfo(is_using_overage=False),
+    )
+    rl_none = RateLimitEvent(
+        type="rate_limit_event",
+        rate_limit_info=RateLimitInfo(is_using_overage=None),
+    )
+
+    # False → renders "no".
+    manager_false = FakeManager(active=True, rate_limit=rl_false)
+    settings = _make_fake_settings(tmp_path)
+    msg_false = _make_message(text="/usage")
+    await cmd_passthrough(
+        msg_false,
+        command=_command("usage"),
+        session_manager=manager_false,
+        settings=settings,
+    )
+    text_false = _captured_text(msg_false)
+    assert "<b>Using overage:</b> no" in text_false
+
+    # None → line is omitted; renderer falls back to "info unavailable" since
+    # no other field is populated.
+    manager_none = FakeManager(active=True, rate_limit=rl_none)
+    msg_none = _make_message(text="/usage")
+    await cmd_passthrough(
+        msg_none,
+        command=_command("usage"),
+        session_manager=manager_none,
+        settings=settings,
+    )
+    text_none = _captured_text(msg_none)
+    assert "Using overage" not in text_none
+
+
+@pytest.mark.asyncio
+async def test_usage_resets_at_in_the_past(tmp_path: Path) -> None:
+    """A 2020 epoch renders an absolute UTC timestamp + ``"in the past"``."""
+    # 2020-01-01T00:00:00Z = 1577836800
+    rl = _probe_rate_limit_event(
+        resets_at=1577836800,
+        # Trim other fields to keep the assertion focused.
+        status=None,
+        rate_limit_type=None,
+        overage_status=None,
+        overage_disabled_reason=None,
+        is_using_overage=None,
+    )
+    manager = FakeManager(active=True, rate_limit=rl)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/usage")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("usage"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    text = _captured_text(msg)
+    assert "<b>Resets at:</b>" in text
+    # Absolute UTC timestamp surfaces.
+    assert "2020-01-01T00:00:00Z" in text
+    # Past delta surfaces as "in the past" rather than a negative duration.
+    assert "in the past" in text
+    # The relative-delta segment (everything inside the parens after "in")
+    # must not contain a negative-sign prefix on a number.
+    import re as _re
+
+    paren_segment = _re.search(r"\(in [^)]*\)", text)
+    assert paren_segment is not None
+    assert "-" not in paren_segment.group(0)
+
+
+def test_unknown_usage_hint_includes_usage_command() -> None:
+    """The unknown-command hint must list ``/usage`` (grep-stability regression)."""
+    from ccr.bot.handlers.passthrough import _UNKNOWN_USAGE_HINT
+
+    assert "/usage" in _UNKNOWN_USAGE_HINT
+
+
+@pytest.mark.asyncio
+async def test_usage_rate_limit_info_none_returns_unavailable(tmp_path: Path) -> None:
+    """``rate_limit_info is None`` → ``"Rate-limit info unavailable."``."""
+    rl = RateLimitEvent(type="rate_limit_event", rate_limit_info=None)
+    manager = FakeManager(active=True, rate_limit=rl)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/usage")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("usage"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    msg.answer.assert_awaited_once_with("Rate-limit info unavailable.")

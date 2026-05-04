@@ -145,6 +145,43 @@ class ResultEvent(_EventBase):
     usage: ResultUsage | None = None
 
 
+class RateLimitInfo(BaseModel):
+    """Inner ``rate_limit_info`` payload of :class:`RateLimitEvent`.
+
+    Forward-compatible: every field is optional and ``extra="allow"`` so
+    new server-side fields surface in ``model_extra`` rather than failing.
+    ``populate_by_name=True`` lets the parser accept either claude's
+    camelCase wire format (``resetsAt``) or snake_case (``resets_at``)
+    used by Python test fixtures.
+    """
+
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+    status: str | None = None
+    resets_at: int | None = Field(default=None, alias="resetsAt")
+    rate_limit_type: str | None = Field(default=None, alias="rateLimitType")
+    overage_status: str | None = Field(default=None, alias="overageStatus")
+    overage_disabled_reason: str | None = Field(
+        default=None,
+        alias="overageDisabledReason",
+    )
+    is_using_overage: bool | None = Field(default=None, alias="isUsingOverage")
+
+
+class RateLimitEvent(_EventBase):
+    """Out-of-band rate-limit / quota snapshot from Claude Code.
+
+    Emitted as a per-line snapshot (last-one-wins): the most recent
+    ``rate_limit_event`` *is* the current rate-limit state. The bot's
+    ``/usage`` handler reads this off :class:`SessionManager`'s in-memory
+    snapshot rather than walking the JSONL log.
+    """
+
+    type: Literal["rate_limit_event"]
+    rate_limit_info: RateLimitInfo | None = None
+    session_id: str | None = None
+    uuid: str | None = None
+
+
 class UnknownEvent(_EventBase):
     """Catch-all for unrecognised ``type`` values OR validation failures.
 
@@ -161,18 +198,18 @@ class UnknownEvent(_EventBase):
 
 
 _KnownEvent = Annotated[
-    SystemInit | UserTurn | AssistantTurn | ResultEvent,
+    SystemInit | UserTurn | AssistantTurn | ResultEvent | RateLimitEvent,
     Field(discriminator="type"),
 ]
 
 # ``ClaudeEvent`` is the public type for downstream consumers — it is the
-# closed union of all four known variants plus the :class:`UnknownEvent`
+# closed union of all known variants plus the :class:`UnknownEvent`
 # catch-all. Pydantic v2 requires discriminator fields to be ``Literal``,
 # so :class:`UnknownEvent` (which has ``type: str``) cannot be part of a
 # discriminated union; we fall back to a plain Union here. Validation goes
 # through :func:`parse_event`, which uses ``_KnownEvent`` first and only
 # constructs :class:`UnknownEvent` on validation failure.
-ClaudeEvent = SystemInit | UserTurn | AssistantTurn | ResultEvent | UnknownEvent
+ClaudeEvent = SystemInit | UserTurn | AssistantTurn | ResultEvent | RateLimitEvent | UnknownEvent
 
 
 _ADAPTER: TypeAdapter[Any] = TypeAdapter(_KnownEvent)
@@ -255,6 +292,8 @@ __all__ = [
     "ClaudeEvent",
     "ContentBlock",
     "McpPermissionRequest",
+    "RateLimitEvent",
+    "RateLimitInfo",
     "ResultEvent",
     "ResultUsage",
     "SystemInit",
