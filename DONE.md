@@ -1013,3 +1013,45 @@ Notes:
   - 2026-05-05 main: branch ccr-034-config-timezone created, dispatching team-lead
   - 2026-05-05 team-lead: scope brief issued (no architect), dispatching python-developer
   - 2026-05-05 team-lead: approved
+---
+
+## CCR-035: `format_user_datetime` helper + bot-wide datetime standardisation [done]
+Phase: n/a (post-CCR-034 UX polish)
+Feature: chat-bot
+Files:
+  - `src/ccr/utils.py` (new — or `src/ccr/bot/datetime.py`; developer's call) — `format_user_datetime(dt: datetime, user: PairedUser | None, mode: Literal["full", "short", "time"]) -> str`. All output 24h. Modes:
+    - `full` → `HH:MM - DD/MM/YYYY`
+    - `short` → `HH:MM - D Mon` (English month abbreviation, no leading zero on day)
+    - `time`  → `HH:MM`
+    Applies `user.timezone` (loaded via `zoneinfo.ZoneInfo`) when set; falls back to UTC when `user is None` or `user.timezone is None` or the stored zone fails to resolve (defensive — log a warning, fall back to UTC, do not raise).
+  - `src/ccr/bot/` — sweep all bot-side timestamp rendering call sites and replace inline `strftime` / ad-hoc formatting with calls to `format_user_datetime`. Likely sites (developer must confirm via grep): wherever `started_at` / `ended_at` / reset-time strings are interpolated today. Web viewer (`src/ccr/web/`) is OUT of scope.
+  - `.claude/agents/python-developer.md` — append a durable rule under Conventions / project rules: **"When rendering datetimes in bot replies (`src/ccr/bot/`), use `ccr.utils.format_user_datetime` (or wherever the helper lands). Never call `strftime` inline in `src/ccr/bot/`."** Phrase as a project rule so future tickets inherit it.
+  - `tests/test_utils_datetime.py` (new) — unit tests: each mode returns the expected format; user with `Europe/Berlin` shifts a UTC instant correctly; `user=None` falls back to UTC; `user.timezone="Not/Real"` falls back to UTC and logs a warning; DST-edge sanity check.
+  - `tests/test_bot_*` — update any existing test that asserts an inline timestamp format to match the new helper output (mostly `tests/test_bot_session.py` and any other passthrough/usage test that pins `started_at` rendering).
+Out of scope:
+  - Web-viewer datetime rendering (`src/ccr/web/`) — that has its own browser-side concerns; explicit out of scope per the user's note "Web viewer is out of scope."
+  - Adding new modes beyond `full` / `short` / `time` — file follow-ups if needed.
+  - Changing how `paired_users.timezone` is set — that's CCR-034.
+  - Any non-bot caller (CLI, console, internal logging) — those keep ISO/UTC. The rule is bot-scoped.
+Acceptance:
+  - [x] `format_user_datetime(dt, user, "full")` returns `HH:MM - DD/MM/YYYY` (24h).
+  - [x] `format_user_datetime(dt, user, "short")` returns `HH:MM - D Mon` (English month abbreviation, no leading zero on day).
+  - [x] `format_user_datetime(dt, user, "time")` returns `HH:MM`.
+  - [x] When `user.timezone` is set to a valid IANA zone, the helper applies that zone (test: a UTC-noon datetime renders with `Europe/Berlin` offset of +1 or +2 depending on DST).
+  - [x] When `user is None` OR `user.timezone is None` OR the stored zone is unresolvable, the helper falls back to UTC and (for the unresolvable case) logs a warning via structlog.
+  - [x] `grep -rnE "strftime\(" src/ccr/bot/` returns no matches (every bot-side rendering goes through the helper).
+  - [x] `.claude/agents/python-developer.md` contains the new rule about using the helper.
+  - [x] `pytest tests/test_utils_datetime.py` passes.
+  - [x] `pytest --cov=ccr --cov-fail-under=80` passes.
+Depends on: CCR-034
+Notes:
+  Phase n/a in the plan — post-CCR-034. The helper is the prerequisite for CCR-037 (sessions list display) and CCR-039 (`/usage` cosmetics). Filing as a standalone ticket so those two tickets can depend on a stable helper and don't each reinvent formatting.
+  The grep canary (`strftime\(`) on `src/ccr/bot/` is the durable enforcement; the python-developer.md rule is the documentation half.
+  Mode 1A note for team-lead: skip the architect — small, additive, single-file helper plus a sweep + agent-rule append. No new abstraction, no schema, no cross-cutting design call.
+  Helper signature is suggested, not prescribed; developer can choose the exact module path and pattern (e.g. accept a `tg_user_id` instead of a `PairedUser`, looking up the row internally). Whichever shape lands, all bot call sites must use it consistently.
+
+### Review log
+  - 2026-05-05 main: branch ccr-035-format-user-datetime created, dispatching team-lead (Mode 1A)
+  - 2026-05-05 team-lead: scope brief issued (no architect), dispatching python-developer
+  - 2026-05-05 team-lead: approved — all 9 acceptance criteria verified passing; 11/11 helper tests, 414/414 full suite, 89.11% coverage, strftime canary clean, agent rule at line 53, ruff+mypy clean; reviewer REVIEW FAIL was a dispatch artefact (BRIEF note present, not quoted in dispatch prompt)
+  - 2026-05-05 main: format respec by user pre-publish — `full` → `HH:MM - DD/MM/YYYY`; `short` → `HH:MM - D Mon` (locale-independent English month abbr., no leading zero on day); `time` unchanged. Helper, tests (now 13 in test_utils_datetime.py), bot regression tests, BRIEF, CONTEXT, and the spec/acceptance lines in this ticket all updated to match.
