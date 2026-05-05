@@ -11,8 +11,7 @@ MCP permission gating, CCR-010 slash passthrough, CCR-012 web SSE):
 * :data:`ClaudeEvent` / :data:`ContentBlock` — Pydantic v2 discriminated
   unions; consumers pattern-match on ``event.type``.
 * :class:`JsonlSessionLog` — read-from-seq + tail iteration for SSE replay.
-* :class:`SessionError` / :class:`NoActiveSessionError` /
-  :class:`StaleSessionError` — error hierarchy.
+* :class:`SessionError` / :class:`NoActiveSessionError` — error hierarchy.
 """
 
 from __future__ import annotations
@@ -23,8 +22,6 @@ from ccr.claude.manager import (
     NoActiveSessionError,
     SessionError,
     SessionManager,
-    StaleSessionError,
-    StaleToolUseError,
 )
 from ccr.claude.mcp import McpPermissionServer, McpServerStartError
 from ccr.claude.state import SessionStatus
@@ -40,6 +37,4 @@ __all__ = [
     "SessionError",
     "SessionManager",
     "SessionStatus",
-    "StaleSessionError",
-    "StaleToolUseError",
 ]

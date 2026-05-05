@@ -543,7 +543,7 @@ async def test_continue_session_picks_most_recent_finished(
     bus = EventBus()
     manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
 
-    prior_id, _ = await manager._db_lookup_most_recent_finished()  # noqa: SLF001 — direct internal probe
+    prior_id = await manager._db_lookup_most_recent_finished()  # noqa: SLF001 — direct internal probe
     assert prior_id == sid_middle
 
     # End-to-end sanity: continue_session succeeds (would have raised
@@ -685,7 +685,7 @@ async def test_continue_session_with_prefix_resumes_matched_row(
 
     # And the helper itself returns the older id when called directly with
     # the prefix — the canonical assertion that the older row was selected.
-    prior_id, _ = await manager._db_lookup_session_by_prefix("76581b99")  # noqa: SLF001
+    prior_id = await manager._db_lookup_session_by_prefix("76581b99")  # noqa: SLF001
     assert prior_id == older_id
 
 
@@ -748,13 +748,12 @@ async def test_db_lookup_session_by_prefix_returns_none_for_no_match(
     settings: Settings,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Direct helper call on an empty DB returns ``(None, None)``."""
+    """Direct helper call on an empty DB returns ``None``."""
     bus = EventBus()
     manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
 
-    prior_id, claude_id = await manager._db_lookup_session_by_prefix("12345678")  # noqa: SLF001
+    prior_id = await manager._db_lookup_session_by_prefix("12345678")  # noqa: SLF001
     assert prior_id is None
-    assert claude_id is None
 
 
 # --------------------------------------------------------------------------- #

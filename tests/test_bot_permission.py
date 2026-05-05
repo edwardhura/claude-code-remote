@@ -56,13 +56,12 @@ def test_parse_callback_rejects_too_few_segments() -> None:
 
 
 def test_keyboard_buttons_match_options_and_callback_data() -> None:
-    kb = permission_kb(_SESSION_ID, "r1", ["approve", "skip", "abort"])
+    kb = permission_kb(_SESSION_ID, "r1", ["approve", "deny"])
     assert isinstance(kb, InlineKeyboardMarkup)
-    assert len(kb.inline_keyboard) == 3
+    assert len(kb.inline_keyboard) == 2
     expected = [
         ("Approve", f"perm:{_SESSION_ID}:r1:approve"),
-        ("Skip", f"perm:{_SESSION_ID}:r1:skip"),
-        ("Abort", f"perm:{_SESSION_ID}:r1:abort"),
+        ("Deny", f"perm:{_SESSION_ID}:r1:deny"),
     ]
     for row, (label, data) in zip(kb.inline_keyboard, expected, strict=True):
         assert len(row) == 1

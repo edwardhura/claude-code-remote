@@ -3,7 +3,7 @@
 Wires together the bot polling task, the global :class:`SessionManager`,
 and the Telegram broadcast loop that fans Claude session events out to all
 paired users with a known ``last_chat_id``. Uvicorn / web server lands in
-CCR-012 and will join the same ``asyncio.gather``.
+CCR-012 and will join the same ``asyncio.wait``.
 """
 
 from __future__ import annotations
