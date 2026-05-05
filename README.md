@@ -6,25 +6,49 @@ Self-hosted Telegram bot that turns your phone into a remote control for a local
 
 Pre-release. The architecture and phased build plan live in [`claude-code-remote-plan.md`](claude-code-remote-plan.md). The active ticket queue is in [`BACKLOG.md`](BACKLOG.md); finished and closed tickets archive to [`DONE.md`](DONE.md).
 
-## Run locally in 60 seconds
+The chat-bot loop is functional today: pairing, session lifecycle (`/new`, `/stop`, `/clear`, `/continue`), structured event broadcast, MCP-driven inline permission prompts, AskUserQuestion replies, slash-command passthrough, and `/cost` / `/usage` summaries. The web viewer, the localhost preview proxy, and the `/view` / `/last` / `/preview` URL-minting commands are scoped in CCR-012 – CCR-015 and not yet implemented.
 
-> The polished walkthrough lands in CCR-017 (Phase 14). Until then, the canonical bootstrap sequence is:
->
-> ```bash
-> git clone --recurse-submodules <repo-url> claude-code-remote
-> cd claude-code-remote
-> ./install.sh
-> # edit .env: set TELEGRAM_BOT_TOKEN and PUBLIC_URL
-> python -m ccr serve
-> # in Telegram, send /start to your bot, then approve via:
-> python -m ccr pair approve <code>
-> ```
+## Bot commands
 
-This section will be rewritten end-to-end once the bootstrap and viewer phases ship.
+Only paired users can run any of these except `/start`. Plain text (no leading `/`) is forwarded to the active session as a user turn, or starts a fresh session if none is running.
 
-## Try it now (current state through CCR-006)
+### Session control
 
-The bot can talk over Telegram, gate non-paired users, and bootstrap the first owner via the console. Session execution, the web viewer, the proxy, and `/view` / `/last` / `/preview` URLs all land in later tickets.
+| Command | Effect |
+| --- | --- |
+| `/new` | Start a fresh Claude session (no initial prompt). |
+| `/stop` | Stop the active session. Idempotent on idle. |
+| `/continue [<id8>]` | Resume the most recent finished session, or the one whose id starts with the 8-hex prefix. |
+| `/clear` | Stop the active session, post a "new session" divider, then start a fresh one. |
+| `/pid` | Show the active session's id, OS pid, and uptime. |
+| `/sessions` | List the most recent 20 sessions (newest first). |
+| `/answer <id8> <text>` | Reply to a free-text `AskUserQuestion` by 8-hex prefix. Inline-button questions are answered by tapping. |
+
+### Pairing
+
+| Command | Effect |
+| --- | --- |
+| `/start` | First sender bootstraps as owner; later senders request access (owner gets a DM with the approval command). |
+| `/who` | Pairing status — owners see the full table; friends see the count plus the owner handle. |
+
+### Telemetry & introspection
+
+| Command | Effect |
+| --- | --- |
+| `/cost` | Per-session usage summary computed locally from the JSONL log (turns, tokens, tool calls, elapsed, cost). |
+| `/usage` | Most recent rate-limit snapshot (window, status, reset time, overage state). |
+| `/agents` | Subagents the active session has spawned, plus the agent library under `.claude/agents/`. |
+| `/skills` | Skills reported by the active session's `system/init` event. |
+
+### Passthrough to Claude
+
+`/model` and `/compact` are forwarded to Claude as a user turn — Claude Code interprets the leading slash exactly as if you typed it in its TTY.
+
+`/mcp` and `/init` are blocked: those are interactive-only commands and the bot will tell you to run them in your local terminal.
+
+Anything else not in this list returns the canonical usage hint. `/view`, `/last`, and `/preview` appear in that hint but are not yet implemented (CCR-014).
+
+## Setup
 
 ### Prerequisites
 
@@ -75,8 +99,6 @@ It prints `Approved Telegram user <id> (owner)`. Send `/start` again — the bot
 Paired. Send a prompt to start, or /new for a fresh session.
 ```
 
-`/new` and prompt forwarding don't do anything yet (they land in CCR-008).
-
 ### 4. Verify the allowlist
 
 From a different (unpaired) Telegram account, send any plain text to the bot. Expected reply:
@@ -125,7 +147,3 @@ uv run ruff format --check src tests
 uv run mypy src
 uv run pre-commit run --all-files
 ```
-
-## License
-
-TBD — to be confirmed by the project owner before the first tagged release.
