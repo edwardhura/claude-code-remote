@@ -177,6 +177,15 @@ def test_help_lists_all_commands(
         assert fragment in out
 
 
+def test_help_lists_session_save(
+    settings: Settings,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    asyncio.run(run(settings, once="help"))
+    out = capsys.readouterr().out
+    assert "session save <claude_session_id>" in out
+
+
 # --------------------------------------------------------------------------- #
 # `pair approve`.
 # --------------------------------------------------------------------------- #
@@ -389,6 +398,52 @@ def test_completer_includes_pending_codes_and_paired_ids(settings: Settings) -> 
     assert "approve" in words
     assert "PEND0001" in words
     assert "42" in words
+
+
+def test_session_save_completer_includes_session_save(settings: Settings) -> None:
+    completer = asyncio.run(build_completer(settings))
+    words = list(completer.words)
+    assert "session" in words
+    assert "save" in words
+
+
+def test_session_save_missing_arg(
+    settings: Settings,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    asyncio.run(run(settings, once="session save"))
+    out = capsys.readouterr().out
+    assert "Usage: session save <claude_session_id>" in out
+
+
+def test_session_save_via_repl_imports_row(
+    settings: Settings,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_paired_user(settings, tg_user_id=42, is_owner=True)
+
+    projects_root = tmp_path / "claude_projects"
+    project_dir = projects_root / "-tmp-fake-cwd"
+    project_dir.mkdir(parents=True)
+    cs_id = "11111111-1111-4111-8111-111111111111"
+    jsonl = project_dir / f"{cs_id}.jsonl"
+    jsonl.write_text(
+        '{"type":"file-history-snapshot","snapshot":{"timestamp":"2026-04-01T10:00:00Z"}}\n'
+        '{"type":"user","timestamp":"2026-04-01T11:00:00Z",'
+        '"message":{"role":"user","content":"hi"}}\n',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "ccr.claude.import_session._DEFAULT_PROJECTS_ROOT",
+        projects_root,
+    )
+
+    asyncio.run(run(settings, once=f"session save {cs_id}"))
+    out = capsys.readouterr().out
+    assert f"Imported Claude session {cs_id}" in out
 
 
 def test_completer_excludes_revoked_users(settings: Settings) -> None:

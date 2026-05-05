@@ -213,6 +213,45 @@ async def _async_pair_revoke(tg_user_id: int) -> int:
     return exit_code
 
 
+async def _async_session_save(claude_session_id: str) -> int:
+    from ccr.claude.import_session import (  # noqa: PLC0415
+        ClaudeSessionFileNotFoundError,
+        DuplicateClaudeSessionError,
+        ImportSessionError,
+        NoOwnerError,
+        import_claude_session,
+    )
+
+    exit_code = 0
+
+    async def _run(session: AsyncSession) -> None:
+        nonlocal exit_code
+        try:
+            row = await import_claude_session(session, claude_session_id)
+        except ClaudeSessionFileNotFoundError as exc:
+            sys.stderr.write(f"{exc}\n")
+            exit_code = 1
+            return
+        except DuplicateClaudeSessionError as exc:
+            sys.stderr.write(f"Already imported: {exc}\n")
+            exit_code = 1
+            return
+        except NoOwnerError:
+            sys.stderr.write("No owner registered. Pair the owner first.\n")
+            exit_code = 1
+            return
+        except ImportSessionError as exc:
+            sys.stderr.write(f"{exc}\n")
+            exit_code = 1
+            return
+        sys.stdout.write(
+            f"Imported Claude session {claude_session_id} as {row.id.hex[:8]}\n",
+        )
+
+    await _with_session(_run)
+    return exit_code
+
+
 async def _async_pair_invite(tg_user_id: int, label: str | None) -> int:
     from ccr.auth.pairing import PairingError, invite  # noqa: PLC0415
 
@@ -278,6 +317,27 @@ def _cmd_pair_invite(args: argparse.Namespace) -> None:
         raise SystemExit(rc)
 
 
+def _cmd_session_save(args: argparse.Namespace) -> None:
+    claude_session_id: str = args.claude_session_id
+    rc = asyncio.run(_async_session_save(claude_session_id))
+    if rc != 0:
+        raise SystemExit(rc)
+
+
+def _add_session_subcommands(
+    session_subparsers: _SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    save_parser = session_subparsers.add_parser(
+        "save",
+        help="Import an existing local Claude session.",
+    )
+    save_parser.add_argument(
+        "claude_session_id",
+        help="Claude session id (UUID Claude reports in its system.init event).",
+    )
+    save_parser.set_defaults(func=_cmd_session_save)
+
+
 def _add_pair_subcommands(pair_subparsers: _SubParsersAction[argparse.ArgumentParser]) -> None:
     list_parser = pair_subparsers.add_parser("list", help="List paired Telegram users.")
     list_parser.set_defaults(func=_cmd_pair_list)
@@ -335,7 +395,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(
         dest="command",
-        metavar="{serve,console,pair,doctor,init-db}",
+        metavar="{serve,console,pair,session,doctor,init-db}",
         required=True,
     )
 
@@ -358,6 +418,14 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     _add_pair_subcommands(pair_subparsers)
+
+    session_parser = subparsers.add_parser("session", help="Manage stored sessions.")
+    session_subparsers = session_parser.add_subparsers(
+        dest="session_command",
+        metavar="{save}",
+        required=True,
+    )
+    _add_session_subcommands(session_subparsers)
 
     doctor_parser = subparsers.add_parser("doctor", help="Run preflight diagnostics.")
     doctor_parser.set_defaults(func=_stub("doctor"))

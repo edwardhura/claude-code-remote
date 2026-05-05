@@ -401,6 +401,7 @@ async def _seed_finished_session(
     session_id: object,
     started_at: object,
     status: str = "completed",
+    claude_session_id: str | None = None,
 ) -> None:
     """Insert a finished :class:`Session` row directly for continue-session tests."""
     import uuid as _uuid_mod
@@ -416,6 +417,7 @@ async def _seed_finished_session(
                 status=status,
                 started_by_tg_user_id=None,
                 first_prompt=None,
+                claude_session_id=claude_session_id,
             ),
         )
         await db.commit()
@@ -427,7 +429,7 @@ async def test_continue_session_passes_resume_flag_to_subprocess(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Outcome 1: ``continue_session`` adds ``--continue`` to the subprocess argv."""
+    """``continue_session`` passes ``--resume <claude_session_id>`` to the subprocess."""
     import uuid as _uuid_mod
     from datetime import UTC as _UTC
     from datetime import datetime as _dt_mod
@@ -437,6 +439,7 @@ async def test_continue_session_passes_resume_flag_to_subprocess(
         session_id=_uuid_mod.UUID("11111111-1111-1111-1111-111111111111"),
         started_at=_dt_mod(2026, 4, 30, 10, 0, 0, tzinfo=_UTC),
         status="completed",
+        claude_session_id="claude-id-001",
     )
 
     events = [
@@ -457,9 +460,9 @@ async def test_continue_session_passes_resume_flag_to_subprocess(
     assert isinstance(new_id, _uuid_mod.UUID)
     assert argv_file.exists()
     argv_lines = argv_file.read_text(encoding="utf-8").splitlines()
-    assert "--continue" in argv_lines
-    # Outcome 1: no --resume flag, no claude session id is plumbed through.
-    assert "--resume" not in argv_lines
+    resume_idx = argv_lines.index("--resume")
+    assert argv_lines[resume_idx + 1] == "claude-id-001"
+    assert "--continue" not in argv_lines
 
 
 async def test_continue_session_with_no_prior_session_raises(
@@ -526,29 +529,23 @@ async def test_continue_session_picks_most_recent_finished(
         session_id=sid_oldest,
         started_at=base,
         status="completed",
+        claude_session_id="claude-oldest",
     )
     await _seed_finished_session(
         session_factory,
         session_id=sid_middle,
         started_at=base + _td(seconds=10),
         status="stopped",
+        claude_session_id="claude-middle",
     )
     await _seed_finished_session(
         session_factory,
         session_id=sid_newest,
         started_at=base + _td(seconds=20),
         status="crashed",
+        claude_session_id="claude-newest",
     )
 
-    bus = EventBus()
-    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
-
-    prior_id = await manager._db_lookup_most_recent_finished()  # noqa: SLF001 — direct internal probe
-    assert prior_id == sid_middle
-
-    # End-to-end sanity: continue_session succeeds (would have raised
-    # NoPriorSessionError if crashed had been mistakenly picked above and
-    # excluded by some other guard).
     events = [
         {"type": "system", "subtype": "init"},
         {"type": "result", "subtype": "success"},
@@ -558,9 +555,18 @@ async def test_continue_session_picks_most_recent_finished(
     argv_file = tmp_path / "argv.txt"
     monkeypatch.setenv("FAKE_CLAUDE_ARGV_FILE", str(argv_file))
 
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
     new_id = await manager.continue_session(started_by_tg_user_id=42)
     assert new_id not in {sid_oldest, sid_middle, sid_newest}
     await _drain_status(bus, SessionStatus.COMPLETED, timeout=5.0)
+
+    # The middle (stopped) row's claude_session_id was the resume target —
+    # not the newest (crashed) row's.
+    argv_lines = argv_file.read_text(encoding="utf-8").splitlines()
+    resume_idx = argv_lines.index("--resume")
+    assert argv_lines[resume_idx + 1] == "claude-middle"
 
 
 async def test_continue_session_inserts_new_row_with_running_status(
@@ -580,6 +586,7 @@ async def test_continue_session_inserts_new_row_with_running_status(
         session_id=prior_id,
         started_at=_dt_mod(2026, 4, 30, 11, 0, 0, tzinfo=_UTC),
         status="completed",
+        claude_session_id="claude-prior",
     )
 
     # Slow the producer so we can observe RUNNING before the script
@@ -639,12 +646,14 @@ async def test_continue_session_with_prefix_resumes_matched_row(
         session_id=older_id,
         started_at=base,
         status="completed",
+        claude_session_id="claude-older",
     )
     await _seed_finished_session(
         session_factory,
         session_id=newer_id,
         started_at=base + _td(seconds=30),
         status="completed",
+        claude_session_id="claude-newer",
     )
 
     events = [
@@ -666,15 +675,13 @@ async def test_continue_session_with_prefix_resumes_matched_row(
     assert new_id not in {older_id, newer_id}
     await _drain_status(bus, SessionStatus.COMPLETED, timeout=5.0)
 
-    # The fresh row references the older row's lineage in the sense that
-    # --continue was passed; verify the subprocess argv contains it.
+    # The older row's ``claude_session_id`` is the resume target — not the
+    # newer row's — because the prefix matched the older row.
     assert argv_file.exists()
     argv_lines = argv_file.read_text(encoding="utf-8").splitlines()
-    assert "--continue" in argv_lines
+    resume_idx = argv_lines.index("--resume")
+    assert argv_lines[resume_idx + 1] == "claude-older"
 
-    # The older row is the one we picked: it must still be present and
-    # untouched (status == completed). The newer row is also untouched —
-    # neither row's ``status`` should have changed because we only read.
     async with session_factory() as db:
         older_row = await db.scalar(select(Session).where(Session.id == older_id))
         newer_row = await db.scalar(select(Session).where(Session.id == newer_id))
@@ -682,11 +689,6 @@ async def test_continue_session_with_prefix_resumes_matched_row(
     assert older_row.status == "completed"
     assert newer_row is not None
     assert newer_row.status == "completed"
-
-    # And the helper itself returns the older id when called directly with
-    # the prefix — the canonical assertion that the older row was selected.
-    prior_id = await manager._db_lookup_session_by_prefix("76581b99")  # noqa: SLF001
-    assert prior_id == older_id
 
 
 async def test_continue_session_with_unknown_prefix_raises_not_found(
@@ -744,16 +746,132 @@ async def test_continue_session_lookup_by_prefix_excludes_crashed(
     assert str(ei.value) == "No session found with id deadbeef."
 
 
-async def test_db_lookup_session_by_prefix_returns_none_for_no_match(
+async def test_system_init_persists_claude_session_id(
     settings: Settings,
     session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Direct helper call on an empty DB returns ``None``."""
+    """``SystemInit`` fires a fire-and-forget update of ``Session.claude_session_id``."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "abc-123"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script)
+
     bus = EventBus()
     manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
 
-    prior_id = await manager._db_lookup_session_by_prefix("12345678")  # noqa: SLF001
-    assert prior_id is None
+    session_id = await manager.new_session(prompt=None, started_by_tg_user_id=42)
+    await _drain_status(bus, SessionStatus.COMPLETED, timeout=5.0)
+
+    # The fire-and-forget DB write may run after the COMPLETED status
+    # broadcast — give it a tick. The teardown drains the pending task.
+    await manager.shutdown()
+
+    async with session_factory() as db:
+        row = await db.scalar(select(Session).where(Session.id == session_id))
+    assert row is not None
+    assert row.claude_session_id == "abc-123"
+
+
+async def test_continue_session_uses_claude_session_id_resume(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row with ``claude_session_id`` is resumed via ``claude --resume <id>``."""
+    import uuid as _uuid_mod
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt_mod
+
+    await _seed_finished_session(
+        session_factory,
+        session_id=_uuid_mod.UUID("22222222-2222-2222-2222-222222222222"),
+        started_at=_dt_mod(2026, 4, 30, 12, 0, 0, tzinfo=_UTC),
+        status="completed",
+        claude_session_id="abc-123",
+    )
+
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "abc-123"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script)
+    argv_file = tmp_path / "argv.txt"
+    monkeypatch.setenv("FAKE_CLAUDE_ARGV_FILE", str(argv_file))
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    await manager.continue_session(started_by_tg_user_id=42)
+    await _drain_status(bus, SessionStatus.COMPLETED, timeout=5.0)
+
+    argv_lines = argv_file.read_text(encoding="utf-8").splitlines()
+    resume_idx = argv_lines.index("--resume")
+    assert argv_lines[resume_idx + 1] == "abc-123"
+
+
+async def test_continue_session_skips_rows_with_null_claude_session_id(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """No-prefix path raises ``NoPriorSessionError`` when ``claude_session_id IS NULL``."""
+    import uuid as _uuid_mod
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt_mod
+
+    await _seed_finished_session(
+        session_factory,
+        session_id=_uuid_mod.UUID("33333333-3333-3333-3333-333333333333"),
+        started_at=_dt_mod(2026, 4, 30, 13, 0, 0, tzinfo=_UTC),
+        status="completed",
+        claude_session_id=None,
+    )
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    with pytest.raises(NoPriorSessionError) as ei:
+        await manager.continue_session(started_by_tg_user_id=42)
+    assert str(ei.value) == "No prior session to continue."
+
+
+async def test_continue_session_by_prefix_against_null_row_raises_no_prior(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Prefix matches a row with ``claude_session_id IS NULL`` -> ``NoPriorSessionError``.
+
+    Critically NOT ``SessionNotFoundError``: the row exists, just isn't
+    resumable. ``SessionNotFoundError``'s "look harder" canned reply would
+    be misleading.
+    """
+    import uuid as _uuid_mod
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt_mod
+
+    row_id = _uuid_mod.UUID("44444444-4444-4444-4444-444444444444")
+    await _seed_finished_session(
+        session_factory,
+        session_id=row_id,
+        started_at=_dt_mod(2026, 4, 30, 14, 0, 0, tzinfo=_UTC),
+        status="completed",
+        claude_session_id=None,
+    )
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    with pytest.raises(NoPriorSessionError) as ei:
+        await manager.continue_session(
+            started_by_tg_user_id=42,
+            session_id_prefix=row_id.hex[:8],
+        )
+    assert str(ei.value) == "No prior session to continue."
 
 
 # --------------------------------------------------------------------------- #

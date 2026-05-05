@@ -1054,4 +1054,68 @@ Notes:
   - 2026-05-05 main: branch ccr-035-format-user-datetime created, dispatching team-lead (Mode 1A)
   - 2026-05-05 team-lead: scope brief issued (no architect), dispatching python-developer
   - 2026-05-05 team-lead: approved — all 9 acceptance criteria verified passing; 11/11 helper tests, 414/414 full suite, 89.11% coverage, strftime canary clean, agent rule at line 53, ruff+mypy clean; reviewer REVIEW FAIL was a dispatch artefact (BRIEF note present, not quoted in dispatch prompt)
+---
+
+## CCR-036: `claude_session_id` column, resume rework, `session save` CLI, sync skill [done]
+Phase: n/a (post-CCR-020 — restructures resume around Claude's session id)
+Feature: claude-runtime
+Files:
+  - `alembic/versions/000X_add_sessions_claude_session_id.py` (new migration) — add nullable `claude_session_id TEXT` column to `sessions` plus a partial unique index where `claude_session_id IS NOT NULL` (prevents double-import of the same Claude session). Additive. Hand-written.
+  - `src/ccr/db/models.py` — add `claude_session_id: Mapped[str | None]` field on `Session` with the partial unique index declared.
+  - `src/ccr/claude/manager.py` — when consuming Claude's `system.init` event (visible at `src/ccr/claude/events.py:87,181`), extract its `session_id` and persist to `sessions.claude_session_id` for the current row. Drop the existing "find latest finished row by our UUID" path in `continue_session` / `_db_lookup_most_recent_finished` and replace with a lookup by `claude_session_id`. `claude --resume <claude_session_id>` is the only resume path; rows with `claude_session_id IS NULL` are not resumable (raise `NoPriorSessionError` or a more specific `NotResumableError` — developer's call).
+  - `src/ccr/claude/process.py` — `resume` argv handling: when `resume` is a string, pass it as `--resume <claude_session_id>` rather than the bare `--continue` flag used today.
+  - `src/ccr/cli.py` — new subcommand group `session` with first member `session save <claude_session_id>`. Argparse dispatch under the existing `python -m ccr` entrypoint, mirroring the existing `pair` subcommand-group pattern (see `_add_pair_subcommands` and the `_cmd_pair_*` family at `src/ccr/cli.py:281-323`). Room for `session list`, `session rename` later (do not implement now unless trivially natural).
+  - `src/ccr/console/app.py` — register `session save` in the interactive REPL the same way `pair` is registered today: add an entry to the `COMMANDS` dispatch dict (currently at `src/ccr/console/app.py:243-253`), extend `_STATIC_COMMAND_WORDS` (at `src/ccr/console/app.py:45-56`) with `session` and `save`, extend `_match_command`'s prefix-length sweep (currently `(2, 1)` at line 267) to also try a 2-token `session save` prefix, add a corresponding REPL handler (`_cmd_session_save`) following the `_cmd_pair_approve` shape, and extend the `help` output (`_cmd_help` at line 217) with a `session save <claude_session_id>` line.
+  - `src/ccr/console/` (or wherever the import logic best lives) — both the one-shot CLI handler (`src/ccr/cli.py`) and the REPL handler (`src/ccr/console/app.py`) call into a shared async function (analogue of `ccr.auth.pairing.approve`) that reads Claude's local session file at `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` and auto-fills:
+    - `claude_session_id` ← argv.
+    - `started_at` ← first event timestamp.
+    - First user prompt → seeds `name` (per CCR-037's auto-derive rule; if CCR-037 has not landed yet, write to a placeholder field or postpone the auto-fill — developer's call coordinated with CCR-037).
+    - `status` = `stopped`.
+    - `started_by_tg_user_id` = the `tg_user_id` from the row in `paired_users` with `is_owner = true`.
+    Do NOT copy the JSONL into `data/logs/` — Claude owns its history; our JSONL is only created when a continuation streams.
+  - `templates/ccr/skills/sync-claude-session-with-remote/SKILL.md` (new) — thin wrapper skill: detects the user's most recent local Claude session (or accepts an explicit id arg), calls `python -m ccr session save <id>`, surfaces the resulting row prefix and a reminder to `/sessions` from the bot. Lives under `templates/ccr/` (the CCR-specific subfolder of `templates/`); `templates/` is the boilerplate downstream projects copy into their own `.claude/`. **Do NOT place this under `.claude/skills/` — that path was wrong in the original draft.**
+  - `tests/test_session_save_cli.py` (new) — end-to-end for both entrypoints: a hand-crafted Claude JSONL at a tmp path; (a) `python -m ccr session save <id>` populates a row with the correct fields; (b) `python -m ccr console --once "session save <id>"` populates a row with the same fields against the same DB; double-import of the same `claude_session_id` (whether via CLI or console) is rejected by the partial unique index (IntegrityError or a clean handler error).
+  - `tests/test_console.py` — extend with `session save` REPL coverage (parity with the existing `pair approve` console tests): unknown-arg usage hint, success path, duplicate-id handling.
+  - `tests/test_session_manager.py` — extend with `claude_session_id` extraction on `system.init` and the new resume-by-claude-id path; remove or update the prior "resume by our UUID prefix" tests as the path is dropped.
+  - `tests/test_claude_process.py` — argv test: `resume="abc-123"` produces `--resume abc-123`.
+Out of scope:
+  - `session list` / `session rename` — leave the CLI group open for them but do not implement now.
+  - Copying Claude's JSONL into `data/logs/` on import — explicitly NOT done; Claude owns its history.
+  - Web-viewer surfaces of `claude_session_id` — the column is server-side; viewer-side display is a follow-up if needed.
+  - Migrating existing `sessions` rows to backfill `claude_session_id` from old logs — operational wipe of throwaway test rows is acceptable per the user's note; the migration itself stays additive.
+  - The standardised `/sessions` listing format that uses `claude_session_id` — that's CCR-037.
+Acceptance:
+  - [x] Alembic migration adds nullable `claude_session_id` column + partial unique index where the value is non-null; `alembic downgrade base && alembic upgrade head` round-trips clean.
+  - [x] On a session started by CCR, `sessions.claude_session_id` is populated from the `system.init` event before the row is written / on the first event consumption (verified by a session-manager test driving fake-claude through a `system.init` line).
+  - [x] Two attempts to insert a `Session` row with the same non-null `claude_session_id` raise `IntegrityError` (partial unique index test).
+  - [x] `python -m ccr session save <claude_session_id>` reads `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`, creates a row with `claude_session_id` set, `started_at` from the first event, `status="stopped"`, `started_by_tg_user_id` = the owner's `tg_user_id`, and (per CCR-037 auto-derive rule) seeds `name` from the first user prompt.
+  - [x] `python -m ccr session save <claude_session_id>` does NOT copy the JSONL into `data/logs/`.
+  - [x] `session save <id>` is invokable both as a one-shot CLI subcommand (`python -m ccr session save <id>`) and as a command inside the interactive console (`python -m ccr console`, then `session save <id>` at the prompt), in parity with the existing `pair` subcommands. Both entrypoints call the same underlying import function and produce the same DB row.
+  - [x] Inside the REPL, `session save` with no argument prints a usage hint (e.g. `Usage: session save <claude_session_id>`) without raising — matches the `pair approve` no-arg behaviour at `src/ccr/console/app.py:122-124`.
+  - [x] The console `help` output lists `session save <claude_session_id>`; `_STATIC_COMMAND_WORDS` includes `session` and `save` so tab-completion offers them.
+  - [x] `/continue` resumes via `claude --resume <claude_session_id>` (verified by a `ClaudeProcess` argv test).
+  - [x] A `Session` row with `claude_session_id IS NULL` is not resumable; `/continue` against it returns a clear error.
+  - [x] `templates/ccr/skills/sync-claude-session-with-remote/SKILL.md` exists and documents the wrapper flow (detect most-recent Claude session OR accept explicit id; invoke `python -m ccr session save`; surface result + `/sessions` hint). The file lives under `templates/ccr/`, NOT under `.claude/skills/`.
+  - [x] `pytest tests/test_session_save_cli.py tests/test_session_manager.py tests/test_claude_process.py tests/test_console.py` passes.
+  - [x] `pytest --cov=ccr --cov-fail-under=80` passes.
+Depends on: CCR-020
+Notes:
+  Phase n/a — post-CCR-020 restructure of resume semantics. The current `SessionManager.resume()` reuses our row's most recent finished session, but the JSONL Claude actually replays is its own (`~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`). This couples resume to our row id (fragile) and disallows continuing sessions started outside the bot.
+
+  **Architect candidate for team-lead Mode 1A.** Surface spans `src/ccr/claude/{manager,process,events}.py`, `src/ccr/cli.py`, `src/ccr/console/app.py`, a new console import path, a new migration, a new skill, and reworks an existing subsystem (resume). The architect should pick:
+    - Where the import logic lives (a new `src/ccr/console/import_session.py`, a method on `SessionManager`, or a free function under `src/ccr/claude/`). The shared function must be callable from BOTH `src/ccr/cli.py` (one-shot) AND `src/ccr/console/app.py` (REPL) — same dual-entrypoint pattern that `ccr.auth.pairing.approve` already serves today.
+    - Whether `claude_session_id` is captured on `system.init` and persisted there, or batched with the next DB write.
+    - How `session save` discovers Claude's local session-file directory (probably `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` per the user's spec — but the encoded-cwd format needs probing).
+    - Whether the auto-derived `name` seed in `session save` integrates with CCR-037 directly (CCR-037 owns the auto-derive rule) or stages a placeholder until CCR-037 lands. PM recommends sequencing this ticket BEFORE CCR-037 so the column exists; coordinate auto-derive scope at team-lead Mode 1A.
+  Existing `sessions` rows are throwaway test data — fine to drop / wipe operationally. The migration itself remains additive (the wipe is operational).
+  Why CCR-037 depends on this and not vice-versa: CCR-037 renders `claude_session_id` in the `/sessions` list. Without this column, CCR-037's listing format cannot be implemented as specified.
+  **Dual-entrypoint reference.** The `pair` subcommand family is the worked example to mirror: one-shot at `src/ccr/cli.py:281-323` (`_add_pair_subcommands` + `_cmd_pair_*`), REPL at `src/ccr/console/app.py:121-183, 243-273` (`_cmd_pair_*` handlers + `COMMANDS` dict + `_match_command` 2-token prefix sweep). Both layers call the same pure async functions in `ccr.auth.pairing`. `session save` follows the same shape: shared import function + thin CLI wrapper + thin REPL wrapper.
+  **`templates/` submodule status — risk to flag.** Per `CLAUDE.md` "Conventions", `templates/` is intended to be a git submodule pointing at `dev-stack-agents`, but the `.gitmodules` wiring is owned by CCR-017 (Phase 14, not yet landed). At ticket-pickup time the developer must verify whether `templates/` is currently a real submodule or a regular directory. If submodule, writing to `templates/ccr/skills/sync-claude-session-with-remote/SKILL.md` requires committing inside the submodule and bumping the parent-repo pointer — that may exceed this ticket's scope and should be flagged back to the team-lead rather than silently absorbed. If `templates/` is still a regular directory (likely current state — `.gitmodules` does not yet exist in the repo root), the file lands as a plain in-tree commit and there is no submodule coordination needed. Either way: **do not place the skill under `.claude/skills/`** — that was the original draft's mistake.
+
+### Review log
+  - 2026-05-05 main: branch ccr-036-claude-session-id-resume created, dispatching team-lead
+  - 2026-05-05 team-lead: dispatching architect — spans >3 files, new dual-entrypoint import abstraction, reworks existing resume subsystem, multiple open design calls (import-logic placement, claude_session_id capture timing, encoded-cwd discovery, CCR-037 name-seed integration)
+  - 2026-05-05 team-lead: plan reviewed (plans/CCR-036-claude-session-id-resume.md), dispatching python-developer
+  - 2026-05-05 team-lead: rejected — F3 path traversal (import_session.py:116, unvalidated user-supplied claude_session_id interpolated into filesystem path) is a real security finding; F2 stale docstring (manager.py:721) also needs fix; F1 (missing BRIEF note) was procedural — note was present in dev report but not relayed to reviewer
+  - 2026-05-06 team-lead: approved
   - 2026-05-05 main: format respec by user pre-publish — `full` → `HH:MM - DD/MM/YYYY`; `short` → `HH:MM - D Mon` (locale-independent English month abbr., no leading zero on day); `time` unchanged. Helper, tests (now 13 in test_utils_datetime.py), bot regression tests, BRIEF, CONTEXT, and the spec/acceptance lines in this ticket all updated to match.

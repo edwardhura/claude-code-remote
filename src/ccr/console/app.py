@@ -49,6 +49,8 @@ _STATIC_COMMAND_WORDS: tuple[str, ...] = (
     "approve",
     "revoke",
     "invite",
+    "session",
+    "save",
     "status",
     "help",
     "exit",
@@ -183,6 +185,40 @@ async def _cmd_pair_invite(args: list[str], settings: Settings) -> None:
     await _with_session(settings, _run)
 
 
+async def _cmd_session_save(args: list[str], settings: Settings) -> None:
+    if not args:
+        _emit("Usage: session save <claude_session_id>")
+        return
+    claude_session_id = args[0]
+
+    async def _run(session: AsyncSession) -> None:
+        from ccr.claude.import_session import (  # noqa: PLC0415
+            ClaudeSessionFileNotFoundError,
+            DuplicateClaudeSessionError,
+            ImportSessionError,
+            NoOwnerError,
+            import_claude_session,
+        )
+
+        try:
+            row = await import_claude_session(session, claude_session_id)
+        except ClaudeSessionFileNotFoundError as exc:
+            _emit(str(exc))
+            return
+        except DuplicateClaudeSessionError as exc:
+            _emit(f"Already imported: {exc}")
+            return
+        except NoOwnerError:
+            _emit("No owner registered. Pair the owner first.")
+            return
+        except ImportSessionError as exc:
+            _emit(str(exc))
+            return
+        _emit(f"Imported Claude session {claude_session_id} as {row.id.hex[:8]}")
+
+    await _with_session(settings, _run)
+
+
 async def _cmd_status(_args: list[str], settings: Settings) -> None:
     db_path = settings.data_dir / "ccr.db"
     paired_count = 0
@@ -223,6 +259,8 @@ async def _cmd_help(_args: list[str], _settings: Settings) -> None:
         "  pair revoke <tg_user_id>  Revoke a paired Telegram user.",
         "  pair invite <tg_user_id> [label]",
         "                            Pre-approve a Telegram user (owner-only).",
+        "  session save <claude_session_id>",
+        "                            Import an existing local Claude session.",
         "  status                    Show DB stats and ping the web server.",
         "  help                      Show this help message.",
         "  exit | quit               Leave the console.",
@@ -246,6 +284,7 @@ COMMANDS: dict[str, CommandHandler] = {
     "pair approve": _cmd_pair_approve,
     "pair revoke": _cmd_pair_revoke,
     "pair invite": _cmd_pair_invite,
+    "session save": _cmd_session_save,
     "status": _cmd_status,
     "help": _cmd_help,
     "exit": _cmd_exit,

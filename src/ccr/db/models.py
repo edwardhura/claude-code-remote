@@ -112,10 +112,17 @@ class Session(Base):
     first_prompt: Mapped[str | None] = mapped_column(String(500), nullable=True)
     exit_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claude_session_id: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         Index("ix_sessions_status", "status"),
         Index("ix_sessions_started_at_desc", started_at.desc()),
+        Index(
+            "ix_sessions_claude_session_id_not_null",
+            "claude_session_id",
+            unique=True,
+            sqlite_where=claude_session_id.is_not(None),
+        ),
     )
 
 

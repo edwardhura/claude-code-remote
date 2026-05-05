@@ -9,6 +9,12 @@ The subprocess + event infrastructure that every higher-level feature depends on
 - **JSONL `seq` is derived from line count**, not stored in SQL. The Nth line in `data/logs/<session_id>.jsonl` has `seq = N`.
 - **Drift tolerance via `UnknownEvent`.** `ClaudeEvent` is a *plain* `Union[_KnownEvent, UnknownEvent]` — `_KnownEvent` is the discriminated union; `UnknownEvent` catches schema drift. `parse_event()` has a double fallback so unknown variants never raise.
 - **`McpPermissionRequest` is a synthetic bus envelope, NOT a `ClaudeEvent` member.** The MCP permission server publishes it on the bus; it does not live in the JSONL stream.
+- **`claude_session_id` is captured from the first `SystemInit` event and persisted exactly once per session lifetime.** `_claude_session_id_persisted` flag is the single-shot guard. Persistence is fire-and-forget via `asyncio.create_task`; task ref held in `_claude_session_id_pending` for teardown drain. The write happens AFTER `log.append` and `bus.publish` for `SystemInit`.
+- **Resume goes through `claude --resume <claude_session_id>`.** A row with `claude_session_id IS NULL` is NOT resumable; both `_db_lookup_resumable_claude_session_id` and the no-prefix path raise `NoPriorSessionError`.
+- **The partial unique index `ix_sessions_claude_session_id_not_null` is the authoritative guard against double-imports.**
+- **Imported rows are inserted with `status="stopped"` (not `completed`)** — the foreign session cannot be proven to have reached a successful `result` event.
+- **Imported rows do NOT write `first_prompt` or `name`** — those are session-side concerns; CCR-037 owns `name`.
+- **`claude_session_id` arguments are validated against a strict UUID4 regex inside `find_claude_session_file` BEFORE any filesystem path is constructed**; non-UUID4 input raises `ImportSessionError("Invalid Claude session id format")`.
 - **Subprocess shutdown is SIGTERM → grace timeout → SIGKILL**, both `start()` and `stop()` are idempotent. Stderr is captured into an 8192-byte ring buffer.
 - **Synthetic crash event.** If the subprocess exits abnormally, `SessionManager` synthesises a crash event onto the bus (and into the JSONL) before transitioning the `Session` row to `CRASHED`.
 - **MCP socket is owner-only.** The Unix socket the relay subprocess connects to is `chmod 0o700` immediately after creation.
@@ -30,6 +36,7 @@ The subprocess + event infrastructure that every higher-level feature depends on
 
 ### Subprocess (`src/ccr/claude/process.py`)
 - `ClaudeProcess` — manages the `claude` child. `start(*, resume: bool | str = False, mcp_argv: Sequence[str] | None = None)`, idempotent `stop()`, line-buffered async generator over stdout, stderr ring buffer (8192 bytes), `send_user_turn(text)`, public read-only `pid` property. argv builder reads `permission_mode` / `allowed_tools` / `disallowed_tools` from Settings.
+- `ClaudeProcess(resume=<str>)` — non-empty string emits `--resume <str>`; `resume=True` still emits `--continue`.
 
 ### JSONL log (`src/ccr/claude/log.py`)
 - `JsonlSessionLog` — `append(event)`, `read_from(seq)`, `tail()` (`asyncio.Event`-notified). Module-level `prune()` for retention-count and age-based cleanup. Parent dir auto-created on first write.
@@ -43,9 +50,19 @@ The subprocess + event infrastructure that every higher-level feature depends on
 
 ### Session manager (`src/ccr/claude/manager.py`)
 - `SessionManager` — single asyncio lock, lifecycle FSM, log-before-publish ordering, synthetic crash event. Exposes `new_session(...)`, `continue_session(*, started_by_tg_user_id, session_id_prefix=None)`, `stop()`, `send_user_turn`, `send_tool_result(tool_use_id, content, *, is_error=False)`, `send_slash`, `info()` snapshot (`{session_id, pid, started_at, status}`), `running_subagents()`, `available_skills()`, `is_session_active()`, `current_session_usage()`, `current_rate_limit_status()`, `resolve_permission()`, `is_permission_pending()`, `shutdown()`.
+- `SessionManager._db_lookup_resumable_claude_session_id(*, session_id_prefix=None) -> str | None` — replaces `_db_lookup_most_recent_finished` and `_db_lookup_session_by_prefix`. Returns the `claude_session_id` to pass to `claude --resume <id>`. With prefix: raises `SessionNotFoundError` if no row matches; raises `NoPriorSessionError` if the matched row's `claude_session_id IS NULL`.
 - AskUserQuestion bookkeeping: `_PendingQuestion` dataclass (with `mcp_request_id: str | None`), `_pending_questions: dict[str, _PendingQuestion]`, timeout tasks per pending question, `_unpaired_mcp_auq_calls: deque[str]` for MCP-first race ordering, `_on_mcp_ask_user_question` handler.
 - Errors: `SessionError`, `NoActiveSessionError`, `SessionAlreadyRunningError`, `NoPriorSessionError`, `SessionNotFoundError` (the dead `StaleSessionError` / `StaleToolUseError` were removed in CCR-033).
 - `SessionStatus(StrEnum)` (`src/ccr/claude/state.py`): `IDLE`, `RUNNING`, `COMPLETED`, `STOPPED`, `CRASHED`.
+
+### DB model extension (`src/ccr/db/models.py`)
+- `Session.claude_session_id: str | None` — Claude's own `session_id` (UUID-shaped string Claude reports in its `system.init` event). Partial unique index `ix_sessions_claude_session_id_not_null` on non-NULL values.
+
+### Import session (`src/ccr/claude/import_session.py`)
+- `import_claude_session(db, claude_session_id, *, projects_root=None) -> Session` — reads Claude's local session file and inserts a `Session` row with `status="stopped"`, `started_at` from the first event timestamp, and `started_by_tg_user_id` from the owner row. Does NOT copy JSONL into `data/logs/`.
+- `find_claude_session_file(claude_session_id, *, projects_root=None) -> Path` — scans `<projects_root>/*/` for `<id>.jsonl`; validates input against a strict UUID4 regex before any filesystem path construction.
+- `encoded_cwd_for(path) -> str` — encodes a path for use as a Claude projects directory name.
+- Exceptions: `ImportSessionError`, `ClaudeSessionFileNotFoundError`, `DuplicateClaudeSessionError`, `NoOwnerError`.
 
 ### Usage (`src/ccr/claude/usage.py`)
 - `SessionUsage` frozen dataclass + `aggregate_session_usage(jsonl_path)` walker. Aggregates input/output/cache tokens, tool-use count, success-turn count, total elapsed (with `duration_api_ms` fallback), and total cost USD across every `result` event. Forward-compatible: `UnknownEvent` lines and parse errors fall through silently.
@@ -69,12 +86,15 @@ The subprocess + event infrastructure that every higher-level feature depends on
 - **Settings argv flags have a pinned slot order.** Resume/continue → `permission_mode`/`allowed_tools`/`disallowed_tools` → MCP block → `claude_extra_args` last. Tests in `test_claude_process.py` and `test_config.py` enforce this.
 - **`shutdown()` is the explicit teardown path.** `server.py::serve` calls `manager.shutdown()` in its finally; this cancels pending question timeouts and stops the MCP server. Do not skip it on normal exit.
 - **`/clear` divider is gated on `prior_status != IDLE`** (chat-bot owns the gate, but the read happens before `manager.stop()`). Idle clears stay quiet.
+- **macOS path canonicalisation (`/tmp` → `/private/tmp`) breaks `encoded_cwd_for(os.getcwd())` round-tripping.** `find_claude_session_file` therefore scans every `<projects_root>/*/` for `<id>.jsonl` rather than constructing the path directly.
+- **The first JSONL line in some Claude sessions is `type:"file-history-snapshot"` whose `timestamp` is nested.** The import only honours top-level `timestamp` keys; if none is found, `started_at` falls back to `datetime.now(UTC)` and a `import_session.no_timestamp` warning is logged.
+- **`import_claude_session` does NOT copy Claude's JSONL into `data/logs/`.** Claude owns its history. Our JSONL is only created when a continuation streams.
 
 ## Cross-feature relations
-- depends on: core (Settings, DB models, async engine, logging).
-- used by: chat-bot (every command and the broadcast loop), web-viewer (planned — SSE replay + tail).
+- depends on: core (Settings, DB models, async engine, logging); auth (`ccr.auth.pairing.get_owner` used by `import_claude_session`).
+- used by: chat-bot (every command and the broadcast loop), web-viewer (planned — SSE replay + tail); `ccr.cli session save` and `ccr.console.app session save` call into `ccr.claude.import_session`.
 
 ## Status
 - State: IN PROGRESS
-- Tickets: CCR-007, CCR-018 (cross-listed UX touch), CCR-024, CCR-025, CCR-028 (relay bridge), CCR-028 (AUQ collision), CCR-029, CCR-030 (SystemInit.skills + accessors), CCR-032 (RateLimitEvent + accessor), CCR-033 (cleanup), CCR-036 (planned)
-- Last updated: CCR-033 (2026-05-05)
+- Tickets: CCR-007, CCR-018 (cross-listed UX touch), CCR-024, CCR-025, CCR-028 (relay bridge), CCR-028 (AUQ collision), CCR-029, CCR-030 (SystemInit.skills + accessors), CCR-032 (RateLimitEvent + accessor), CCR-033 (cleanup), CCR-036
+- Last updated: CCR-036 (2026-05-06)
