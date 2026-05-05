@@ -53,6 +53,7 @@ class PairedUser(Base):
     approved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    timezone: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         Index(

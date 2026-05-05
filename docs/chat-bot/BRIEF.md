@@ -14,11 +14,14 @@ The aiogram-based Telegram bot. This is the user's primary control surface: pair
 - `/clear` broadcasts a divider (`"— — — new session — — —"`) to all paired chats *only* when `prior_status != IDLE` — idle clears stay quiet.
 - `/sessions` body is hard-capped at 3500 chars via `chunk_text`; empty DB returns the stable `"(no sessions)"` string.
 - Slash-command passthrough is a tight whitelist (`{"model", "compact"}`); known-blocked interactives (`{"mcp", "init"}`) return a canned local-terminal redirect. Unknown commands return the pinned usage hint.
-- `/cost`, `/usage`, `/agents`, `/skills` are local renders, NOT passthroughs to the upstream `claude` CLI.
+- `/cost`, `/usage`, `/agents`, `/skills`, `/config` are local renders, NOT passthroughs to the upstream `claude` CLI.
+- `cfg:*` callbacks use the calling `tg_user_id` (`cb.from_user.id`) as the DB lookup key — never trust the callback payload for the update target. Callback data carries only an integer index into a server-controlled list.
+- Timezone validation MUST use stdlib `zoneinfo.ZoneInfo(name)` and treat `ZoneInfoNotFoundError` as a user error (no DB write).
+- `paired_users.timezone` is nullable; NULL means UTC at render time. Do not hard-code a server default in the migration or the model.
 
 ## Public surface
 ### Entry point
-- `src/ccr/bot/app.py::build_dispatcher(settings, db_factory, session_manager=None) -> tuple[Bot, Dispatcher]` — registers `AllowlistMiddleware`, stashes `db_factory`, `session_manager`, `settings` in workflow data; includes pairing, session, permission, ask-user-question, and passthrough routers (passthrough must be last).
+- `src/ccr/bot/app.py::build_dispatcher(settings, db_factory, session_manager=None) -> tuple[Bot, Dispatcher]` — registers `AllowlistMiddleware`, stashes `db_factory`, `session_manager`, `settings` in workflow data; includes pairing, session, permission, ask-user-question, config, and passthrough routers (passthrough must be last).
 - `src/ccr/bot/app.py::run_polling` — logs `"Bot started, awaiting updates"` then enters `dp.start_polling(bot)`.
 
 ### Middleware + notification
@@ -32,6 +35,15 @@ The aiogram-based Telegram bot. This is the user's primary control surface: pair
 - `permission.py::cb_permission` — callback `perm:{session_id}:{request_id}:{choice}`; validates choice against `_pending_options` frozenset; rejects forged / stale / concurrent / malformed; edits message with `→ {choice} (by @{username})`.
 - `ask_user_question.py` — three reply paths (button tap callback, `/answer <id8> <text>` command, single-outstanding plain-text feed). `_ID8_RE = ^[0-9a-zA-Z_-]{8}$` (broadened for real-world prefixes like `toulu_…`). Stale / unknown ids rejected with canned message. Validates `tool_use_id`, calls `session_manager.send_tool_result`.
 - `passthrough.py` — three-branch dispatch: `WHITELIST = {"model", "compact"}` forwarded via `manager.send_slash`; `BLOCKED_INTERACTIVE = {"mcp", "init"}` returns canned redirect; unknown commands return usage hint. Dedicated branches for `/agents` (Running + Library), `/skills`, `/cost`, `/usage`.
+- `config.py` — `cfg:*` router; `/config` opens an inline-keyboard menu (Timezone + Close); `/config tz <IANA name>` is the free-text fallback that validates via `zoneinfo.ZoneInfo` and persists to `paired_users.timezone` for the caller.
+- `config.py::cmd_config` — `/config` handler; opens menu, or honours `/config tz <IANA name>` free-text fallback.
+- `config.py::cb_open_tz_picker` — `cfg:tz` callback; renders the curated picker (13 zones).
+- `config.py::cb_pick_tz` — `cfg:tz:<idx>` callback; persists `_CURATED_ZONES[idx]` for the caller.
+- `config.py::cb_close` — `cfg:close` callback; edits to "Menu closed." and drops `reply_markup`.
+
+### DB schema additions (chat-bot)
+- `src/ccr/db/models.py::PairedUser.timezone` — new nullable IANA-zone column; NULL means UTC at render time (consumer is CCR-035).
+- `alembic/versions/0002_add_paired_users_timezone.py` — additive migration; reversible.
 
 ### Keyboards (`src/ccr/bot/keyboards.py`)
 - `permission_kb(session_id, request_id, options) -> InlineKeyboardMarkup` — one button per option using `_LABELS` (`{"allow": "Allow", "deny": "Deny", ...}`); unknown options fall back to `opt.capitalize()`. Callback data: `perm:{session_id}:{request_id}:{choice}`.
@@ -54,7 +66,7 @@ The aiogram-based Telegram bot. This is the user's primary control surface: pair
 - `src/ccr/cli.py::_cmd_serve` — wires `serve` subcommand to `asyncio.run(server.serve(Settings()))`.
 
 ### Bot commands available today
-- `/start`, `/new`, `/stop`, `/clear`, `/who`, `/pid`, `/sessions`, `/continue`, `/answer <id8> <text>`, `/agents` (live Running + `.claude/agents/*.md` Library), `/skills` (from `system/init`), `/cost` (rich HTML), `/usage` (rate-limit snapshot), `/model`, `/compact` (passthroughs), and the canned-redirect for `/mcp`, `/init`.
+- `/start`, `/new`, `/stop`, `/clear`, `/who`, `/pid`, `/sessions`, `/continue`, `/answer <id8> <text>`, `/agents` (live Running + `.claude/agents/*.md` Library), `/skills` (from `system/init`), `/cost` (rich HTML), `/usage` (rate-limit snapshot), `/config` (per-user preferences — timezone picker + free-text fallback), `/model`, `/compact` (passthroughs), and the canned-redirect for `/mcp`, `/init`.
 
 ## Subtleties / gotchas
 - **`/agents` reads from `.claude/agents/*.md` on disk** — that path is a Claude Code convention and is correct; do *not* repoint it to `docs/` or `plans/`. Tests in `test_bot_passthrough.py` populate `tmp_path/.claude/agents/` to verify.
@@ -65,6 +77,9 @@ The aiogram-based Telegram bot. This is the user's primary control surface: pair
 - **Slash-command filter narrowing.** `handle_text` excludes slash commands so they fall through to `passthrough.py`. If you add a new slash-command handler, register it before `passthrough_router` (which is included last in `app.py`).
 - **`/clear` divider** is gated on `prior_status != IDLE` and the read must happen before `manager.stop()` (status flips after stop).
 - **`/continue` argument validation** uses `_HEX8_RE` on the raw argv — invalid format must reject without invoking the manager (regression risk).
+- **`cfg:` callback prefix is namespaced** separately from `perm:` and `auq:` — adding new callback prefixes elsewhere must pick a fresh namespace to avoid collisions on aiogram's `F.data.startswith(...)` filters.
+- **`cb_open_tz_picker` matches `F.data == "cfg:tz"` (exact equality)** while `cb_pick_tz` matches `F.data.startswith("cfg:tz:")` (trailing colon) — both coexist because aiogram dispatches by registration order and the filters are mutually exclusive on payload shape.
+- **Even curated zones go through `zoneinfo.ZoneInfo` server-side** before persistence — defence-in-depth against a future typo in `_CURATED_ZONES` silently writing a bad zone.
 - **`/cost` cost line is omitted when `total_cost_usd == 0`** — that signals a subscription user whose cost isn't tracked. Don't emit `$0.00`.
 - **`broadcast_paired` swallows per-recipient `TelegramAPIError`.** Don't add a global try/except that hides the per-recipient warning logs.
 - **TypingKeepalive cancel is idempotent.** Calling `cancel` on an already-cancelled task is fine; the broadcast loop relies on this.
@@ -75,5 +90,5 @@ The aiogram-based Telegram bot. This is the user's primary control surface: pair
 
 ## Status
 - State: IN PROGRESS
-- Tickets: CCR-006, CCR-008, CCR-009 (gating later removed in CCR-024), CCR-010, CCR-014 (planned), CCR-018, CCR-019, CCR-020, CCR-022, CCR-023, CCR-024, CCR-026, CCR-027 (deferred), CCR-028 (AUQ collision), CCR-030, CCR-031, CCR-032, CCR-033, CCR-034..CCR-040 (planned polish)
-- Last updated: CCR-033 (2026-05-05)
+- Tickets: CCR-006, CCR-008, CCR-009 (gating later removed in CCR-024), CCR-010, CCR-014 (planned), CCR-018, CCR-019, CCR-020, CCR-022, CCR-023, CCR-024, CCR-026, CCR-027 (deferred), CCR-028 (AUQ collision), CCR-030, CCR-031, CCR-032, CCR-033, CCR-034, CCR-035..CCR-040 (planned polish)
+- Last updated: CCR-034 (2026-05-05)
