@@ -144,6 +144,65 @@ async def test_argv_continue_appears_before_mcp_flags_when_resume_true(
     assert cont_idx < perm_idx
 
 
+async def test_argv_resume_true_still_emits_continue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the bare ``resume=True`` path still emits ``--continue``."""
+    argv_file = tmp_path / "argv.txt"
+    monkeypatch.setenv("FAKE_CLAUDE_ARGV_FILE", str(argv_file))
+    monkeypatch.setenv("PYTHONPATH", str(REPO_ROOT))
+    monkeypatch.setenv("FAKE_CLAUDE_SCRIPT", "")
+
+    settings = _make_settings(tmp_path)
+    proc = ClaudeProcess(settings=settings, resume=True)
+    await proc.start()
+    await proc.wait()
+
+    argv_lines = argv_file.read_text(encoding="utf-8").splitlines()
+    assert "--continue" in argv_lines
+    assert "--resume" not in argv_lines
+
+
+async def test_argv_resume_string_emits_resume_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``resume="<id>"`` emits ``--resume <id>`` in the resume slot.
+
+    The flag must land between the fixed control flags (``-p``,
+    ``--input-format=...``, ``--output-format=...``, ``--verbose``) and the
+    permission block (``--permission-prompt-tool`` and friends).
+    """
+    argv_file = tmp_path / "argv.txt"
+    monkeypatch.setenv("FAKE_CLAUDE_ARGV_FILE", str(argv_file))
+    monkeypatch.setenv("PYTHONPATH", str(REPO_ROOT))
+    monkeypatch.setenv("FAKE_CLAUDE_SCRIPT", "")
+
+    settings = _make_settings(tmp_path)
+    proc = ClaudeProcess(
+        settings=settings,
+        resume="abc-123",
+        mcp_argv=[
+            "--permission-prompt-tool",
+            "mcp__ccr__ccr_permission_prompt",
+            "--mcp-config",
+            "/tmp/x.json",
+        ],
+    )
+    await proc.start()
+    await proc.wait()
+
+    argv_lines = argv_file.read_text(encoding="utf-8").splitlines()
+    resume_idx = argv_lines.index("--resume")
+    assert argv_lines[resume_idx + 1] == "abc-123"
+    assert "--continue" not in argv_lines
+
+    verbose_idx = argv_lines.index("--verbose")
+    perm_idx = argv_lines.index("--permission-prompt-tool")
+    assert verbose_idx < resume_idx < perm_idx
+
+
 async def test_argv_permission_mode_inserted_between_resume_and_mcp(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

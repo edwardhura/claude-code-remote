@@ -217,6 +217,11 @@ class SessionManager:
         # Per-session bookkeeping reset on each new_session().
         self._init_event: asyncio.Event = asyncio.Event()
         self._saw_result_success = False
+        # CCR-036: gates the single-shot ``claude_session_id`` DB write fired
+        # from :meth:`_consume_events` on the first :class:`SystemInit`. A
+        # second ``system.init`` (theoretical, never observed) is a no-op.
+        self._claude_session_id_persisted: bool = False
+        self._claude_session_id_pending: asyncio.Task[None] | None = None
         self._last_event_at_write_ts: float = 0.0
         self._last_event_at_pending: asyncio.Task[None] | None = None
         # tool_use_id -> subagent_type. Populated when a Task/Agent tool fires;
@@ -328,6 +333,8 @@ class SessionManager:
             self._status = SessionStatus.RUNNING
             self._stop_requested = False
             self._saw_result_success = False
+            self._claude_session_id_persisted = False
+            self._claude_session_id_pending = None
             self._init_event = asyncio.Event()
             self._last_event_at_write_ts = 0.0
             self._last_event_at_pending = None
@@ -397,20 +404,24 @@ class SessionManager:
     ) -> uuid.UUID:
         """Resume a finished session. Returns the new ``Session.id``.
 
-        With no ``session_id_prefix``, the most recent finished session is
-        chosen. With a prefix, the matching row from the resumable set is
-        chosen (most recent on the vanishingly rare 8-hex collision).
+        With no ``session_id_prefix``, the most recent finished row whose
+        ``claude_session_id IS NOT NULL`` is chosen. With a prefix, the
+        matching row from the resumable set is chosen (most recent on the
+        vanishingly rare 8-hex collision).
 
         Refuses to silently replace a running session — caller must
         ``/stop`` or ``/clear`` first. Mints a fresh local UUID and inserts
         a new :class:`Session` row; spawns a fresh :class:`ClaudeProcess`
-        with ``--continue`` so Claude Code restores conversation context
-        from its own local cache.
+        with ``--resume <claude_session_id>`` so Claude Code restores the
+        exact conversation captured on the foreign session_id channel.
 
         Raises:
             SessionAlreadyRunningError: a session is currently running.
-            NoPriorSessionError: no completed/stopped row exists in the DB
-                (no-arg path only).
+            NoPriorSessionError: (a) no resumable row exists at all on the
+                no-prefix path, or (b) the matched row (no-prefix or
+                prefix path) has ``claude_session_id IS NULL`` — the row
+                exists but is not resumable. The bot-side reply contract
+                is preserved: handler does ``msg.answer(str(exc))``.
             SessionNotFoundError: a ``session_id_prefix`` was given but no
                 resumable row's first 8 hex chars match.
             SessionError: ``claude_bin`` is missing or the subprocess
@@ -421,16 +432,12 @@ class SessionManager:
                 message = "Session already running. /stop first or /clear to start fresh."
                 raise SessionAlreadyRunningError(message)
 
-            if session_id_prefix is None:
-                prior_id = await self._db_lookup_most_recent_finished()
-                if prior_id is None:
-                    message = "No prior session to continue."
-                    raise NoPriorSessionError(message)
-            else:
-                prior_id = await self._db_lookup_session_by_prefix(session_id_prefix)
-                if prior_id is None:
-                    message = f"No session found with id {session_id_prefix}."
-                    raise SessionNotFoundError(message)
+            claude_session_id = await self._db_lookup_resumable_claude_session_id(
+                session_id_prefix=session_id_prefix,
+            )
+            if claude_session_id is None:
+                message = "No prior session to continue."
+                raise NoPriorSessionError(message)
 
             await self._ensure_mcp_started()
 
@@ -441,7 +448,7 @@ class SessionManager:
 
             proc = ClaudeProcess(
                 settings=self._settings,
-                resume=True,
+                resume=claude_session_id,
                 mcp_argv=self._mcp.claude_argv,
             )
             try:
@@ -456,6 +463,8 @@ class SessionManager:
             self._status = SessionStatus.RUNNING
             self._stop_requested = False
             self._saw_result_success = False
+            self._claude_session_id_persisted = False
+            self._claude_session_id_pending = None
             self._init_event = asyncio.Event()
             self._last_event_at_write_ts = 0.0
             self._last_event_at_pending = None
@@ -708,9 +717,12 @@ class SessionManager:
         """Resolve an 8-hex-prefix to the full ``tool_use_id``.
 
         Returns ``None`` on zero matches OR ≥2 matches (collision). The
-        same disambiguation pattern as
-        :meth:`_db_lookup_session_by_prefix`. The bot's ``/answer``
-        handler maps ``None`` to ``"Stale prompt"``.
+        sibling DB-row prefix lookup is
+        :meth:`_db_lookup_resumable_claude_session_id`, which raises
+        :class:`SessionNotFoundError` if no row matches the prefix and
+        :class:`NoPriorSessionError` if the matched row has
+        ``claude_session_id IS NULL``. The bot's ``/answer`` handler maps
+        ``None`` to ``"Stale prompt"``.
         """
         matches = [tid for tid in self._pending_questions if tid.startswith(id_prefix)]
         if len(matches) != 1:
@@ -789,6 +801,10 @@ class SessionManager:
         if self._last_event_at_pending is not None:
             with contextlib.suppress(BaseException):
                 await self._last_event_at_pending
+        # Drain the single-shot claude_session_id write the same way.
+        if self._claude_session_id_pending is not None:
+            with contextlib.suppress(BaseException):
+                await self._claude_session_id_pending
 
         self._proc = None
         self._session_id = None
@@ -799,6 +815,7 @@ class SessionManager:
         self._running_subagents = {}
         self._skills = []
         self._rate_limit_status = None
+        self._claude_session_id_pending = None
 
     async def _consume_events(self) -> None:
         """Drain :meth:`ClaudeProcess.events` into the log + bus.
@@ -825,6 +842,12 @@ class SessionManager:
                 if isinstance(event, SystemInit):
                     self._init_event.set()
                     self._skills = list(event.skills)
+                    if event.session_id and not self._claude_session_id_persisted:
+                        self._claude_session_id_persisted = True
+                        self._claude_session_id_pending = asyncio.create_task(
+                            self._update_claude_session_id(session_id, event.session_id),
+                            name=f"claude-session-id-{session_id}",
+                        )
                 elif isinstance(event, ResultEvent) and event.subtype == "success":
                     self._saw_result_success = True
                 elif isinstance(event, RateLimitEvent):
@@ -1011,6 +1034,33 @@ class SessionManager:
                 session_id=str(session_id),
             )
 
+    async def _update_claude_session_id(
+        self,
+        session_id: uuid.UUID,
+        claude_session_id: str,
+    ) -> None:
+        """Fire-and-forget single-shot persistence of Claude's ``session_id``.
+
+        Mirrors :meth:`_update_last_event_at`: opens a fresh DB session via
+        ``self._db_factory()``, loads the row, sets ``claude_session_id``, and
+        commits. Failures are logged via :func:`log.exception` and never
+        re-raised — losing this write is non-fatal (``/continue`` will fall
+        back to ``NoPriorSessionError`` for that row, same as a legacy NULL).
+        """
+        try:
+            async with self._db_factory() as db:
+                row = await db.scalar(select(Session).where(Session.id == session_id))
+                if row is None:
+                    return
+                row.claude_session_id = claude_session_id
+                await db.commit()
+        except Exception:
+            log.exception(
+                "session_manager.claude_session_id_update_failed",
+                session_id=str(session_id),
+                claude_session_id=claude_session_id,
+            )
+
     async def _await_exit(self) -> None:
         """Wait for the subprocess to exit; decide final status."""
         proc = self._proc
@@ -1029,10 +1079,14 @@ class SessionManager:
         # Drain any in-flight ``last_event_at`` write before we issue the
         # final-state update — otherwise observers that read the row right
         # after seeing the COMPLETED/CRASHED status may still see
-        # ``last_event_at`` as NULL.
+        # ``last_event_at`` as NULL. Same drain for the single-shot
+        # ``claude_session_id`` write fired from :meth:`_consume_events`.
         if self._last_event_at_pending is not None:
             with contextlib.suppress(BaseException):
                 await self._last_event_at_pending
+        if self._claude_session_id_pending is not None:
+            with contextlib.suppress(BaseException):
+                await self._claude_session_id_pending
 
         if self._stop_requested:
             final_status = SessionStatus.STOPPED
@@ -1119,35 +1173,24 @@ class SessionManager:
                 session_id=str(session_id),
             )
 
-    async def _db_lookup_most_recent_finished(self) -> uuid.UUID | None:
-        """Return the id of the most recent finished session, or ``None``.
+    async def _db_lookup_resumable_claude_session_id(
+        self,
+        *,
+        session_id_prefix: str | None,
+    ) -> str | None:
+        """Return the ``claude_session_id`` to resume, or ``None``.
 
-        "Finished" = ``status IN ('completed', 'stopped')``; ``crashed`` is
-        deliberately excluded (see :data:`_RESUMABLE_STATUSES`).
-        """
-        async with self._db_factory() as db:
-            row = await db.scalar(
-                select(Session)
-                .where(Session.status.in_(_RESUMABLE_STATUSES))
-                .order_by(Session.started_at.desc())
-                .limit(1),
-            )
-            if row is None:
-                return None
-            return row.id
+        No prefix -> the most recent finished row whose ``claude_session_id IS
+        NOT NULL``; rows with ``claude_session_id IS NULL`` are skipped (legacy
+        / pre-CCR-036). With a prefix -> the row whose ``id.hex[:8] == prefix``
+        from the resumable set; if that row's ``claude_session_id IS NULL``,
+        :class:`NoPriorSessionError` is raised (the row exists but is NOT
+        resumable — :class:`SessionNotFoundError`'s "look harder" wording
+        would be misleading). If no row matches the prefix at all,
+        :class:`SessionNotFoundError` is raised.
 
-    async def _db_lookup_session_by_prefix(self, prefix: str) -> uuid.UUID | None:
-        """Return the id of a resumable row matching the 8-hex prefix, or ``None``.
-
-        Same eligibility set as :meth:`_db_lookup_most_recent_finished`
-        (``crashed`` and ``running`` excluded). The match runs in Python on
-        ``row.id.hex[:8]`` rather than SQL because :class:`Session.id` is
-        stored as a backend-specific UUID type (binary on most backends,
-        TEXT on SQLite) and a portable LIKE/SUBSTR predicate would have to
-        cast both sides; the resumable result set is small (worst case a
-        few hundred entries) so the in-Python filter is acceptable. On the
-        vanishingly rare 8-hex collision the most recent ``started_at``
-        wins (the rows are scanned in DESC order).
+        Returns ``None`` only on the no-prefix path when there is genuinely
+        no resumable row; the caller maps that to :class:`NoPriorSessionError`.
         """
         async with self._db_factory() as db:
             rows = (
@@ -1157,10 +1200,21 @@ class SessionManager:
                     .order_by(Session.started_at.desc()),
                 )
             ).all()
+
+        if session_id_prefix is None:
             for row in rows:
-                if row.id.hex[:8] == prefix:
-                    return row.id
+                if row.claude_session_id is not None:
+                    return row.claude_session_id
             return None
+
+        for row in rows:
+            if row.id.hex[:8] == session_id_prefix:
+                if row.claude_session_id is None:
+                    message = "No prior session to continue."
+                    raise NoPriorSessionError(message)
+                return row.claude_session_id
+        message = f"No session found with id {session_id_prefix}."
+        raise SessionNotFoundError(message)
 
     async def _db_finalize_session(
         self,

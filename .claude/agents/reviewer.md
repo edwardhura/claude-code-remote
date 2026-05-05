@@ -100,21 +100,23 @@ A **test fixture** containing an obviously fake placeholder (e.g. `JWT_SECRET="x
 
 Apply the team lead's `## Reviewer focus (CCR-NNN)` block. If team lead said "this ticket introduces JWT minting", spend extra time on §6. If team lead said "this writes JSONL files keyed by session_id", spend extra time on §5.
 
-## BRIEF update note check
+## BRIEF / diff drift check
 
-The developer's report ends with a `## BRIEF update note (CCR-NNN)` section that the team-lead will fold into `docs/<feature>/BRIEF.md` verbatim. The team-lead does not read `src/`, so any drift between the dev's note and the diff hides a permanent BRIEF inaccuracy.
+By the time you run, **team-lead Mode 1C has already refreshed `docs/<feature>/BRIEF.md` and `docs/<feature>/CONTEXT.md`** from the developer's `## BRIEF update note (CCR-NNN)`. The reviewer's job is no longer to audit the dev's free-form report for the presence of that section (Mode 1C is the gate for that — if the section was missing, the developer is currently being re-dispatched for an amended report and you wouldn't have been called).
 
-Audit:
+What you DO check is **drift between the now-current BRIEF and the actual diff**: does the file on disk accurately describe what the code now does?
 
-- **Public surface accuracy.** Each `New / changed entries for ## Public surface` bullet should correspond to a real new / changed public symbol, route, command, or file role in the diff. Symbols added to the diff but missing from the note are an omission. Symbols listed in the note but not in the diff are an over-claim.
-- **Removed entries.** If the diff deletes a previously-public symbol, the note should list it as `removed: <symbol>`. Omitted removals are findings.
-- **Invariants.** If the diff adds a new constraint future tickets must respect (a new validator, a new lock, a new fail-closed branch, a new rate / size limit), it should appear under `Key invariants`. Missing → finding.
-- **Subtleties.** If the diff introduces non-obvious behaviour the team-lead would need to remember (an async ordering, a synthetic event, a deferred side-effect, an unusual chmod / permission, a buffering rule), it should appear under `Subtleties / gotchas`. Missing → finding.
-- **`no change` honesty.** If a subsection says `no change` but the diff actually changed it, that is the worst kind of omission — call it out.
+Read `docs/<feature>/BRIEF.md` (the current state, post-Mode-1C) and compare to the diff:
 
-A BRIEF-update-note omission is a MEDIUM finding by default, HIGH if it hides a security-relevant invariant or a removed public surface (which would leave the BRIEF claiming something the code no longer provides).
+- **Public surface accuracy.** Each entry under `## Public surface` that this ticket touches should correspond to a real new / changed public symbol, route, command, or file role in the diff. Symbols added to the diff but missing from BRIEF are an omission. Symbols listed in BRIEF but not in the diff are an over-claim.
+- **Removed entries.** If the diff deletes a previously-public symbol, BRIEF should no longer list it.
+- **Invariants.** New constraints introduced by the diff (a new validator, a new lock, a new fail-closed branch, a new rate / size limit) should appear under `## Key invariants`. Missing → finding.
+- **Subtleties.** Non-obvious behaviour the team-lead would need to remember when scoping later tickets (an async ordering, a synthetic event, a deferred side-effect, an unusual chmod / permission, a buffering rule) should appear under `## Subtleties / gotchas`. Missing → finding.
+- **Status line.** `Last updated:` should reference this ticket id; `Tickets:` should include it.
 
-If the developer's report is missing the `## BRIEF update note (CCR-NNN)` section entirely, that is a `REVIEW FAIL: CCR-NNN — developer report missing BRIEF update note` automatic fail; the team-lead cannot do their Mode 2 BRIEF refresh without it.
+Drift findings are MEDIUM by default, HIGH if BRIEF understates a security-relevant invariant or omits a removed public surface (which would leave BRIEF claiming something the code no longer provides). They are *normal findings*, not auto-FAILs — the reviewer's verdict is decided by the same severity rule as everything else.
+
+If `docs/<feature>/BRIEF.md` looks completely unchanged for this ticket (no entries touching the new files, `Last updated:` still pointing at a previous ticket, no new invariants matching the diff), that suggests Mode 1C did not run or ran on a stale dev report. Surface as a HIGH finding "BRIEF appears stale, may not have been refreshed by team-lead Mode 1C" — the team-lead's Mode 2 will route appropriately.
 
 ## Test coverage check
 
@@ -184,13 +186,12 @@ If a test fails, you do **not** investigate it as a code-review finding — the 
 ## Ticket-specific focus
 <Per the team-lead reviewer-focus block. State explicitly what was checked and the result.>
 
-## BRIEF update note audit
-- Note present in dev report: <YES | NO — automatic FAIL>
+## BRIEF / diff drift audit
+- BRIEF.md refreshed by Mode 1C (Last updated points to this ticket): <YES | NO — likely Mode 1C did not run; HIGH finding>
 - Public surface entries match diff: <YES | omissions / over-claims below>
-- Removals listed: <YES | N/A — no removals | omissions below>
-- New invariants captured: <YES | omissions below>
-- New subtleties captured: <YES | omissions below>
-- `no change` claims honest: <YES | discrepancies below>
+- Removals reflected: <YES | N/A — no removals | omissions below>
+- New invariants captured in BRIEF: <YES | omissions below>
+- New subtleties captured in BRIEF: <YES | omissions below>
 
 ## Test coverage
 - New code covered: <YES | gaps below>
@@ -233,8 +234,8 @@ REVIEW FAIL: CCR-NNN — <one-line summary citing the highest-severity finding o
 
 ## When PASS, when FAIL
 
-- **PASS**: every acceptance command exits as expected, all targeted tests pass, lint + types are clean, no CRITICAL or HIGH findings, no coverage gap so significant that the ticket is unsafe to land. MEDIUM / LOW findings are reported but do not fail the review (team lead may still ask for them to be fixed).
-- **FAIL**: any acceptance command fails, any targeted test fails, lint or types fail, any CRITICAL or HIGH finding (hardcoded secret, missing auth check on a sensitive route, JWT accepting `none`, `subprocess(..., shell=True)` with user input, missing acceptance behavior, undocumented plan deviation in security-relevant code), or coverage / test-gap is bad enough that landing the ticket would mean shipping untested behavior. Err on the side of FAIL when in doubt — a borderline FAIL is much cheaper than a regression in main.
+- **PASS**: every acceptance command exits as expected, all targeted tests pass, lint + types are clean, no CRITICAL or HIGH findings, no coverage gap so significant that the ticket is unsafe to land. MEDIUM / LOW findings are reported but do not fail the review (team lead may still ask for them to be fixed). BRIEF/diff drift is reported as a finding (severity per "BRIEF / diff drift check" above) but is not an automatic FAIL — the team-lead handles BRIEF; you only flag inaccuracy.
+- **FAIL**: any acceptance command fails, any targeted test fails, lint or types fail, any CRITICAL or HIGH finding (hardcoded secret, missing auth check on a sensitive route, JWT accepting `none`, `subprocess(..., shell=True)` with user input, missing acceptance behavior, undocumented plan deviation in security-relevant code, BRIEF apparently not refreshed by Mode 1C / completely stale), or coverage / test-gap is bad enough that landing the ticket would mean shipping untested behavior. Err on the side of FAIL when in doubt — a borderline FAIL is much cheaper than a regression in main.
 
 ## Final-line verdict
 

@@ -9,7 +9,7 @@ The **main session** (the top-level Claude conversation) is the orchestrator and
 | Agent | Writes code? | Runs code? | Primary outputs |
 |---|---|---|---|
 | `project-manager` | No | No | Tickets appended to `BACKLOG.md`; stub `docs/<feature>/{BRIEF,CONTEXT}.md` |
-| `team-lead` | No | No | Decision: architect-first or skip; dev + reviewer scope briefs; per-ticket `BRIEF.md` refresh; `CONTEXT.md` + `BACKLOG.md` / `DONE.md` updates on completion |
+| `team-lead` | No | No | Decision: architect-first or skip; dev + reviewer scope briefs; per-ticket `BRIEF.md` + `CONTEXT.md` refresh (Mode 1C, post-developer / pre-reviewer); `BACKLOG.md` / `DONE.md` updates + acceptance ticking + ticket move on completion (Mode 2) |
 | `architect` | No (plan file only) | No | Design plan at `plans/CCR-NNN-<slug>.md`; runs only when team-lead asks |
 | `python-developer` | Yes | Yes (own tests) | Code + tests under Python backend scope (incl. install/CI/doctor) |
 | `web-developer` | Yes | Yes (own tests) | Code + tests under `src/ccr/web/` |
@@ -34,18 +34,33 @@ main session
   7. (only if 5A) dispatches team-lead (Mode 1B — compose dev brief from plan)
        └─→ team-lead returns dev scope + reviewer focus + DISPATCH: <developer> CCR-NNN
   8. dispatches the developer with team-lead's dev scope
-       └─→ developer writes code + tests; reports what was done in detail
-  9. dispatches reviewer (solo — no parallel QA)
+       └─→ developer writes code + tests; reports what was done in detail,
+           ENDING with a ## BRIEF update note (CCR-NNN) section
+  9. dispatches team-lead (Mode 1C — BRIEF/CONTEXT refresh, pre-review)
+       └─→ team-lead reads the dev's ## BRIEF update note and "Files created or
+           modified" list, refreshes docs/<feature>/BRIEF.md + CONTEXT.md
+           IMMEDIATELY (before review), then returns DISPATCH: reviewer CCR-NNN
+           with the original ## Reviewer focus block. If the dev's report omits
+           the BRIEF update note, team-lead returns DISPATCH back to the
+           developer asking for the missing section (no code change), or BLOCKED
+           if the gap is structural.
+ 10. dispatches reviewer (solo — no parallel QA)
        └─→ reviewer does code review + security checks + coverage audit, then
-           runs the test suite + lint + types at the end; reports pass/fail
- 10. dispatches team-lead (Mode 2 — verdict)
-        - REVIEW FAIL: team-lead returns fix scope → loop to step 8 (fresh dev session)
-        - REVIEW PASS: team-lead flips status to [done], MOVES the ticket entry from
-                       BACKLOG.md to DONE.md, REFRESHES BRIEF.md and CONTEXT.md from the
-                       developer's report (BRIEF every ticket, not only feature completion)
-                       → returns APPROVED
- 11. main session **stops and waits for user approval** before the final step
- 12. on user approval: main session commits, pushes, opens PR (never merges)
+           runs the test suite + lint + types at the end; reports pass/fail.
+           Reviewer no longer audits the dev report for a missing BRIEF note —
+           team-lead Mode 1C already gated on it. Reviewer MAY still flag
+           BRIEF/diff drift as a normal code-review finding.
+ 11. dispatches team-lead (Mode 2 — verdict)
+        - REVIEW FAIL: team-lead returns fix scope → loop to step 8 (fresh dev session;
+                       on the next pass Mode 1C will overwrite BRIEF/CONTEXT from the
+                       new dev report)
+        - REVIEW PASS: team-lead ticks acceptance boxes, flips status to [done],
+                       appends the approval Review log line, MOVES the ticket entry
+                       from BACKLOG.md to DONE.md → returns APPROVED. BRIEF and
+                       CONTEXT were already refreshed in Mode 1C; Mode 2 does not
+                       touch them.
+ 12. main session **stops and waits for user approval** before the final step
+ 13. on user approval: main session commits, pushes, opens PR (never merges)
 ```
 
 **Hard rule — user gate before publish.** After team-lead returns `APPROVED`, the main session **must not** stage, commit, push, or run `gh pr create` until the user explicitly approves. End the turn with a short summary (ticket, branch, files changed, acceptance verdict, PR title + body preview) and an explicit ask such as "Ready to commit, push, and open the PR?". Wait for the user's reply. Only after the user says yes (or equivalent) does the main session execute step 12. If the user says no, asks for changes, or stays silent, do not publish.
@@ -62,9 +77,11 @@ The architect is **optional**. Team-lead Mode 1A decides whether to dispatch it 
 | project-manager | `NO TICKETS CREATED: <reason>` | Decided not to add tickets |
 | team-lead (Mode 1A — architect path) | `DISPATCH: architect CCR-NNN` | Main should dispatch the architect with the brief in the response body |
 | team-lead (Mode 1A — skip architect, or Mode 1B post-architect) | `DISPATCH: <python-developer\|web-developer> CCR-NNN` | Main should dispatch the named developer with the scope in the response body |
+| team-lead (Mode 1C — post-developer, pre-reviewer) | `DISPATCH: reviewer CCR-NNN` | BRIEF/CONTEXT have been refreshed; main should dispatch the reviewer with the focus block reproduced in the response body |
+| team-lead (Mode 1C, dev-report incomplete) | `DISPATCH: <python-developer\|web-developer> CCR-NNN` | Dev's report omitted the BRIEF update note; main re-dispatches the dev for an amended report (fix scope in the body) |
 | team-lead (fix loop) | `DISPATCH: <python-developer\|web-developer> CCR-NNN` | Same, with the fix scope in the body |
 | team-lead (final) | `APPROVED: CCR-NNN` | Ticket complete |
-| team-lead (final + last in feature) | `FEATURE COMPLETE: <feature-slug>` | Approved AND BRIEF written |
+| team-lead (final + last in feature) | `FEATURE COMPLETE: <feature-slug>` | Approved AND BRIEF was the feature's last write |
 | team-lead (any) | `BLOCKED: CCR-NNN — <reason>` | Cannot proceed (e.g. acceptance criteria contradict the plan) |
 | architect | `PLAN READY: CCR-NNN` | `plans/CCR-NNN-<slug>.md` written; team-lead Mode 1B can compose dev brief from it |
 | architect | `BLOCKED: CCR-NNN — <reason>` | Cannot design without resolving a contradiction or scope gap |
@@ -151,9 +168,9 @@ When emitting `APPROVED` (team-lead) or `[closed]` (main session):
 
 One folder per feature. Slug names a capability, not a phase (e.g. `core`, `auth`, `chat-bot`, `web-viewer`). PM creates the folder + stubs when generating the first ticket for that feature; multiple tickets across phases share one feature folder.
 
-### `BRIEF.md` (team lead writes / updates **every approved ticket**)
+### `BRIEF.md` (team lead writes / updates in **Mode 1C, every developer pass**)
 
-`BRIEF.md` is the team-lead's primary view of a feature. It is dense, opinionated, and always current — the team-lead must be able to scope an architect or developer brief for a new ticket in this feature **without reading `src/` and without re-reading `CONTEXT.md`**. Created as a stub by PM, refreshed by team-lead on every `APPROVED` verdict (not only on feature completion).
+`BRIEF.md` is the team-lead's primary view of a feature. It is dense, opinionated, and always current — the team-lead must be able to scope an architect or developer brief for a new ticket in this feature **without reading `src/` and without re-reading `CONTEXT.md`**. Created as a stub by PM, refreshed by team-lead in **Mode 1C** (immediately after the developer returns `READY FOR REVIEW`, before the reviewer is dispatched). On a fix loop, Mode 1C overwrites BRIEF/CONTEXT with the new dev report's content; the in-flight stale BRIEF is invisible because BRIEF is only consulted by team-lead Mode 1A when scoping the *next* ticket. Mode 2 does not touch BRIEF.
 
 Format:
 
@@ -195,11 +212,11 @@ or category as helpful.>
 - Last updated: CCR-NNN (YYYY-MM-DD)
 ```
 
-The team-lead refreshes `Public surface`, `Key invariants`, and `Subtleties` whenever a ticket adds, changes, or removes one. The `Status` line always advances: bump `Last updated`, ensure the new ticket id appears in `Tickets:`, and flip `State` to `COMPLETE` when no other ticket for the feature remains in `[todo]` / `[in-progress]` / `[blocked]`. The team-lead derives BRIEF updates from the developer's `## BRIEF update note (CCR-NNN)` section — the team-lead does not read `src/` or `tests/` to confirm.
+The team-lead refreshes `Public surface`, `Key invariants`, and `Subtleties` whenever a ticket adds, changes, or removes one. The `Status` line always advances: bump `Last updated`, ensure the new ticket id appears in `Tickets:`, and flip `State` to `COMPLETE` when no other ticket for the feature remains in `[todo]` / `[in-progress]` / `[blocked]`. The team-lead derives BRIEF updates from the developer's `## BRIEF update note (CCR-NNN)` section — the team-lead does not read `src/` or `tests/` to confirm. If the dev's report is missing the BRIEF update note, Mode 1C bounces it back as a non-code fix request rather than writing a partial BRIEF.
 
-### `CONTEXT.md` (team lead writes / updates)
+### `CONTEXT.md` (team lead writes / updates in Mode 1C)
 
-Deeper file-by-file record kept for the architect (and any human reading the repo). Created as a stub by PM, maintained by team lead based on the developer's per-ticket report. Team-lead refreshes CONTEXT.md on every `APPROVED`. The team-lead does not need to re-read CONTEXT.md to scope the *next* ticket — that is what BRIEF.md is for. The architect reads CONTEXT.md (and source) when designing.
+Deeper file-by-file record kept for the architect (and any human reading the repo). Created as a stub by PM, maintained by team lead based on the developer's per-ticket report. Team-lead refreshes CONTEXT.md in **Mode 1C** alongside BRIEF.md (not in Mode 2). The team-lead does not need to re-read CONTEXT.md to scope the *next* ticket — that is what BRIEF.md is for. The architect reads CONTEXT.md (and source) when designing.
 
 Format:
 
@@ -219,7 +236,7 @@ Format:
 - [CCR-MMM]: ...
 ```
 
-The change-history entries are append-only. Team lead appends a new entry when emitting `APPROVED`.
+The change-history entries are append-only. Team lead appends a new entry in Mode 1C (post-developer, pre-reviewer); on a fix loop the next Mode 1C pass overwrites the prior entry's text rather than stacking duplicates.
 
 ## Read budgets — who reads what
 
@@ -230,7 +247,8 @@ The team-lead is a manager, not an implementer. The team-lead **does not read `s
 - The feature's `docs/<feature>/BRIEF.md` (always).
 - `docs/WORKFLOW.md` and `CLAUDE.md`.
 - In Mode 1B only: the architect's `plans/CCR-NNN-<slug>.md` in full.
-- In Mode 2 only: the developer's full implementation summary and the reviewer's full response.
+- In Mode 1C only: the developer's full implementation summary (in particular the `## BRIEF update note` and "Files created or modified" sections).
+- In Mode 2 only: the reviewer's full response (the dev report was already consumed in Mode 1C, but is provided again for context if needed).
 
 If `BRIEF.md` does not answer a specific scoping question, the team-lead either asks the question to the user, returns `BLOCKED`, or relies on the architect (in Mode 1A) — the team-lead does **not** open `src/` to find out.
 
@@ -258,7 +276,7 @@ Every subagent that produces a final report includes a `## BRIEF update note (CC
 - Feature complete? <YES — flip State to COMPLETE | NO — keep IN PROGRESS>
 ```
 
-The architect emits the note in its `PLAN READY` response (about what the *plan* changes); the developer emits the note in its `READY FOR REVIEW` response (about what was actually built and may have diverged from the plan); the reviewer flags any drift between the dev's BRIEF update note and the diff. The team-lead then folds the note into `BRIEF.md` verbatim or with light editing — the team-lead is allowed to copy bullets directly without reading the underlying code.
+The architect emits the note in its `PLAN READY` response (about what the *plan* changes); the developer emits the note in its `READY FOR REVIEW` response (about what was actually built and may have diverged from the plan). The team-lead then folds the developer's note into `BRIEF.md` verbatim or with light editing in **Mode 1C**, before the reviewer runs — the team-lead is allowed to copy bullets directly without reading the underlying code. The reviewer no longer audits whether the dev wrote the note (Mode 1C is the gate); the reviewer MAY still flag drift between the now-current BRIEF and the actual diff as a code-review finding.
 
 If a subagent has no changes to surface in BRIEF, it still emits the section with `Public surface: no change`, `Key invariants: no change`, etc., to make the absence explicit (otherwise team-lead cannot tell the difference between "nothing changed" and "subagent forgot").
 
@@ -322,6 +340,52 @@ DISPATCH: <python-developer|web-developer> CCR-NNN
 
 If the architect surfaced "Open questions for team lead" that team-lead cannot resolve from the ticket / plan section alone, team-lead returns `BLOCKED: CCR-NNN — <reason>` so the main session can bring the questions to the user.
 
+## How team-lead structures Mode 1C — post-developer BRIEF/CONTEXT refresh, pre-review
+
+Triggered when the developer returned `READY FOR REVIEW: CCR-NNN`. Team-lead reads the developer's full report (in particular the `## BRIEF update note (CCR-NNN)` section and the "Files created or modified" / "Relations / dependencies" sections), refreshes `docs/<feature>/BRIEF.md` and `docs/<feature>/CONTEXT.md` immediately, and then dispatches the reviewer.
+
+**What Mode 1C edits:**
+
+1. `docs/<feature>/BRIEF.md` from the dev's `## BRIEF update note (CCR-NNN)`:
+   - Apply `Public surface` adds/changes/removals.
+   - Apply `Key invariants` adds/changes — phrase each as a rule a future ticket might break.
+   - Apply `Subtleties / gotchas` adds/changes — non-obvious behaviour to remember when scoping later tickets.
+   - Update `Cross-feature relations` if the note added a `depends on:` / `used by:` edge.
+   - Update `Status`: bump `Last updated:` to `CCR-NNN (YYYY-MM-DD)`; ensure `Tickets:` includes `CCR-NNN`.
+   - Do NOT flip `State: COMPLETE` here — that decision waits for Mode 2 (the ticket isn't approved yet). For now leave `IN PROGRESS`.
+2. `docs/<feature>/CONTEXT.md` from the dev's "Files created or modified" / "Relations / dependencies" sections:
+   - `## Files`: add or refresh `- <path> — <one-line role>` for files created or substantially changed.
+   - `## Relations`: add `depends on:` / `used by:` lines that emerged.
+   - `## Change history`: append `- [CCR-NNN]: <short description>` (or update the existing CCR-NNN line on a fix-loop pass — do not stack duplicates for the same ticket).
+3. Append a `### Review log` line in `BACKLOG.md`: `<YYYY-MM-DD> team-lead: BRIEF/CONTEXT refreshed, dispatching reviewer`.
+
+**What Mode 1C produces:**
+
+```
+## Reviewer focus (CCR-NNN)
+<Reproduce the same Reviewer focus block from Mode 1A or 1B verbatim. Reviewer
+focus is fixed at scoping time; Mode 1C does not change it. Acceptance commands
+to run at the end of the reviewer's pass are reproduced here.>
+
+DISPATCH: reviewer CCR-NNN
+```
+
+**If the dev's report omits `## BRIEF update note (CCR-NNN)`:** Mode 1C does NOT write a partial BRIEF. It returns the developer with a small fix scope asking only for the missing report section (no code change, no test re-run):
+
+```
+## Fix scope (CCR-NNN)
+Your previous READY FOR REVIEW response did not include the
+`## BRIEF update note (CCR-NNN)` section required by `docs/WORKFLOW.md`.
+Re-emit your full report unchanged plus the missing section, structured per
+the format in `docs/WORKFLOW.md §BRIEF update note`. Do NOT re-run any
+acceptance commands or change any code — the previous diff is correct, only
+the report is incomplete.
+
+DISPATCH: <python-developer|web-developer> CCR-NNN
+```
+
+On a fix loop (after `REVIEW FAIL` → developer redo → another `READY FOR REVIEW`), Mode 1C is invoked again and overwrites BRIEF/CONTEXT from the new dev report. Stale BRIEF written from a failed attempt is invisible because team-lead Mode 1A only consults BRIEF when scoping the *next* ticket.
+
 ## Final verdict round (team-lead Mode 2, after reviewer report)
 
 When dispatched with reviewer output, team-lead either:
@@ -331,18 +395,18 @@ When dispatched with reviewer output, team-lead either:
 2. Append `### Review log` line: `<YYYY-MM-DD> team-lead: approved`.
 3. Set ticket status to `[done]`.
 4. **Move the ticket entry from `BACKLOG.md` to `DONE.md`** per "How to move a ticket" above. The whole block — title, body, and full Review log — goes verbatim; nothing is dropped.
-5. Update `docs/<feature>/CONTEXT.md` based on the developer's report:
-   - Add/update `## Files` entries for files created or substantially changed.
-   - Add `## Relations` entries (`depends on:` / `used by:`) that emerged.
-   - Append `- [CCR-NNN]: <short description>` to `## Change history`.
-6. If this was the last ticket for the feature, update `BRIEF.md` (Overview, Files, Status: COMPLETE).
-7. Return `APPROVED: CCR-NNN` (or `FEATURE COMPLETE: <feature-slug>` if BRIEF was written).
+5. If this was the last ticket for the feature (every other ticket with the same `Feature:` slug across `BACKLOG.md` + `DONE.md` is `[done]` or `[closed]`), flip `State: IN PROGRESS` → `State: COMPLETE` in `docs/<feature>/BRIEF.md`. This is the ONLY BRIEF write Mode 2 performs — content was already refreshed in Mode 1C.
+6. Return `APPROVED: CCR-NNN` (or `FEATURE COMPLETE: <feature-slug>` if `State` flipped to COMPLETE).
+
+Mode 2 does NOT write `Public surface`, `Key invariants`, `Subtleties`, `Cross-feature relations`, `Last updated`, `Tickets:`, or `## Change history` — those are Mode 1C's responsibility and must already be correct on disk by the time Mode 2 runs. If Mode 2 detects them stale (e.g. the `Last updated` line still references an older ticket), that is a Mode 1C bug — Mode 2 returns `BLOCKED: CCR-NNN — Mode 1C did not refresh BRIEF/CONTEXT before reviewer dispatch` rather than papering over it.
 
 **REVIEW FAIL**:
 1. Append `### Review log` line summarizing the rejection.
 2. Leave status as `[in-progress]` (entry stays in `BACKLOG.md`).
 3. Write a fix-scope section in the response body — concretely what to fix, citing reviewer findings + failing test output. The developer is fresh and will not see the previous attempt; the fix scope must be self-contained.
 4. Return `DISPATCH: <python-developer|web-developer> CCR-NNN`.
+
+(On the next pass through the loop, Mode 1C will overwrite BRIEF/CONTEXT from the corrected dev report.)
 
 ## Integration: GitHub PR (never merge automatically)
 
