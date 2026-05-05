@@ -165,20 +165,6 @@ class NoActiveSessionError(SessionError):
     """Raised when an operation requires a running session but none exists."""
 
 
-class StaleSessionError(SessionError):
-    """Raised when a permission response targets a session that is no longer current."""
-
-
-class StaleToolUseError(SessionError):
-    """Raised when a tool_use_id is not registered in :attr:`_pending_questions`.
-
-    Reserved for internal assertions and future callers that prefer an
-    exception path. :meth:`SessionManager.send_tool_result` does NOT raise
-    this — it returns ``False`` for unknown ids, mirroring the
-    :meth:`SessionManager.resolve_permission` contract.
-    """
-
-
 class SessionAlreadyRunningError(SessionError):
     """Raised when :meth:`SessionManager.continue_session` is called while a session is running."""
 
@@ -436,14 +422,12 @@ class SessionManager:
                 raise SessionAlreadyRunningError(message)
 
             if session_id_prefix is None:
-                prior_id, _prior_claude_id = await self._db_lookup_most_recent_finished()
+                prior_id = await self._db_lookup_most_recent_finished()
                 if prior_id is None:
                     message = "No prior session to continue."
                     raise NoPriorSessionError(message)
             else:
-                prior_id, _prior_claude_id = await self._db_lookup_session_by_prefix(
-                    session_id_prefix,
-                )
+                prior_id = await self._db_lookup_session_by_prefix(session_id_prefix)
                 if prior_id is None:
                     message = f"No session found with id {session_id_prefix}."
                     raise SessionNotFoundError(message)
@@ -1135,16 +1119,11 @@ class SessionManager:
                 session_id=str(session_id),
             )
 
-    async def _db_lookup_most_recent_finished(
-        self,
-    ) -> tuple[uuid.UUID | None, str | None]:
-        """Return ``(id, claude_session_id)`` for the most recent finished session.
+    async def _db_lookup_most_recent_finished(self) -> uuid.UUID | None:
+        """Return the id of the most recent finished session, or ``None``.
 
         "Finished" = ``status IN ('completed', 'stopped')``; ``crashed`` is
-        deliberately excluded (see :data:`_RESUMABLE_STATUSES`). The second
-        tuple element is reserved for the Outcome 2 ``claude_session_id``
-        capture path; in Outcome 1 (the path landed by CCR-020) the column
-        does not exist on the row and the value is always ``None``.
+        deliberately excluded (see :data:`_RESUMABLE_STATUSES`).
         """
         async with self._db_factory() as db:
             row = await db.scalar(
@@ -1154,14 +1133,11 @@ class SessionManager:
                 .limit(1),
             )
             if row is None:
-                return None, None
-            return row.id, getattr(row, "claude_session_id", None)
+                return None
+            return row.id
 
-    async def _db_lookup_session_by_prefix(
-        self,
-        prefix: str,
-    ) -> tuple[uuid.UUID | None, str | None]:
-        """Return ``(id, claude_session_id)`` for a resumable row matching the 8-hex prefix.
+    async def _db_lookup_session_by_prefix(self, prefix: str) -> uuid.UUID | None:
+        """Return the id of a resumable row matching the 8-hex prefix, or ``None``.
 
         Same eligibility set as :meth:`_db_lookup_most_recent_finished`
         (``crashed`` and ``running`` excluded). The match runs in Python on
@@ -1183,8 +1159,8 @@ class SessionManager:
             ).all()
             for row in rows:
                 if row.id.hex[:8] == prefix:
-                    return row.id, getattr(row, "claude_session_id", None)
-            return None, None
+                    return row.id
+            return None
 
     async def _db_finalize_session(
         self,
@@ -1285,6 +1261,4 @@ __all__ = [
     "SessionError",
     "SessionManager",
     "SessionNotFoundError",
-    "StaleSessionError",
-    "StaleToolUseError",
 ]

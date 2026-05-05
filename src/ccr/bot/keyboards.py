@@ -2,11 +2,10 @@
 
 Currently only :func:`permission_kb` is needed — the permission inline
 buttons that turn a permission prompt into a tappable Telegram message.
-The function is kept dormant after CCR-024 stripped the dead JSONL-based
-permission channel; CCR-025 will reuse it for the MCP-driven envelope.
-CCR-014 (``/view`` / ``/last`` / ``/preview``) will land link buttons
-here as well, which is why this lives in its own module rather than
-getting merged into ``formatting.py``.
+CCR-024 stripped the dead JSONL-based permission channel and CCR-025
+reused it for the MCP-driven envelope. CCR-014 (``/view`` / ``/last``
+/ ``/preview``) will land link buttons here as well, which is why this
+lives in its own module rather than getting merged into ``formatting.py``.
 """
 
 from __future__ import annotations
@@ -25,8 +24,7 @@ if TYPE_CHECKING:
 # the raw option name.
 _LABELS: dict[str, str] = {
     "approve": "Approve",
-    "skip": "Skip",
-    "abort": "Abort",
+    "deny": "Deny",
 }
 
 

@@ -940,3 +940,36 @@ Notes:
   - 2026-05-05 main: branch ccr-028-auq-permission-collision created, dispatching team-lead
   - 2026-05-05 team-lead: dispatching architect — three open design questions (MCP resolution shape, suppression race, generalisation) require a Step-0 probe and cross-cutting decisions across mcp.py, manager.py, and formatting.py
   - 2026-05-05 team-lead: approved — 385 tests, 88.80% coverage, all 5 automated criteria verified; F1/F2 LOW noted (missing handler-exception test, redundant nullcheck) — non-blocking; manual smoke unticked per CCR-020/021/026 precedent
+---
+
+## CCR-033: Minor cleanup of post-CCR-028 dead code and doc drift [done]
+Phase: n/a (cleanup)
+Feature: claude-runtime
+Files:
+  - `src/ccr/claude/manager.py` — drop the `claude_session_id` second tuple element from `_db_lookup_most_recent_finished` and `_db_lookup_session_by_prefix` (both helper bodies, both call sites at ~lines 439 and 444-446, both docstrings); helpers now return `uuid.UUID | None`. Remove unused exception classes `StaleSessionError` (~lines 168-170) and `StaleToolUseError` (~lines 172-179) and their `__all__` entries (~lines 1288-1289).
+  - `src/ccr/claude/__init__.py` — drop the `StaleSessionError` / `StaleToolUseError` re-exports (~lines 26-27 and 43-44).
+  - `src/ccr/bot/keyboards.py` — in `_LABELS` (~lines 26-30) drop `"skip"` and `"abort"` keys, add `"deny": "Deny"`. Update the module docstring (~lines 1-10) so the CCR-024/CCR-025 sentence is past tense (CCR-025 has shipped). Leave the CCR-014 reference; CCR-014 is still open.
+  - `src/ccr/server.py` — fix the `asyncio.gather` reference in the module docstring (~line 6); the orchestration is `asyncio.wait(..., FIRST_COMPLETED)`. Either rename to `asyncio.wait` or drop the implementation-detail half of that sentence.
+  - `tests/test_bot_permission.py` — rewrite `test_keyboard_buttons_match_options_and_callback_data` (~lines 58-66) to use the real production combo `["approve", "deny"]` instead of the unreachable `["approve", "skip", "abort"]`.
+Out of scope:
+  - Wiring `claude.log.prune` into startup (defer to CCR-016).
+  - Removing `McpPermissionRequest.options` (one-line forward seam — leave it in place per audit recommendation).
+  - Anything in `src/ccr/web/` (does not exist yet).
+  - Anything that changes wire format, public API, settings, migrations, or tests outside the one named test.
+Acceptance:
+  - [x] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [x] `mypy src` passes.
+  - [x] `ruff check src tests` passes.
+  - [x] `ruff format --check src tests` passes.
+  - [x] `grep -rn 'StaleSessionError\|StaleToolUseError\|_prior_claude_id\|claude_session_id' src/ tests/` returns no matches.
+  - [x] `grep -nE '"skip"|"abort"' src/ccr/bot/keyboards.py` returns no matches.
+Depends on: CCR-028, CCR-029
+Notes:
+  Findings come from `.claude/plans/CCR-REFACTOR-AUDIT.md`. Audit verdict: codebase is in good shape; this is a small (~20 LOC delta) cleanup pass bundling four locally-scoped findings. No new abstraction, no new wire format, no migration. Skip the architect — additive cleanup. Reviewer focus: confirm no production behaviour changes; the keyboard / manager cleanup leaves all existing tests green; no other code paths reference the removed exceptions or the dead tuple slot.
+
+  Developer note: the audit said finding 1 needed no test changes, but three call sites in `tests/test_session_manager.py` directly probed the private helpers and unpacked the now-removed tuple slot — they were updated mechanically (`prior_id, _ = ...` → `prior_id = ...`) with no assertion drops. Final delta ~30 LOC across 6 source files + 2 test files.
+
+### Review log
+  - 2026-05-05 main: ticket created from .claude/plans/CCR-REFACTOR-AUDIT.md; bypassing team-lead per user instruction — dispatched python-developer directly.
+  - 2026-05-05 python-developer: READY FOR REVIEW — 385 passed, 88.79% coverage; all six acceptance commands green; both grep canaries empty; flagged mechanical signature follow-up in tests/test_session_manager.py (3 call sites).
+  - 2026-05-05 main: approved by user; reviewer round skipped per user instruction; status flipped to [done] and entry moved BACKLOG → DONE.
