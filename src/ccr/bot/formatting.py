@@ -84,6 +84,17 @@ _TOOL_ERROR_TRUNCATE = 200
 _ONE_MINUTE_MS = 60_000
 _TOKEN_K_THRESHOLD = 10_000
 
+# CCR-028 — defensive guard mirroring the manager-level
+# ``_ASK_USER_QUESTION_TOOL_NAME`` constant. The MCP server suppresses the
+# bus envelope for these tool names at source (see
+# ``McpPermissionServer.suppressed_tool_names``) so a
+# ``McpPermissionRequest`` for one of them should never reach the
+# formatter in production. Returning ``None`` here keeps the contract
+# pinned at the rendering layer too — protects against schema drift,
+# fixture-injected envelopes, or future refactors that bypass the
+# source-level suppression.
+_AUQ_SUPPRESSED_TOOL_NAMES = frozenset({"AskUserQuestion"})
+
 
 def chunk_text(text: str) -> list[str]:
     """Split ``text`` into chunks no longer than :data:`SAFE_CHUNK` characters.
@@ -276,13 +287,21 @@ def _format_result(event: ResultEvent) -> list[OutboundMessage]:
     return [(f"❌ failed: {html.escape(event.subtype)}", None)]
 
 
-def _format_mcp_permission(event: McpPermissionRequest) -> OutboundMessage:
+def _format_mcp_permission(event: McpPermissionRequest) -> OutboundMessage | None:
     """Render a :class:`McpPermissionRequest` envelope into one outbound message.
 
     The keyboard slot carries a :class:`_PendingKeyboard` sentinel — the
     broadcast loop owns the ``session_id`` and materialises a real
     :class:`InlineKeyboardMarkup` from it.
+
+    CCR-028: returns ``None`` for envelopes whose ``tool_name`` is in
+    :data:`_AUQ_SUPPRESSED_TOOL_NAMES` — the MCP server suppresses these
+    at source, but the defensive guard makes the invariant testable and
+    keeps a stray envelope (test fixture, schema drift) from rendering a
+    duplicate "🛑 Permission requested" prompt next to the AUQ keyboard.
     """
+    if event.tool_name in _AUQ_SUPPRESSED_TOOL_NAMES:
+        return None
     tool = html.escape(event.tool_name)
     args = html.escape(repr(event.tool_input)[:_TOOL_ARG_TRUNCATE])
     text = f"\U0001f6d1 Permission requested\nTool: <code>{tool}</code>\nInput: {args}"
@@ -312,7 +331,8 @@ def event_to_messages(event: ClaudeEvent | McpPermissionRequest) -> list[Outboun
     * :class:`SystemInit`, :class:`UserTurn`, :class:`UnknownEvent` → ``[]``.
     """
     if isinstance(event, McpPermissionRequest):
-        return [_format_mcp_permission(event)]
+        msg = _format_mcp_permission(event)
+        return [msg] if msg is not None else []
     if isinstance(event, AssistantTurn):
         return _format_assistant_turn(event)
     if isinstance(event, ResultEvent):

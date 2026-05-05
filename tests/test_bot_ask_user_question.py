@@ -16,6 +16,7 @@ Coverage:
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -539,3 +540,226 @@ def test_ask_user_question_kb_shape_indexed_callbacks_under_64_bytes() -> None:
         assert row[0].text == label
         assert row[0].callback_data == data
         assert len(row[0].callback_data.encode("utf-8")) <= 64
+
+
+# --------------------------------------------------------------------------- #
+# CCR-028: real-claude AUQ trace produces ONLY the AUQ keyboard. The
+# permission gate envelope must never reach the broadcast loop.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_real_claude_trace_publishes_only_auq_keyboard_no_permission_prompt() -> None:  # noqa: PLR0915 — end-to-end harness covers four assertions in one trace
+    """Simulate the AssistantTurn-then-MCP sequence end-to-end through the broadcast loop.
+
+    Asserts:
+
+    1. ``bot.send_message`` is called EXACTLY once with a callback_data
+       starting with ``"auq:"`` (the AUQ keyboard for the AUQ tool_use).
+    2. ZERO calls have ``callback_data`` starting with ``"perm:"``.
+    3. The MCP Future is resolved with ``{"behavior": "deny",
+       "message": <chosen option>}`` after the user taps the AUQ button.
+    4. ``proc.send_user_turn`` was NOT called for the AUQ ``tool_use_id``
+       — the synthetic ``tool_result`` is claude's responsibility on
+       the deny path.
+    """
+    import asyncio
+    import contextlib
+    from datetime import UTC, datetime
+    from unittest.mock import AsyncMock as _AsyncMock
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from ccr.claude.events import AssistantTurn as _AssistantTurn
+    from ccr.claude.events import McpPermissionRequest
+    from ccr.claude.events import ToolUseBlock as _ToolUseBlock
+    from ccr.config import Settings
+    from ccr.db.engine import AsyncSessionMaker
+    from ccr.db.models import Base, PairedUser
+    from ccr.events import EventBus
+    from ccr.server import _broadcast_loop
+
+    # Ephemeral DB with one paired user. The broadcast loop reads
+    # ``PairedUser`` for the active chat id list.
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = AsyncSessionMaker(engine)
+    async with factory() as db:
+        db.add(
+            PairedUser(
+                tg_user_id=1,
+                tg_username="u1",
+                is_owner=True,
+                approved_at=datetime.now(UTC),
+                last_chat_id=1001,
+            ),
+        )
+        await db.commit()
+
+    bus = EventBus()
+    bot = _AsyncMock()
+    bot.send_message = _AsyncMock()
+
+    loop_task = asyncio.create_task(_broadcast_loop(bus, bot, factory))
+    # Yield so the broadcast loop's subscription is registered before publish.
+    await asyncio.sleep(0)
+
+    # Build a minimal SessionManager — we exercise its real
+    # _on_mcp_ask_user_question, _track_ask_user_question, and
+    # send_tool_result, but stub out proc.send_user_turn so we can assert
+    # it never fires. We bypass new_session(); the manager's MCP server
+    # is constructed in __init__ and that is all the suppressed-handler
+    # wiring needs.
+    from ccr.claude.manager import SessionManager
+
+    settings = Settings(
+        telegram_bot_token="dummy-token",  # type: ignore[arg-type]
+        public_url="http://localhost",  # type: ignore[arg-type]
+        jwt_secret="x" * 32,  # type: ignore[arg-type]
+        data_dir=Path("./data"),
+        claude_bin="/usr/bin/false",
+    )
+    manager = SessionManager(bus=bus, db_factory=factory, settings=settings)
+
+    # send_tool_result raises NoActiveSessionError when ``_proc is None``,
+    # so install a sentinel proc whose ``send_user_turn`` is a spy.
+    # If the legacy-path branch ever fires for an MCP-paired entry the
+    # spy would record it.
+    deliver_calls: list[tuple[str, str]] = []
+
+    class _StubProc:
+        async def send_user_turn(self, content: object) -> None:
+            deliver_calls.append(("send_user_turn", repr(content)))
+
+    manager._proc = _StubProc()  # type: ignore[assignment] # noqa: SLF001
+
+    full_id = "toolu_collision_aaabbb"
+    sid = uuid.UUID("22222222-2222-2222-2222-222222222222")
+    manager._mcp.set_current_session(sid)  # noqa: SLF001
+
+    # 1) Publish the AssistantTurn carrying the AUQ tool_use block. The
+    # broadcast loop renders the AUQ keyboard, and the manager's
+    # _track_ask_user_question registers the pending question.
+    auq_block = _ToolUseBlock(
+        type="tool_use",
+        id=full_id,
+        name="AskUserQuestion",
+        input={
+            "questions": [
+                {
+                    "question": "Pick a colour",
+                    "options": [{"label": "Red"}, {"label": "Blue"}],
+                },
+            ],
+        },
+    )
+    auq_event = _AssistantTurn.model_validate(
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [auq_block.model_dump()],
+            },
+        }
+    )
+    manager._track_ask_user_question(auq_event, sid)  # noqa: SLF001
+    await bus.publish(
+        "session.event",
+        {"session_id": sid, "seq": 0, "event": auq_event},
+    )
+
+    # 2) Drive the MCP suppressed-tool handler — equivalent to the
+    # real claude binary calling ccr_permission_prompt with
+    # tool_name=AskUserQuestion. The bus envelope is suppressed at
+    # source; if the suppression broke, an McpPermissionRequest would
+    # land on the bus and the broadcast loop would render a "perm:"
+    # keyboard.
+    mcp_request_id = "rid-real-1"
+    fut: asyncio.Future[dict[str, object]] = asyncio.get_running_loop().create_future()
+    manager._mcp._futures[mcp_request_id] = fut  # noqa: SLF001
+    manager._mcp._sessions[mcp_request_id] = sid  # noqa: SLF001
+    manager._mcp._inputs[mcp_request_id] = {}  # noqa: SLF001
+    await manager._on_mcp_ask_user_question(  # noqa: SLF001
+        mcp_request_id,
+        "AskUserQuestion",
+        {},
+    )
+
+    # The pending question now has the MCP request_id paired to it.
+    pending = manager._pending_questions[full_id]  # noqa: SLF001
+    assert pending.mcp_request_id == mcp_request_id
+    # Cancel the timeout task so we do not leak background work.
+    if pending.timeout_task is not None:
+        pending.timeout_task.cancel()
+
+    # 3) Wait for the broadcast loop to enqueue exactly the AUQ
+    # keyboard message. Two yields are enough for the bus->sender->bot
+    # chain to land but we poll defensively.
+    deadline = asyncio.get_running_loop().time() + 2.0
+    while bot.send_message.await_count < 1:
+        if asyncio.get_running_loop().time() > deadline:
+            msg = "broadcast loop never delivered an AUQ keyboard"
+            raise AssertionError(msg)
+        await asyncio.sleep(0.01)
+    # Drain a bit further in case a stray "perm:" call is racing —
+    # this also gives the suppression-at-source a chance to fail loudly.
+    await asyncio.sleep(0.05)
+
+    # 4) Tap the first AUQ option.
+    delivered = await manager.send_tool_result(full_id, "Red")
+    assert delivered is True
+
+    # === Assertions =====================================================
+
+    # (a) EXACTLY one outbound call, with reply_markup carrying an
+    # AUQ-prefixed callback_data. Zero perm-prefixed calls.
+    auq_calls = [
+        call for call in bot.send_message.await_args_list if _first_callback_prefix(call) == "auq"
+    ]
+    perm_calls = [
+        call for call in bot.send_message.await_args_list if _first_callback_prefix(call) == "perm"
+    ]
+    assert len(auq_calls) == 1, (
+        f"expected 1 AUQ keyboard, got {len(auq_calls)} (all calls: "
+        f"{bot.send_message.await_args_list})"
+    )
+    assert len(perm_calls) == 0, (
+        f"expected 0 permission-prompt keyboards, got {len(perm_calls)} (all calls: "
+        f"{bot.send_message.await_args_list})"
+    )
+
+    # (b) The MCP Future was resolved with deny+message.
+    assert fut.done()
+    assert fut.result() == {"behavior": "deny", "message": "Red"}
+
+    # (c) ``proc.send_user_turn`` was NEVER called for the AUQ
+    # tool_use_id — the legacy wire path is bypassed for MCP-paired
+    # entries; claude's harness writes the synthetic tool_result.
+    assert deliver_calls == []
+
+    # Sanity: no McpPermissionRequest ever landed on the bus path.
+    # (Implied by zero perm: calls above; pinned here for readability.)
+    for call in bot.send_message.await_args_list:
+        text = call.args[1] if len(call.args) > 1 else call.kwargs.get("text", "")
+        assert "Permission requested" not in text
+        assert McpPermissionRequest.__name__ not in text
+
+    loop_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await loop_task
+    await engine.dispose()
+
+
+def _first_callback_prefix(call: Any) -> str | None:
+    """Return the prefix (before ``:``) of the first inline-button callback_data, or None."""
+    reply_markup = call.kwargs.get("reply_markup")
+    if reply_markup is None or not hasattr(reply_markup, "inline_keyboard"):
+        return None
+    rows = reply_markup.inline_keyboard
+    if not rows or not rows[0]:
+        return None
+    data = getattr(rows[0][0], "callback_data", None)
+    if not isinstance(data, str) or ":" not in data:
+        return None
+    return data.split(":", 1)[0]

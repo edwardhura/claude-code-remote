@@ -903,3 +903,40 @@ Notes:
   - 2026-05-04 python-developer: READY FOR REVIEW — fix pass (regex broadened, regression test added)
   - 2026-05-04 reviewer: REVIEW PASS — F1 fully resolved, all 369 tests pass, 88.76% coverage
   - 2026-05-04 team-lead: approved
+
+---
+
+## CCR-028: AskUserQuestion / MCP permission gate collision [done]
+Phase: n/a (bugfix — chat-bot UX, follow-up to CCR-026)
+Feature: chat-bot
+Files:
+  - `src/ccr/claude/manager.py` — when an `AssistantTurn` carries a `tool_use` block with `name == "AskUserQuestion"`, suppress or auto-resolve the MCP permission gate for that `tool_use_id` so Claude Code's harness does not race with the AUQ handler. Likely path: in `_track_ask_user_question`, also pre-resolve the `McpPermissionRequest` future for the same `tool_use_id` (architect picks `allow + updatedInput` carrying the answer, vs. `deny` with our injection still working).
+  - `src/ccr/bot/formatting.py` — suppress the `McpPermissionRequest` chat broadcast when the request's `tool_name == "AskUserQuestion"`. The AUQ keyboard already covers the user-facing surface; a parallel "🛑 Permission requested" message is duplicate UX and racy.
+  - `tests/test_bot_ask_user_question.py` — extend with a test that simulates a real-Claude trace where `AskUserQuestion` arrives via `tool_use` AND `McpPermissionRequest` concurrently for the same `tool_use_id`; the bot must broadcast only the AUQ keyboard (no permission prompt), and the AUQ button tap must auto-resolve the MCP permission.
+  - `tests/test_session_manager.py` — add coverage for the auto-resolution path on teardown / on AUQ resolve.
+Out of scope:
+  - Other built-in tools that may also collide with the MCP permission gate — file separately if discovered.
+  - Editing the CCR-025 / CCR-026 plan files retroactively.
+  - Web-side AskUserQuestion surface.
+Acceptance:
+  - [x] In a real claude session, `AskUserQuestion` produces ONE chat surface (the AUQ keyboard), not two — no separate "🛑 Permission requested — Tool: AskUserQuestion" message.
+  - [x] Tapping an AUQ option resolves both the synthetic `tool_result` AND any pending MCP permission for the same `tool_use_id`.
+  - [ ] Claude receives the chosen answer and proceeds accordingly (verified by manual smoke at the end of review).
+  - [x] `pytest tests/test_bot_ask_user_question.py` passes.
+  - [x] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [ ] Manual smoke (unticked, not blocking review per CCR-020/CCR-021 precedent): real claude session triggers `AskUserQuestion`, user taps option, claude proceeds with the chosen answer (no "tool response came back empty").
+Depends on: CCR-026
+Notes:
+  Discovered during CCR-026 smoke test on 2026-05-05. Real claude routes built-in `AskUserQuestion` through the MCP permission tool channel, contradicting the CCR-026 architect plan's "orthogonal to `McpPermissionRequest`" assumption. The user-visible failure: the AUQ keyboard appears AND a separate "🛑 Permission requested" prompt appears for the same `tool_use_id`; tapping the option writes our synthetic `tool_result` to stdin, but Claude Code's harness — once permission is granted — also fulfils `AskUserQuestion` natively (in headless `-p` mode that fulfilment is empty). Claude sees the empty fulfilment win the race and reports "tool response came back empty".
+
+  The current behaviour is degraded but not broken: state is consistent, sessions don't crash, and Claude either re-asks or gracefully gives up. Filed as a follow-up rather than blocking the CCR-026 PR per Option B in the smoke-test triage.
+
+  Open questions for team-lead Mode 1A (likely needs the architect):
+    - Resolution shape: (a) pre-resolve the MCP permission with `allow + updatedInput` carrying the answer (does Claude Code honour `updatedInput` for built-in tools?), (b) `deny` the MCP permission and rely on our synthetic `tool_result` (does the harness still emit an empty fulfilment after deny?), or (c) silently noop on the MCP side and trust our `send_tool_result` injection — depends on a Step-0 probe of how the harness treats each path.
+    - Suppression decision: should the MCP permission broadcast be suppressed unconditionally for `AskUserQuestion`, or only when the AUQ handler has registered the `tool_use_id`? Consider race ordering between `AssistantTurn` arrival and `McpPermissionRequest` arrival.
+    - Generalisation: are there other built-in tools (e.g. plan-mode `ExitPlanMode`) that route through the same channel and need the same treatment? Likely yes — flag CCR-027 (plan-mode UX) as a related follow-up.
+
+### Review log
+  - 2026-05-05 main: branch ccr-028-auq-permission-collision created, dispatching team-lead
+  - 2026-05-05 team-lead: dispatching architect — three open design questions (MCP resolution shape, suppression race, generalisation) require a Step-0 probe and cross-cutting decisions across mcp.py, manager.py, and formatting.py
+  - 2026-05-05 team-lead: approved — 385 tests, 88.80% coverage, all 5 automated criteria verified; F1/F2 LOW noted (missing handler-exception test, redundant nullcheck) — non-blocking; manual smoke unticked per CCR-020/021/026 precedent
