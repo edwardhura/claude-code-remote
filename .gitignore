@@ -69,7 +69,7 @@ dmypy.json
 data/
 
 # Throwaway / diagnostic
-tmp/
+tmp
 
 # Claude
 .claude/worktrees/
