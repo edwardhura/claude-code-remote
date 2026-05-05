@@ -27,6 +27,7 @@ import asyncio
 import contextlib
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -70,6 +71,79 @@ _CRASH_REASON_TAIL_BYTES = 200
 # in older session logs. Both are accepted to be forward/backward compatible.
 _SUBAGENT_DISPATCH_TOOL_NAMES: frozenset[str] = frozenset({"Task", "Agent"})
 
+# CCR-026: name of the built-in tool whose tool_use blocks we capture as
+# interactive Telegram prompts. Tracked separately from
+# ``_SUBAGENT_DISPATCH_TOOL_NAMES`` — different lifecycle.
+_ASK_USER_QUESTION_TOOL_NAME = "AskUserQuestion"
+
+
+def _extract_ask_user_question_options(tool_input: dict[str, object]) -> list[str]:
+    """Pull discrete option labels out of an ``AskUserQuestion`` ``tool_input``.
+
+    The probed wire schema (CCR-026 Step-0) is::
+
+        {
+          "questions": [
+            {"question": "...", "header": "...", "multiSelect": false,
+             "options": [{"label": "red", "description": "..."}, ...]}
+          ]
+        }
+
+    Multiple ``questions`` are coalesced into a single decision: the bot
+    presents one keyboard / one prompt per ``tool_use_id`` so we expose the
+    options of the FIRST question. If the first question has no options
+    (or carries an empty list), this returns ``[]`` and the bot renders the
+    free-text path. Tolerates schema drift: anything that does not match
+    the probed shape — including the legacy guess of a flat ``options:
+    list[str]`` — falls through to the appropriate branch.
+    """
+    questions = tool_input.get("questions")
+    if isinstance(questions, list) and questions:
+        first = questions[0]
+        if isinstance(first, dict):
+            opts = first.get("options")
+            if isinstance(opts, list):
+                labels: list[str] = []
+                for entry in opts:
+                    if isinstance(entry, dict):
+                        label = entry.get("label")
+                        if isinstance(label, str) and label:
+                            labels.append(label)
+                    elif isinstance(entry, str) and entry:
+                        labels.append(entry)
+                return labels
+    # Fallback: flat ``options: list[str]`` (the original plan guess) /
+    # forward-compat with future schema changes.
+    flat = tool_input.get("options")
+    if isinstance(flat, list):
+        return [str(opt) for opt in flat if isinstance(opt, str) and opt]
+    return []
+
+
+@dataclass(slots=True)
+class _PendingQuestion:
+    """Per-question bookkeeping for an outstanding ``AskUserQuestion`` call.
+
+    Lifetime spans from the ``tool_use`` block being observed in
+    :meth:`SessionManager._consume_events` until either:
+
+    * a paired user replies (button tap, ``/answer``, or plain text) and
+      :meth:`SessionManager.send_tool_result` pops the entry; OR
+    * the timeout task fires and pops the entry; OR
+    * :meth:`SessionManager._teardown_locked` clears the dict.
+
+    ``options`` is the list of option labels (extracted from the probed
+    ``tool_input.questions[0].options[*].label`` schema). Empty list ⇒
+    free-text question. ``timeout_task`` is the ``asyncio.Task`` scheduled
+    to fire after ``settings.ask_user_question_timeout_seconds``; cancelled
+    on resolution and on teardown.
+    """
+
+    tool_use_id: str
+    session_id: uuid.UUID
+    options: list[str]
+    timeout_task: asyncio.Task[None] | None = None
+
 
 class SessionError(Exception):
     """Base error for :class:`SessionManager` operations."""
@@ -81,6 +155,16 @@ class NoActiveSessionError(SessionError):
 
 class StaleSessionError(SessionError):
     """Raised when a permission response targets a session that is no longer current."""
+
+
+class StaleToolUseError(SessionError):
+    """Raised when a tool_use_id is not registered in :attr:`_pending_questions`.
+
+    Reserved for internal assertions and future callers that prefer an
+    exception path. :meth:`SessionManager.send_tool_result` does NOT raise
+    this — it returns ``False`` for unknown ids, mirroring the
+    :meth:`SessionManager.resolve_permission` contract.
+    """
 
 
 class SessionAlreadyRunningError(SessionError):
@@ -157,6 +241,11 @@ class SessionManager:
         )
         self._mcp_started = False
 
+        # CCR-026 AskUserQuestion bookkeeping. Lifetime = current session;
+        # cleared in _teardown_locked. Maps ``tool_use_id`` (the full,
+        # opaque id supplied by Claude) to the per-question record.
+        self._pending_questions: dict[str, _PendingQuestion] = {}
+
     # ------------------------------------------------------------------ #
     # Public API.
     # ------------------------------------------------------------------ #
@@ -232,6 +321,7 @@ class SessionManager:
             self._running_subagents = {}
             self._skills = []
             self._rate_limit_status = None
+            self._pending_questions = {}
             self._mcp.set_current_session(session_id)
 
             now = datetime.now(UTC)
@@ -361,6 +451,7 @@ class SessionManager:
             self._running_subagents = {}
             self._skills = []
             self._rate_limit_status = None
+            self._pending_questions = {}
             self._mcp.set_current_session(session_id)
 
             now = datetime.now(UTC)
@@ -475,6 +566,99 @@ class SessionManager:
         return self._mcp.is_pending(request_id)
 
     # ------------------------------------------------------------------ #
+    # CCR-026: AskUserQuestion gate.
+    # ------------------------------------------------------------------ #
+
+    async def send_tool_result(
+        self,
+        tool_use_id: str,
+        content: str,
+        *,
+        is_error: bool = False,
+    ) -> bool:
+        """Feed a synthetic ``tool_result`` block back to the running session.
+
+        Atomically pops :attr:`_pending_questions[tool_use_id]` and cancels
+        its timeout task before writing — the pop is the single-shot
+        resolution guard against concurrent button taps / ``/answer``
+        races.
+
+        Returns ``True`` if THIS call delivered (the id was registered);
+        ``False`` if the id was unknown / already resolved / the session
+        crashed mid-flight (``RuntimeError`` from
+        :meth:`ClaudeProcess.send_user_turn`). The bot maps ``False`` to
+        the canned ``"Stale prompt"`` alert — same shape as
+        :meth:`resolve_permission`.
+
+        Wire path: builds a single ``ToolResultBlock`` and reuses
+        :meth:`ClaudeProcess.send_user_turn` — no new low-level write
+        method on :class:`ClaudeProcess`.
+
+        Raises :class:`NoActiveSessionError` when no Claude subprocess is
+        held (caller bug — same precondition as :meth:`send`).
+        """
+        if self._proc is None:
+            message = "No active session."
+            raise NoActiveSessionError(message)
+
+        pending = self._pending_questions.pop(tool_use_id, None)
+        if pending is None:
+            return False
+        if pending.timeout_task is not None and not pending.timeout_task.done():
+            pending.timeout_task.cancel()
+
+        try:
+            await self._deliver_tool_result(tool_use_id, content, is_error=is_error)
+        except RuntimeError as exc:
+            log.warning(
+                "session_manager.send_tool_result_failed",
+                tool_use_id=tool_use_id,
+                error=str(exc),
+            )
+            return False
+        return True
+
+    def is_question_pending(self, tool_use_id: str) -> bool:
+        """Return ``True`` iff a question is registered and unresolved."""
+        return tool_use_id in self._pending_questions
+
+    def question_options(self, tool_use_id: str) -> list[str] | None:
+        """Return the option list carried by the question, or ``None`` if unknown.
+
+        Used by the bot's ``cb_ask_user_question`` to translate a
+        button-index callback into the option text fed back to claude.
+        Returns an empty list for free-text questions (which carry no
+        button keyboard); the bot's callback handler should never run on
+        those because the keyboard is not built.
+        """
+        pending = self._pending_questions.get(tool_use_id)
+        if pending is None:
+            return None
+        return list(pending.options)
+
+    def outstanding_free_text_questions(self) -> list[str]:
+        """Return the ``tool_use_id`` of every outstanding free-text question.
+
+        "Free-text" = registered with an empty ``options`` list. Used by
+        the plain-text aiogram filter to decide whether to claim the
+        message — the filter requires exactly one entry to fire.
+        """
+        return [q.tool_use_id for q in self._pending_questions.values() if not q.options]
+
+    def question_id_by_prefix(self, id_prefix: str) -> str | None:
+        """Resolve an 8-hex-prefix to the full ``tool_use_id``.
+
+        Returns ``None`` on zero matches OR ≥2 matches (collision). The
+        same disambiguation pattern as
+        :meth:`_db_lookup_session_by_prefix`. The bot's ``/answer``
+        handler maps ``None`` to ``"Stale prompt"``.
+        """
+        matches = [tid for tid in self._pending_questions if tid.startswith(id_prefix)]
+        if len(matches) != 1:
+            return None
+        return matches[0]
+
+    # ------------------------------------------------------------------ #
     # Internals.
     # ------------------------------------------------------------------ #
 
@@ -510,6 +694,15 @@ class SessionManager:
         # than a hung MCP socket.
         await self._mcp.cancel_pending(session_id)
         self._mcp.set_current_session(None)
+
+        # CCR-026: cancel every outstanding AskUserQuestion timeout task
+        # and drop the bookkeeping. We do NOT send synthetic
+        # ``tool_result`` blocks back here — the subprocess is being torn
+        # down anyway and the unanswered question dies with it.
+        for pending in self._pending_questions.values():
+            if pending.timeout_task is not None and not pending.timeout_task.done():
+                pending.timeout_task.cancel()
+        self._pending_questions = {}
 
         await proc.stop()
 
@@ -574,6 +767,7 @@ class SessionManager:
                     self._rate_limit_status = event
 
                 self._track_subagents(event)
+                self._track_ask_user_question(event, session_id)
 
                 self._schedule_last_event_at_update(session_id)
         except asyncio.CancelledError:
@@ -604,6 +798,105 @@ class SessionManager:
                 for block in content:
                     if isinstance(block, ToolResultBlock):
                         self._running_subagents.pop(block.tool_use_id, None)
+
+    def _track_ask_user_question(self, event: object, session_id: uuid.UUID) -> None:
+        """Register every ``AskUserQuestion`` ``tool_use`` block in ``event``.
+
+        Walks :attr:`AssistantTurn.message.content` looking for blocks
+        with ``name == "AskUserQuestion"`` (kept as a parallel walk to
+        :meth:`_track_subagents` so future changes to one do not drag the
+        other). For each match, creates a :class:`_PendingQuestion` and
+        schedules its timeout task via :meth:`_schedule_question_timeout`.
+
+        Idempotency: if the same ``tool_use_id`` is observed twice
+        (impossible in normal operation but cheap to guard), the second
+        observation is ignored — the first wins and its timeout task
+        keeps running.
+        """
+        if not isinstance(event, AssistantTurn):
+            return
+        for block in event.message.content:
+            if not isinstance(block, ToolUseBlock):
+                continue
+            if block.name != _ASK_USER_QUESTION_TOOL_NAME:
+                continue
+            if block.id in self._pending_questions:
+                continue
+            options = _extract_ask_user_question_options(block.input)
+            pending = _PendingQuestion(
+                tool_use_id=block.id,
+                session_id=session_id,
+                options=options,
+                timeout_task=None,
+            )
+            self._pending_questions[block.id] = pending
+            self._schedule_question_timeout(pending)
+
+    def _schedule_question_timeout(self, pending: _PendingQuestion) -> None:
+        """Schedule the per-question timeout fail-safe.
+
+        On fire, the task pops the entry from :attr:`_pending_questions`
+        directly and writes an ``is_error=True`` ``tool_result`` via the
+        private :meth:`_deliver_tool_result` helper. We do NOT call
+        :meth:`send_tool_result` from the timeout because that would
+        race with a successful concurrent reply (both would attempt the
+        same pop; the loser would no-op silently while the winner has
+        already written the answer).
+        """
+        deadline = float(self._settings.ask_user_question_timeout_seconds)
+        pending.timeout_task = asyncio.create_task(
+            self._handle_question_timeout(pending.tool_use_id, deadline),
+            name=f"auq-timeout-{pending.tool_use_id}",
+        )
+
+    async def _handle_question_timeout(self, tool_use_id: str, deadline: float) -> None:
+        """Fire-on-deadline handler for an outstanding ``AskUserQuestion``."""
+        try:
+            await asyncio.sleep(deadline)
+        except asyncio.CancelledError:
+            return
+        pending = self._pending_questions.pop(tool_use_id, None)
+        if pending is None:
+            return
+        log.warning(
+            "session_manager.ask_user_question_timeout",
+            tool_use_id=tool_use_id,
+            timeout_seconds=deadline,
+        )
+        message = f"Timed out — no paired user responded within {int(deadline)}s"
+        try:
+            await self._deliver_tool_result(tool_use_id, message, is_error=True)
+        except (RuntimeError, NoActiveSessionError) as exc:
+            log.warning(
+                "session_manager.ask_user_question_timeout_send_failed",
+                tool_use_id=tool_use_id,
+                error=str(exc),
+            )
+
+    async def _deliver_tool_result(
+        self,
+        tool_use_id: str,
+        content: str,
+        *,
+        is_error: bool,
+    ) -> None:
+        """Write a synthetic ``tool_result`` user-turn to the live subprocess.
+
+        Does NOT touch :attr:`_pending_questions` — callers must pop the
+        entry themselves before calling this. Both
+        :meth:`send_tool_result` and the timeout task pop first; this
+        helper only handles the wire-level write.
+        """
+        if self._proc is None:
+            message = "No active session."
+            raise NoActiveSessionError(message)
+        block = ToolResultBlock(
+            type="tool_result",
+            tool_use_id=tool_use_id,
+            content=content,
+            is_error=is_error,
+        )
+        await self._proc.send_user_turn([block])
 
     def _schedule_last_event_at_update(self, session_id: uuid.UUID) -> None:
         """Debounce ``last_event_at`` writes to ≤ 1 per second, fire-and-forget."""
@@ -896,4 +1189,5 @@ __all__ = [
     "SessionManager",
     "SessionNotFoundError",
     "StaleSessionError",
+    "StaleToolUseError",
 ]

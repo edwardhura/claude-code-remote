@@ -22,7 +22,7 @@ from sqlalchemy import select
 
 from ccr.bot.app import run_polling
 from ccr.bot.formatting import OutboundMessage, _PendingKeyboard, event_to_messages
-from ccr.bot.keyboards import permission_kb
+from ccr.bot.keyboards import ask_user_question_kb, permission_kb
 from ccr.bot.typing import TypingKeepalive
 from ccr.claude.events import ResultEvent
 from ccr.claude.manager import SessionManager
@@ -135,14 +135,18 @@ def _materialise_keyboards(
     """Swap :class:`_PendingKeyboard` sentinels for real ``InlineKeyboardMarkup``.
 
     The formatter has no access to the live ``session_id``; this loop is
-    where ``permission_kb(session_id, request_id, options)`` runs.
+    where ``permission_kb`` / ``ask_user_question_kb`` run. Dispatch is
+    on :attr:`_PendingKeyboard.kind` (``"perm"`` for CCR-025 callsites,
+    ``"auq"`` for CCR-026 AskUserQuestion blocks).
     """
     out: list[OutboundMessage] = []
     for text, slot in messages:
         if isinstance(slot, _PendingKeyboard):
-            out.append(
-                (text, permission_kb(session_id, slot.request_id, slot.options)),
-            )
+            if slot.kind == "auq":
+                kb = ask_user_question_kb(session_id, slot.request_id, slot.options)
+            else:
+                kb = permission_kb(session_id, slot.request_id, slot.options)
+            out.append((text, kb))
         else:
             out.append((text, slot))
     return out

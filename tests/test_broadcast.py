@@ -266,6 +266,74 @@ async def test_broadcast_skips_events_with_no_messages(
         await loop_task
 
 
+async def test_broadcast_renders_auq_keyboard_via_ask_user_question_kb(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An ``AssistantTurn`` carrying an ``AskUserQuestion`` block produces an auq keyboard."""
+    from aiogram.types import InlineKeyboardMarkup
+
+    from ccr.claude.events import ToolUseBlock
+
+    await _seed_user(session_factory, tg_user_id=1, last_chat_id=1001, is_owner=True)
+
+    bus = EventBus()
+    bot = AsyncMock()
+    bot.send_message = AsyncMock()
+
+    loop_task = asyncio.create_task(_broadcast_loop(bus, bot, session_factory))
+    await asyncio.sleep(0)
+
+    full_id = "toolu_qqqqaaaa11112222"
+    event = AssistantTurn.model_validate(
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    ToolUseBlock(
+                        type="tool_use",
+                        id=full_id,
+                        name="AskUserQuestion",
+                        input={
+                            "questions": [
+                                {
+                                    "question": "Pick one",
+                                    "options": [
+                                        {"label": "red"},
+                                        {"label": "blue"},
+                                        {"label": "green"},
+                                    ],
+                                },
+                            ],
+                        },
+                    ).model_dump(),
+                ],
+            },
+        }
+    )
+    await bus.publish(
+        "session.event",
+        {"session_id": _SESSION_ID, "seq": 0, "event": event},
+    )
+    await _wait_for_call_count(bot.send_message, 1)
+
+    call = bot.send_message.await_args_list[0]
+    kb = call.kwargs.get("reply_markup")
+    assert isinstance(kb, InlineKeyboardMarkup)
+    callbacks = [btn.callback_data for row in kb.inline_keyboard for btn in row]
+    # Every button's callback_data is the auq prefix routed to the index.
+    assert all(cb.startswith("auq:") for cb in callbacks)
+    assert len(callbacks) == 3
+    # The 8-hex prefix of the tool_use_id flows through the sentinel.
+    assert all(f":{full_id[:8]}:" in cb for cb in callbacks)
+    # NOT a permission keyboard.
+    assert not any(cb.startswith("perm:") for cb in callbacks)
+
+    loop_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await loop_task
+
+
 async def test_broadcast_renders_mcp_permission_request_with_keyboard(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

@@ -24,6 +24,7 @@ from ccr.claude.manager import (
     SessionError,
     SessionManager,
     StaleSessionError,
+    StaleToolUseError,
 )
 from ccr.claude.mcp import McpPermissionServer, McpServerStartError
 from ccr.claude.state import SessionStatus
@@ -40,4 +41,5 @@ __all__ = [
     "SessionManager",
     "SessionStatus",
     "StaleSessionError",
+    "StaleToolUseError",
 ]

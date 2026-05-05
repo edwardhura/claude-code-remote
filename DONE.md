@@ -862,3 +862,44 @@ Notes:
   - 2026-05-04 team-lead: dispatching architect — rate_limit_event field shape unknown; outcome 1 design call (in-memory state vs JSONL aggregator) spans events.py + manager.py + usage.py
   - 2026-05-04 team-lead: plan reviewed (.claude/plans/CCR-032-usage-command.md), dispatching python-developer
   - 2026-05-04 team-lead: approved
+---
+
+## CCR-026: AskUserQuestion handler (deferred) [done]
+Phase: n/a (deferred — post-MCP UX)
+Feature: chat-bot
+Files:
+  - `src/ccr/bot/formatting.py` — extend `event_to_messages` to recognise `tool_use` content blocks where `name == "AskUserQuestion"`. Render the question (and any `options` carried in `tool_input`) as a chat message; if discrete options are present, build an inline keyboard, otherwise instruct the user to reply via `/answer` (or developer's-call equivalent).
+  - `src/ccr/bot/handlers/ask_user_question.py` (new) — collects the typed reply (or button tap) from any paired user, correlates it with the originating `tool_use_id`, and feeds it back to claude as a synthetic `tool_result` content block via `SessionManager`.
+  - `src/ccr/claude/manager.py` — new `async send_tool_result(tool_use_id: str, content: str | dict, *, is_error: bool = False) -> None` (or developer's-call equivalent) that constructs a properly-shaped `user`-turn message containing a `tool_result` block and submits it to claude via stdin. Track outstanding `tool_use_id`s so the bot can validate stale replies.
+  - `tests/test_bot_ask_user_question.py` (new) — fake `tool_use` event with `name == "AskUserQuestion"` → bot publishes a question + keyboard / prompt; simulated reply → `send_tool_result` called with the correct `tool_use_id` and content; stale reply rejected; concurrent questions handled (or documented as one-at-a-time per architect's call).
+  - Manual smoke (documented but unticked): a real claude session that uses `AskUserQuestion`, surfaced in Telegram, answered, and resumed.
+Out of scope:
+  - Plan-mode UX (CCR-027 — separate ticket).
+  - Per-session question UI in the web viewer.
+  - Web-side answer surface (Telegram-only for now).
+  - Persisting question history across sessions.
+Acceptance:
+  - [x] `/ask` (or whatever the bot reply surface settles on) renders the AskUserQuestion text + options to all paired chats with `last_chat_id`.
+  - [x] Any paired user can reply (typed or button tap) and the answer is fed back to claude as a `tool_result` for the originating `tool_use_id`.
+  - [x] Stale or unknown `tool_use_id` replies are rejected with a clear canned message.
+  - [x] `pytest tests/test_bot_ask_user_question.py` passes.
+  - [x] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [ ] Manual smoke (unticked, not blocking review per CCR-020/CCR-021 precedent): real claude session with `AskUserQuestion` triggers a Telegram prompt, the user answers, claude proceeds.
+Depends on: CCR-025
+Notes:
+  Phase n/a in the plan — post-CCR-025 UX work in the chat-bot cluster.
+  **Priority: deferred — pick up after the chat bot is stable.** This ticket is filed now to capture scope but should NOT be picked by `/implement-ticket` ahead of higher-value work. The chat-bot-first-iteration push prioritizes CCR-024 → CCR-025 → CCR-022 → CCR-023 ahead of this.
+  Claude's built-in `AskUserQuestion` tool surfaces as a normal `tool_use` event in the JSONL stream (NOT a permission event — orthogonal to the MCP gating channel CCR-025 builds). The handler shape is: recognise `tool_use` events with `name == "AskUserQuestion"`, broadcast the question, collect a typed reply or button tap from any paired user, feed it back to claude as a synthetic `tool_result` for the originating `tool_use_id`.
+  Why depends on CCR-025: CCR-025 settles the bus + chat-broadcast surface for prompt-style interactions (the inline-button rendering, the resolve-via-Future pattern, the timeout policy). This ticket reuses that scaffolding rather than re-litigating it.
+  Open questions for team-lead Mode 1A (probably needs the architect): how to correlate typed replies back to the originating `tool_use_id` (a generic `/answer <id> <text>` command? a "reply-to" UX? per-question button only?); how to handle multiple concurrent AskUserQuestion calls (claude can fire several in a turn); whether to time out stale questions and what to send back to claude in that case.
+
+### Review log
+  - 2026-05-04 main: branch ccr-026-ask-user-question created, dispatching team-lead
+  - 2026-05-04 team-lead: dispatching architect — three unresolved design questions (typed-reply correlation, concurrent question handling, send_tool_result timeout/error shape) require architecture decisions before developer work begins
+  - 2026-05-04 team-lead: plan reviewed (.claude/plans/CCR-026-ask-user-question.md), dispatching python-developer
+  - 2026-05-04 python-developer: READY FOR REVIEW — first pass (33 new test cases + 17 modifications, Step-0 probe revealed nested `questions` schema, adapted)
+  - 2026-05-04 reviewer: REVIEW FAIL — F1 /answer regex rejects real tool_use_id prefix (toulu_01...)
+  - 2026-05-04 team-lead: dispatching python-developer fix — _HEX8_RE -> _ID8_RE, regression test
+  - 2026-05-04 python-developer: READY FOR REVIEW — fix pass (regex broadened, regression test added)
+  - 2026-05-04 reviewer: REVIEW PASS — F1 fully resolved, all 369 tests pass, 88.76% coverage
+  - 2026-05-04 team-lead: approved

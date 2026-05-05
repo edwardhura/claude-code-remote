@@ -13,38 +13,6 @@ only flip status in the title or move the entry to `DONE.md`.
 
 ---
 
-## CCR-026: AskUserQuestion handler (deferred) [todo]
-Phase: n/a (deferred — post-MCP UX)
-Feature: chat-bot
-Files:
-  - `src/ccr/bot/formatting.py` — extend `event_to_messages` to recognise `tool_use` content blocks where `name == "AskUserQuestion"`. Render the question (and any `options` carried in `tool_input`) as a chat message; if discrete options are present, build an inline keyboard, otherwise instruct the user to reply via `/answer` (or developer's-call equivalent).
-  - `src/ccr/bot/handlers/ask_user_question.py` (new) — collects the typed reply (or button tap) from any paired user, correlates it with the originating `tool_use_id`, and feeds it back to claude as a synthetic `tool_result` content block via `SessionManager`.
-  - `src/ccr/claude/manager.py` — new `async send_tool_result(tool_use_id: str, content: str | dict, *, is_error: bool = False) -> None` (or developer's-call equivalent) that constructs a properly-shaped `user`-turn message containing a `tool_result` block and submits it to claude via stdin. Track outstanding `tool_use_id`s so the bot can validate stale replies.
-  - `tests/test_bot_ask_user_question.py` (new) — fake `tool_use` event with `name == "AskUserQuestion"` → bot publishes a question + keyboard / prompt; simulated reply → `send_tool_result` called with the correct `tool_use_id` and content; stale reply rejected; concurrent questions handled (or documented as one-at-a-time per architect's call).
-  - Manual smoke (documented but unticked): a real claude session that uses `AskUserQuestion`, surfaced in Telegram, answered, and resumed.
-Out of scope:
-  - Plan-mode UX (CCR-027 — separate ticket).
-  - Per-session question UI in the web viewer.
-  - Web-side answer surface (Telegram-only for now).
-  - Persisting question history across sessions.
-Acceptance:
-  - [ ] `/ask` (or whatever the bot reply surface settles on) renders the AskUserQuestion text + options to all paired chats with `last_chat_id`.
-  - [ ] Any paired user can reply (typed or button tap) and the answer is fed back to claude as a `tool_result` for the originating `tool_use_id`.
-  - [ ] Stale or unknown `tool_use_id` replies are rejected with a clear canned message.
-  - [ ] `pytest tests/test_bot_ask_user_question.py` passes.
-  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
-  - [ ] Manual smoke (unticked, not blocking review per CCR-020/CCR-021 precedent): real claude session with `AskUserQuestion` triggers a Telegram prompt, the user answers, claude proceeds.
-Depends on: CCR-025
-Notes:
-  Phase n/a in the plan — post-CCR-025 UX work in the chat-bot cluster.
-  **Priority: deferred — pick up after the chat bot is stable.** This ticket is filed now to capture scope but should NOT be picked by `/implement-ticket` ahead of higher-value work. The chat-bot-first-iteration push prioritizes CCR-024 → CCR-025 → CCR-022 → CCR-023 ahead of this.
-  Claude's built-in `AskUserQuestion` tool surfaces as a normal `tool_use` event in the JSONL stream (NOT a permission event — orthogonal to the MCP gating channel CCR-025 builds). The handler shape is: recognise `tool_use` events with `name == "AskUserQuestion"`, broadcast the question, collect a typed reply or button tap from any paired user, feed it back to claude as a synthetic `tool_result` for the originating `tool_use_id`.
-  Why depends on CCR-025: CCR-025 settles the bus + chat-broadcast surface for prompt-style interactions (the inline-button rendering, the resolve-via-Future pattern, the timeout policy). This ticket reuses that scaffolding rather than re-litigating it.
-  Open questions for team-lead Mode 1A (probably needs the architect): how to correlate typed replies back to the originating `tool_use_id` (a generic `/answer <id> <text>` command? a "reply-to" UX? per-question button only?); how to handle multiple concurrent AskUserQuestion calls (claude can fire several in a turn); whether to time out stale questions and what to send back to claude in that case.
-
-### Review log
----
-
 ## CCR-027: Plan-mode UX (deferred) [todo]
 Phase: n/a (deferred — post-MCP UX)
 Feature: chat-bot
@@ -325,3 +293,37 @@ Notes:
 ### Review log
   - 2026-05-01 main: Step 0 probe executed against claude v2.1.123 from a fresh /tmp cwd; outcome (c) confirmed — `claude -p` emits ZERO `permission_request` events on stdout (types seen: system, rate_limit_event, assistant, user, result; `permission_denials: []`; init shows `permissionMode: "default"`; stderr empty; exit 0). Built-in permission gating in non-interactive mode is wired via `--permission-prompt-tool <mcp_tool>`, not via stdin/stdout JSONL. Probe transcript: tmp/ccr-021-probe-1777590778.jsonl; summary: tmp/ccr-021-probe-1777590778.summary.txt.
   - 2026-05-01 main: marked [blocked] — schema reconciliation work in this ticket is moot (no schema to reconcile to); supersedes filed as CCR-024 (remove dead permission code from CCR-009) and CCR-025 (MCP permission-prompt-tool integration). This ticket stays open as a tracking pin until CCR-025 lands; revisit if upstream Claude `-p` ever exposes a stdout permission channel.
+---
+
+## CCR-028: AskUserQuestion / MCP permission gate collision [todo]
+Phase: n/a (bugfix — chat-bot UX, follow-up to CCR-026)
+Feature: chat-bot
+Files:
+  - `src/ccr/claude/manager.py` — when an `AssistantTurn` carries a `tool_use` block with `name == "AskUserQuestion"`, suppress or auto-resolve the MCP permission gate for that `tool_use_id` so Claude Code's harness does not race with the AUQ handler. Likely path: in `_track_ask_user_question`, also pre-resolve the `McpPermissionRequest` future for the same `tool_use_id` (architect picks `allow + updatedInput` carrying the answer, vs. `deny` with our injection still working).
+  - `src/ccr/bot/formatting.py` — suppress the `McpPermissionRequest` chat broadcast when the request's `tool_name == "AskUserQuestion"`. The AUQ keyboard already covers the user-facing surface; a parallel "🛑 Permission requested" message is duplicate UX and racy.
+  - `tests/test_bot_ask_user_question.py` — extend with a test that simulates a real-Claude trace where `AskUserQuestion` arrives via `tool_use` AND `McpPermissionRequest` concurrently for the same `tool_use_id`; the bot must broadcast only the AUQ keyboard (no permission prompt), and the AUQ button tap must auto-resolve the MCP permission.
+  - `tests/test_session_manager.py` — add coverage for the auto-resolution path on teardown / on AUQ resolve.
+Out of scope:
+  - Other built-in tools that may also collide with the MCP permission gate — file separately if discovered.
+  - Editing the CCR-025 / CCR-026 plan files retroactively.
+  - Web-side AskUserQuestion surface.
+Acceptance:
+  - [ ] In a real claude session, `AskUserQuestion` produces ONE chat surface (the AUQ keyboard), not two — no separate "🛑 Permission requested — Tool: AskUserQuestion" message.
+  - [ ] Tapping an AUQ option resolves both the synthetic `tool_result` AND any pending MCP permission for the same `tool_use_id`.
+  - [ ] Claude receives the chosen answer and proceeds accordingly (verified by manual smoke at the end of review).
+  - [ ] `pytest tests/test_bot_ask_user_question.py` passes.
+  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [ ] Manual smoke (unticked, not blocking review per CCR-020/CCR-021 precedent): real claude session triggers `AskUserQuestion`, user taps option, claude proceeds with the chosen answer (no "tool response came back empty").
+Depends on: CCR-026
+Notes:
+  Discovered during CCR-026 smoke test on 2026-05-05. Real claude routes built-in `AskUserQuestion` through the MCP permission tool channel, contradicting the CCR-026 architect plan's "orthogonal to `McpPermissionRequest`" assumption. The user-visible failure: the AUQ keyboard appears AND a separate "🛑 Permission requested" prompt appears for the same `tool_use_id`; tapping the option writes our synthetic `tool_result` to stdin, but Claude Code's harness — once permission is granted — also fulfils `AskUserQuestion` natively (in headless `-p` mode that fulfilment is empty). Claude sees the empty fulfilment win the race and reports "tool response came back empty".
+
+  The current behaviour is degraded but not broken: state is consistent, sessions don't crash, and Claude either re-asks or gracefully gives up. Filed as a follow-up rather than blocking the CCR-026 PR per Option B in the smoke-test triage.
+
+  Open questions for team-lead Mode 1A (likely needs the architect):
+    - Resolution shape: (a) pre-resolve the MCP permission with `allow + updatedInput` carrying the answer (does Claude Code honour `updatedInput` for built-in tools?), (b) `deny` the MCP permission and rely on our synthetic `tool_result` (does the harness still emit an empty fulfilment after deny?), or (c) silently noop on the MCP side and trust our `send_tool_result` injection — depends on a Step-0 probe of how the harness treats each path.
+    - Suppression decision: should the MCP permission broadcast be suppressed unconditionally for `AskUserQuestion`, or only when the AUQ handler has registered the `tool_use_id`? Consider race ordering between `AssistantTurn` arrival and `McpPermissionRequest` arrival.
+    - Generalisation: are there other built-in tools (e.g. plan-mode `ExitPlanMode`) that route through the same channel and need the same treatment? Likely yes — flag CCR-027 (plan-mode UX) as a related follow-up.
+
+### Review log
+---

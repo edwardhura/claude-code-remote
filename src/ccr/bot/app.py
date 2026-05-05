@@ -18,6 +18,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
+from ccr.bot.handlers.ask_user_question import router as ask_user_question_router
 from ccr.bot.handlers.pairing import router as pairing_router
 from ccr.bot.handlers.passthrough import router as passthrough_router
 from ccr.bot.handlers.permission import router as permission_router
@@ -51,6 +52,11 @@ def build_dispatcher(
     dp.callback_query.middleware(middleware)
 
     dp.include_router(pairing_router)
+    # CCR-026: ask_user_question_router must run BEFORE session_router so
+    # the conditional plain-text-claim filter resolves before
+    # ``session.handle_text``'s catch-all (`F.text & ~F.text.startswith("/")`)
+    # would otherwise consume the message.
+    dp.include_router(ask_user_question_router)
     dp.include_router(session_router)
     dp.include_router(permission_router)
     dp.include_router(passthrough_router)

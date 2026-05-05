@@ -293,3 +293,143 @@ def test_long_text_event_yields_multiple_chunks_under_limit() -> None:
     for text, kb in out:
         assert kb is None
         assert len(text) <= TELEGRAM_HARD_LIMIT
+
+
+# --------------------------------------------------------------------------- #
+# CCR-026: AskUserQuestion rendering inside an AssistantTurn.
+# --------------------------------------------------------------------------- #
+
+
+def test_assistant_turn_with_ask_user_question_options_renders_keyboard_sentinel() -> None:
+    """Probed schema with options → _PendingKeyboard(kind='auq', request_id=id8, options=labels)."""
+    from ccr.bot.formatting import _PendingKeyboard
+
+    full_id = "toolu_aaaabbbbccccdddd"
+    block = ToolUseBlock(
+        type="tool_use",
+        id=full_id,
+        name="AskUserQuestion",
+        input={
+            "questions": [
+                {
+                    "question": "Pick a colour",
+                    "header": "colour",
+                    "multiSelect": False,
+                    "options": [
+                        {"label": "red", "description": "rouge"},
+                        {"label": "blue", "description": "blue"},
+                    ],
+                },
+            ],
+        },
+    )
+    event = _assistant_with([block])
+    out = event_to_messages(event)
+    assert len(out) == 1
+    text, kb = out[0]
+    assert "Pick a colour" in text
+    assert isinstance(kb, _PendingKeyboard)
+    assert kb.kind == "auq"
+    assert kb.request_id == full_id[:8]
+    assert kb.options == ["red", "blue"]
+
+
+def test_assistant_turn_with_ask_user_question_no_options_renders_text_only() -> None:
+    """Free-text question (empty options) → text + /answer hint, no sentinel."""
+    block = ToolUseBlock(
+        type="tool_use",
+        id="toolu_freetext_aaaabbbb",
+        name="AskUserQuestion",
+        input={
+            "questions": [
+                {
+                    "question": "What name should I use?",
+                    "options": [],
+                },
+            ],
+        },
+    )
+    event = _assistant_with([block])
+    out = event_to_messages(event)
+    assert len(out) == 1
+    text, kb = out[0]
+    assert kb is None
+    assert "What name should I use?" in text
+    assert "/answer" in text
+    assert "toolu_fr" in text  # the 8-hex prefix appears in the hint
+
+
+def test_assistant_turn_with_ask_user_question_html_escapes_question_and_options() -> None:
+    """HTML-escape the question text and ensure options arrive verbatim in the sentinel."""
+    from ccr.bot.formatting import _PendingKeyboard
+
+    block = ToolUseBlock(
+        type="tool_use",
+        id="toolu_evilevil00000000",
+        name="AskUserQuestion",
+        input={
+            "questions": [
+                {
+                    "question": "<script>alert(1)</script>",
+                    "options": [{"label": "A & B"}, {"label": "C"}],
+                },
+            ],
+        },
+    )
+    event = _assistant_with([block])
+    out = event_to_messages(event)
+    assert len(out) == 1
+    text, kb = out[0]
+    assert "<script>" not in text
+    assert "&lt;script&gt;" in text
+    # Options are kept as plain strings inside the sentinel; the
+    # broadcast loop hands them to the keyboard builder which uses them
+    # as button labels (Telegram does not run HTML on button labels).
+    assert isinstance(kb, _PendingKeyboard)
+    assert kb.options == ["A & B", "C"]
+
+
+def test_assistant_turn_with_ask_user_question_empty_input_falls_back() -> None:
+    """tool_input={} → fallback text and free-text path."""
+    block = ToolUseBlock(
+        type="tool_use",
+        id="toolu_emptyempty0000",
+        name="AskUserQuestion",
+        input={},
+    )
+    event = _assistant_with([block])
+    out = event_to_messages(event)
+    assert len(out) == 1
+    text, kb = out[0]
+    assert kb is None
+    assert "(no question text)" in text
+
+
+def test_assistant_turn_mixed_blocks_keeps_other_tool_uses_unchanged() -> None:
+    """Text + AskUserQuestion + Bash tool_use → 3 outbound entries in order."""
+    from ccr.bot.formatting import _PendingKeyboard
+
+    blocks = [
+        TextBlock(type="text", text="thinking..."),
+        ToolUseBlock(
+            type="tool_use",
+            id="toolu_q_aaaabbbb",
+            name="AskUserQuestion",
+            input={"questions": [{"question": "?", "options": [{"label": "x"}]}]},
+        ),
+        ToolUseBlock(
+            type="tool_use",
+            id="toolu_bash_001",
+            name="Bash",
+            input={"command": "ls"},
+        ),
+    ]
+    event = _assistant_with(blocks)
+    out = event_to_messages(event)
+    assert len(out) == 3
+    assert out[0][0] == "thinking..."
+    assert out[0][1] is None
+    assert isinstance(out[1][1], _PendingKeyboard)
+    assert out[1][1].kind == "auq"
+    assert out[2][0].startswith("\U0001f527 Bash")
+    assert out[2][1] is None
