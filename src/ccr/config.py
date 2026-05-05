@@ -64,6 +64,7 @@ class Settings(BaseSettings):
     pairing_code_ttl_seconds: int = 900
     subprocess_grace_kill_seconds: int = 5
     mcp_permission_timeout_seconds: int = 120
+    ask_user_question_timeout_seconds: int = 600
     permission_mode: Literal["default", "acceptEdits", "plan", "bypassPermissions"] | None = None
     allowed_tools: Annotated[list[str], NoDecode] = []
     disallowed_tools: Annotated[list[str], NoDecode] = []
@@ -106,6 +107,17 @@ class Settings(BaseSettings):
         if not MCP_TIMEOUT_MIN <= value <= MCP_TIMEOUT_MAX:
             message = (
                 f"MCP_PERMISSION_TIMEOUT_SECONDS must be between "
+                f"{MCP_TIMEOUT_MIN} and {MCP_TIMEOUT_MAX} (got {value})."
+            )
+            raise ValueError(message)
+        return value
+
+    @field_validator("ask_user_question_timeout_seconds")
+    @classmethod
+    def _ask_user_question_timeout_in_range(cls, value: int) -> int:
+        if not MCP_TIMEOUT_MIN <= value <= MCP_TIMEOUT_MAX:
+            message = (
+                f"ASK_USER_QUESTION_TIMEOUT_SECONDS must be between "
                 f"{MCP_TIMEOUT_MIN} and {MCP_TIMEOUT_MAX} (got {value})."
             )
             raise ValueError(message)

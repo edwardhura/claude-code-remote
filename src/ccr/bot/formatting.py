@@ -24,7 +24,7 @@ web viewer.
 from __future__ import annotations
 
 import html
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 from ccr.claude.events import (
     AssistantTurn,
@@ -46,17 +46,28 @@ if TYPE_CHECKING:
 
 
 class _PendingKeyboard(NamedTuple):
-    """Sentinel emitted by :func:`event_to_messages` for permission prompts.
+    """Sentinel emitted by :func:`event_to_messages` for interactive prompts.
 
     The formatter is a pure function of the event and does not have access
     to the live ``session_id`` (which is on the bus payload, not on the
     envelope's ``request_id``). The broadcast loop swaps this sentinel for
     a real :class:`InlineKeyboardMarkup` via
     :func:`ccr.server._materialise_keyboards`.
+
+    ``kind`` discriminates between the two consumers:
+
+    * ``"perm"`` (default — back-compat with CCR-025 callsites) → routed
+      through :func:`ccr.bot.keyboards.permission_kb`.
+    * ``"auq"`` → routed through
+      :func:`ccr.bot.keyboards.ask_user_question_kb` (CCR-026). For this
+      kind, ``request_id`` carries the 8-hex prefix of the
+      ``tool_use_id``; the materialiser embeds it verbatim into the
+      callback payload.
     """
 
     request_id: str
     options: list[str]
+    kind: Literal["perm", "auq"] = "perm"
 
 
 # Tuple of ``(text, reply_markup_or_sentinel)``. ``reply_markup`` is ``None``
@@ -131,6 +142,74 @@ def _format_tool_use(block: ToolUseBlock) -> str:
     return f"\U0001f527 {name} {short_args}"
 
 
+_ASK_USER_QUESTION_FALLBACK_TEXT = "❓ (no question text)"
+
+
+def _coerce_options(raw: object) -> list[str]:
+    """Pull non-empty option labels out of a list-shaped ``options`` value.
+
+    Each entry may be a ``{"label": str, ...}`` dict (probed schema) or a
+    plain string (legacy fallback). Non-string / empty entries are
+    skipped.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for entry in raw:
+        if isinstance(entry, dict):
+            label = entry.get("label")
+            if isinstance(label, str) and label:
+                out.append(label)
+        elif isinstance(entry, str) and entry:
+            out.append(entry)
+    return out
+
+
+def _ask_user_question_payload(
+    tool_input: dict[str, object],
+) -> tuple[str, list[str]]:
+    """Extract ``(question_text, option_labels)`` from an AskUserQuestion input.
+
+    Probed schema (CCR-026 Step-0): ``tool_input.questions[0]`` carries
+    ``question`` (str) plus ``options`` (list of ``{"label": str,
+    "description": str}``). Tolerates schema drift by falling back to the
+    legacy ``{"question", "options": list[str]}`` shape.
+    """
+    questions = tool_input.get("questions")
+    if isinstance(questions, list) and questions and isinstance(questions[0], dict):
+        first = questions[0]
+        question_text_raw = first.get("question")
+        question_text = question_text_raw if isinstance(question_text_raw, str) else ""
+        return question_text, _coerce_options(first.get("options"))
+
+    raw_q = tool_input.get("question")
+    question_text = raw_q if isinstance(raw_q, str) else ""
+    return question_text, _coerce_options(tool_input.get("options"))
+
+
+def _format_ask_user_question(block: ToolUseBlock) -> OutboundMessage:
+    """Render an ``AskUserQuestion`` ``tool_use`` block into one outbound message.
+
+    The button-options path emits a :class:`_PendingKeyboard` sentinel
+    with ``kind="auq"`` so :func:`ccr.server._materialise_keyboards`
+    routes it to :func:`ccr.bot.keyboards.ask_user_question_kb`. The
+    free-text path emits ``None`` and appends an ``/answer <id8>`` hint
+    so the user has a multi-question-safe disambiguator.
+    """
+    question_text, options = _ask_user_question_payload(block.input)
+    id8 = block.id[:8]
+    if not question_text and not options:
+        text = _ASK_USER_QUESTION_FALLBACK_TEXT
+    else:
+        text = f"❓ {html.escape(question_text)}" if question_text else "❓"
+
+    if options:
+        return (text, _PendingKeyboard(request_id=id8, options=list(options), kind="auq"))
+
+    text += f"\nReply with text, or /answer <code>{html.escape(id8)}</code> &lt;text&gt;."
+    return (text, None)
+
+
 def _format_tool_result_error(block: ToolResultBlock) -> str | None:
     if not block.is_error:
         return None
@@ -147,7 +226,10 @@ def _format_assistant_turn(event: AssistantTurn) -> list[OutboundMessage]:
         elif isinstance(block, ThinkingBlock):
             out.extend((html.escape(chunk), None) for chunk in chunk_text(block.thinking))
         elif isinstance(block, ToolUseBlock):
-            out.append((_format_tool_use(block), None))
+            if block.name == "AskUserQuestion":
+                out.append(_format_ask_user_question(block))
+            else:
+                out.append((_format_tool_use(block), None))
         elif isinstance(block, ToolResultBlock):
             formatted = _format_tool_result_error(block)
             if formatted is not None:

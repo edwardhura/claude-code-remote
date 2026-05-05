@@ -59,4 +59,40 @@ def permission_kb(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-__all__ = ["permission_kb"]
+def ask_user_question_kb(
+    session_id: uuid.UUID,
+    question_id: str,
+    options: list[str],
+) -> InlineKeyboardMarkup:
+    """Build the inline keyboard for an ``AskUserQuestion`` prompt (CCR-026).
+
+    One row per option. ``callback_data`` for each button is::
+
+        auq:{session_id}:{question_id}:{idx}
+
+    where ``question_id`` is the 8-hex prefix of the full
+    ``tool_use_id`` (the bot resolves prefix → full id via
+    :meth:`SessionManager.question_id_by_prefix`) and ``idx`` is the
+    option's INDEX in ``options`` — not the option text. Indices keep
+    ``callback_data`` well under Telegram's 64-byte cap regardless of
+    option label length: ``"auq:" (4) + uuid (36) + ":" + 8-hex (8) +
+    ":" + 2-digit index (≤2) = ≤52 bytes``.
+
+    The button label is the option text verbatim — Telegram inline
+    button text has its own length limits but is never sent back; only
+    ``callback_data`` round-trips, and ``callback_data`` carries no
+    user-controlled label content.
+    """
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text=opt,
+                callback_data=f"auq:{session_id}:{question_id}:{idx}",
+            ),
+        ]
+        for idx, opt in enumerate(options)
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+__all__ = ["ask_user_question_kb", "permission_kb"]

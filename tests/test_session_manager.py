@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -1301,3 +1302,444 @@ async def test_current_rate_limit_status_resets_on_stop(
     await manager.stop()
 
     assert manager.current_rate_limit_status() is None
+
+
+# --------------------------------------------------------------------------- #
+# CCR-026: AskUserQuestion handling — _pending_questions accessors,
+# send_tool_result, timeout, teardown.
+# --------------------------------------------------------------------------- #
+
+
+def _seed_pending_question(
+    manager: SessionManager,
+    *,
+    tool_use_id: str,
+    options: list[str] | None = None,
+    session_id: object | None = None,
+) -> None:
+    """Seed a :class:`_PendingQuestion` directly on the manager.
+
+    Used by tests that exercise the helper accessors without driving a
+    real subprocess. ``options=None`` ⇒ free-text. ``session_id=None``
+    falls back to a stable test UUID.
+    """
+    import uuid as _uuid_mod
+
+    from ccr.claude.manager import _PendingQuestion
+
+    sid = (
+        session_id
+        if isinstance(session_id, _uuid_mod.UUID)
+        else _uuid_mod.UUID("99999999-9999-9999-9999-999999999999")
+    )
+    manager._pending_questions[tool_use_id] = _PendingQuestion(  # noqa: SLF001
+        tool_use_id=tool_use_id,
+        session_id=sid,
+        options=list(options or []),
+        timeout_task=None,
+    )
+
+
+async def test_question_options_unknown_returns_none(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+    assert manager.question_options("nope") is None
+    assert manager.is_question_pending("nope") is False
+    assert manager.outstanding_free_text_questions() == []
+    assert manager.question_id_by_prefix("aaaaaaaa") is None
+
+
+async def test_question_id_by_prefix_resolves_unique_prefix(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+    full_id = "ffeebbaa11223344"
+    _seed_pending_question(manager, tool_use_id=full_id, options=["a", "b"])
+    assert manager.question_id_by_prefix("ffeebbaa") == full_id
+    assert manager.question_options(full_id) == ["a", "b"]
+    assert manager.is_question_pending(full_id) is True
+
+
+async def test_question_id_by_prefix_returns_none_on_collision(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+    _seed_pending_question(manager, tool_use_id="abcdef0011112222", options=["x"])
+    _seed_pending_question(manager, tool_use_id="abcdef0033334444", options=["y"])
+    assert manager.question_id_by_prefix("abcdef00") is None
+
+
+async def test_outstanding_free_text_questions_returns_only_empty_options(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+    _seed_pending_question(manager, tool_use_id="aaaa1111", options=[])
+    _seed_pending_question(manager, tool_use_id="bbbb2222", options=["a", "b"])
+    _seed_pending_question(manager, tool_use_id="cccc3333", options=[])
+    assert sorted(manager.outstanding_free_text_questions()) == ["aaaa1111", "cccc3333"]
+
+
+async def test_send_tool_result_no_active_session_raises(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+    with pytest.raises(NoActiveSessionError):
+        await manager.send_tool_result("any", "x")
+
+
+async def test_send_tool_result_unknown_id_returns_false(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown tool_use_id returns False without writing to stdin."""
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script, delay_ms=200)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    await manager.new_session(prompt=None, started_by_tg_user_id=None)
+
+    # Replace proc.send_user_turn with a spy so we observe whether the
+    # write path was reached at all.
+    sent: list[object] = []
+    proc = manager._proc  # noqa: SLF001
+    assert proc is not None
+    real_send = proc.send_user_turn
+
+    async def _spy(content: object) -> None:
+        sent.append(content)
+        await real_send(content)  # type: ignore[arg-type]
+
+    proc.send_user_turn = _spy  # type: ignore[method-assign]
+
+    delivered = await manager.send_tool_result("nope", "x")
+    assert delivered is False
+    assert sent == []  # write path NOT reached for unknown id
+
+    await manager.stop()
+
+
+async def test_send_tool_result_happy_path_writes_tool_result_block(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A registered question's reply produces a single ToolResultBlock user-turn."""
+    from ccr.claude.events import ToolResultBlock
+
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script, delay_ms=500)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    await manager.new_session(prompt=None, started_by_tg_user_id=None)
+
+    sent: list[object] = []
+    proc = manager._proc  # noqa: SLF001
+    assert proc is not None
+
+    async def _spy(content: object) -> None:
+        sent.append(content)
+
+    proc.send_user_turn = _spy  # type: ignore[method-assign]
+
+    full_id = "toolu_abcdef0011223344"
+    _seed_pending_question(manager, tool_use_id=full_id, options=["red", "blue"])
+
+    delivered = await manager.send_tool_result(full_id, "red")
+    assert delivered is True
+    assert manager.is_question_pending(full_id) is False
+    assert len(sent) == 1
+    payload = sent[0]
+    assert isinstance(payload, list)
+    assert len(payload) == 1
+    block = payload[0]
+    assert isinstance(block, ToolResultBlock)
+    assert block.tool_use_id == full_id
+    assert block.content == "red"
+    assert block.is_error is False
+
+    await manager.stop()
+
+
+async def test_send_tool_result_already_answered_returns_false(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Second call with the same id returns False — single-shot pop."""
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script, delay_ms=500)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    await manager.new_session(prompt=None, started_by_tg_user_id=None)
+
+    proc = manager._proc  # noqa: SLF001
+    assert proc is not None
+    proc.send_user_turn = AsyncMock_helper()  # type: ignore[method-assign]
+
+    full_id = "toolu_doublepop00"
+    _seed_pending_question(manager, tool_use_id=full_id, options=["only"])
+
+    first = await manager.send_tool_result(full_id, "only")
+    second = await manager.send_tool_result(full_id, "only")
+    assert first is True
+    assert second is False
+
+    await manager.stop()
+
+
+async def test_send_tool_result_runtime_error_returns_false(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A RuntimeError from proc.send_user_turn (stdin closed) maps to False."""
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script, delay_ms=500)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    await manager.new_session(prompt=None, started_by_tg_user_id=None)
+
+    proc = manager._proc  # noqa: SLF001
+    assert proc is not None
+
+    async def _boom(_content: object) -> None:
+        msg = "stdin closed"
+        raise RuntimeError(msg)
+
+    proc.send_user_turn = _boom  # type: ignore[method-assign]
+
+    full_id = "toolu_boomboom00"
+    _seed_pending_question(manager, tool_use_id=full_id, options=["x"])
+
+    delivered = await manager.send_tool_result(full_id, "x")
+    assert delivered is False
+    # The pop happened even though the wire write failed — the question
+    # is gone from the dict and a retry returns False as well.
+    assert manager.is_question_pending(full_id) is False
+
+    await manager.stop()
+
+
+async def test_ask_user_question_block_registers_pending_question(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An AskUserQuestion tool_use block in the JSONL stream registers pending."""
+    tool_use_id = "toolu_question_aaaabbbb"
+    events = [
+        {"type": "system", "subtype": "init"},
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": tool_use_id,
+                        "name": "AskUserQuestion",
+                        "input": {
+                            "questions": [
+                                {
+                                    "question": "Pick a colour",
+                                    "options": [
+                                        {"label": "red"},
+                                        {"label": "blue"},
+                                    ],
+                                },
+                            ],
+                        },
+                    },
+                ],
+            },
+        },
+    ]
+    script = _write_script(tmp_path, events)
+    # Slow it down so we can observe the pending question before the
+    # subprocess exits and teardown wipes the dict.
+    _set_fake_env(monkeypatch, script=script, delay_ms=300)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    received: list[object] = []
+
+    async def consumer() -> None:
+        async for payload in bus.subscribe("session.event"):
+            assert isinstance(payload, dict)
+            received.append(payload["event"])
+            if len(received) >= 2:
+                return
+
+    task = asyncio.create_task(consumer())
+    await asyncio.sleep(0)
+
+    await manager.new_session(prompt=None, started_by_tg_user_id=None)
+    await asyncio.wait_for(task, timeout=5.0)
+
+    assert manager.is_question_pending(tool_use_id) is True
+    assert manager.question_options(tool_use_id) == ["red", "blue"]
+    assert manager.outstanding_free_text_questions() == []
+
+    await manager.stop()
+
+
+async def test_teardown_clears_pending_questions_and_cancels_timeouts(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``manager.stop()`` clears _pending_questions and cancels timeout tasks."""
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script, delay_ms=500)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    await manager.new_session(prompt=None, started_by_tg_user_id=None)
+
+    full_id = "toolu_teardown_aaaa"
+    # Use the manager's scheduling helper so the timeout task is real.
+    from ccr.claude.manager import _PendingQuestion
+
+    pending = _PendingQuestion(
+        tool_use_id=full_id,
+        session_id=manager.current_session_id or uuid.UUID(int=0),
+        options=[],
+        timeout_task=None,
+    )
+    manager._pending_questions[full_id] = pending  # noqa: SLF001
+    manager._schedule_question_timeout(pending)  # noqa: SLF001
+    assert pending.timeout_task is not None
+
+    await manager.stop()
+
+    assert manager.is_question_pending(full_id) is False
+    assert pending.timeout_task.cancelled() or pending.timeout_task.done()
+
+
+async def test_ask_user_question_timeout_sends_error_tool_result(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Override the timeout to a sub-second value; the timer fires and sends is_error=True."""
+    from ccr.claude.events import ToolResultBlock
+    from ccr.claude.manager import _PendingQuestion
+
+    test_settings = Settings(
+        telegram_bot_token="dummy-token",  # type: ignore[arg-type]
+        public_url="http://localhost",  # type: ignore[arg-type]
+        jwt_secret="x" * 32,  # type: ignore[arg-type]
+        data_dir=tmp_path,
+        claude_bin=str(FAKE_CLAUDE),
+        subprocess_grace_kill_seconds=2,
+        ask_user_question_timeout_seconds=1,
+    )
+
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script, delay_ms=2000)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=test_settings)
+
+    await manager.new_session(prompt=None, started_by_tg_user_id=None)
+
+    sent: list[object] = []
+    proc = manager._proc  # noqa: SLF001
+    assert proc is not None
+
+    async def _spy(content: object) -> None:
+        sent.append(content)
+
+    proc.send_user_turn = _spy  # type: ignore[method-assign]
+
+    full_id = "toolu_timeout_aaaa"
+    pending = _PendingQuestion(
+        tool_use_id=full_id,
+        session_id=manager.current_session_id or uuid.UUID(int=0),
+        options=[],
+        timeout_task=None,
+    )
+    manager._pending_questions[full_id] = pending  # noqa: SLF001
+    manager._schedule_question_timeout(pending)  # noqa: SLF001
+
+    # Wait long enough for the timeout to fire.
+    await asyncio.sleep(1.5)
+
+    assert manager.is_question_pending(full_id) is False
+    # The timeout task wrote one tool_result with is_error=True.
+    assert any(
+        isinstance(payload, list)
+        and len(payload) == 1
+        and isinstance(payload[0], ToolResultBlock)
+        and payload[0].is_error is True
+        and payload[0].tool_use_id == full_id
+        for payload in sent
+    ), sent
+
+    await manager.stop()
+
+
+# Local helper so the tests above are self-contained.
+def AsyncMock_helper():  # noqa: N802 — test-helper naming
+    """Return an awaitable no-op replacement for ``proc.send_user_turn``.
+
+    Inline definition rather than ``unittest.mock.AsyncMock`` so the tests
+    do not pull a new test dependency just for the spy.
+    """
+
+    async def _noop(_content: object) -> None:
+        return None
+
+    return _noop
