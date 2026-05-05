@@ -10,12 +10,12 @@ When the user asks to "implement Phase N" or to add a feature, the plan's Sectio
 
 ## Multi-agent workflow
 
-Implementation is driven by specialist subagents in `.claude/agents/` (`project-manager`, `team-lead`, `python-developer`, `web-developer`, `qa`, `reviewer`). The shared protocol — ticket schema, status transitions, BRIEF/CONTEXT format, verdict strings, per-ticket flow — lives in `.claude/docs/WORKFLOW.md`. Ticket state is split across two files at the repo root:
+Implementation is driven by specialist subagents in `.claude/agents/` (`project-manager`, `team-lead`, `python-developer`, `web-developer`, `qa`, `reviewer`). The shared protocol — ticket schema, status transitions, BRIEF/CONTEXT format, verdict strings, per-ticket flow — lives in `docs/WORKFLOW.md`. Ticket state is split across two files at the repo root:
 
 - `BACKLOG.md` — active tickets in statuses `todo` / `in-progress` / `blocked` (status in the title for grep-ability).
 - `DONE.md` — archived tickets in statuses `done` / `closed`. Entries move here from `BACKLOG.md` when the team-lead approves a ticket (`done`) or the main session closes one (`closed`, e.g. abandoned/auto-rejected).
 
-Per-feature design notes live under `.claude/docs/<feature>/{BRIEF,CONTEXT}.md`. Both ticket files are append-only — never delete content; only flip the status in the title or move the entry from `BACKLOG.md` to `DONE.md`.
+Per-feature design notes live under `docs/<feature>/{BRIEF,CONTEXT}.md`. `BRIEF.md` is the dense, always-current summary the team-lead works from (purpose, invariants, public surface, status). `CONTEXT.md` is the deeper file/relations/change-history record kept by the team-lead from developer reports. Architect plan files live at `plans/CCR-NNN-<slug>.md`. Both ticket files are append-only — never delete content; only flip the status in the title or move the entry from `BACKLOG.md` to `DONE.md`.
 
 The orchestrator role — picking tickets, dispatching agents, committing, opening PRs — is **not** part of the default session. It is loaded on demand via the `/implement-ticket` skill, which the user invokes when they want ticket work driven end-to-end. Without that skill, treat agent invocation as opt-in: do not preemptively dispatch subagents, do not assume the session is running the multi-agent loop. Direct questions, ad-hoc edits, and debugging help are answered directly.
 

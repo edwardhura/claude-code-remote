@@ -1,0 +1,79 @@
+# Brief: chat-bot
+
+## Purpose
+The aiogram-based Telegram bot. This is the user's primary control surface: paired users send prompts and slash commands; the bot forwards them into the running Claude session and broadcasts the resulting events back as formatted HTML messages with inline keyboards for permission gates and AskUserQuestion prompts. Owns the `/start` pairing flow, the allowlist middleware, the per-chat broadcast loop, the typing-indicator keepalive, and the slash-command handlers (built-in + passthrough whitelist).
+
+## Key invariants
+- Every Telegram update passes through `AllowlistMiddleware`. Unpaired senders are short-circuited; only `/start` is allowed through. The middleware persists `last_chat_id` on paired senders so `notify_owner` and `broadcast_paired` can reach them later.
+- The broadcast loop pauses **only Telegram fan-out** while a permission request or AskUserQuestion is pending; SSE keeps streaming. When the gate reopens (button tap or `/answer`), the buffered events drain in order.
+- Allowlist is keyed on `tg_user_id`. `@username` is never load-bearing — it can change.
+- `/start` has three branches: already-paired, bootstrap (no owner exists yet — auto-promote on approval), normal (paired, code-issuing).
+- `cb_permission` and AskUserQuestion handlers validate every callback / answer against `_pending_options` / pending-id whitelists. Forged choices and stale ids are rejected with canned messages; concurrent taps are absorbed via `contextlib.suppress(TelegramBadRequest)`.
+- All user-controlled strings (usernames, tool inputs, session ids, errors) go through `html.escape()` before reaching `parse_mode="HTML"`.
+- `chunk_text` caps every outbound message body at the Telegram limit; `event_to_messages()` returns a list because some events don't fit in one message.
+- `/clear` broadcasts a divider (`"— — — new session — — —"`) to all paired chats *only* when `prior_status != IDLE` — idle clears stay quiet.
+- `/sessions` body is hard-capped at 3500 chars via `chunk_text`; empty DB returns the stable `"(no sessions)"` string.
+- Slash-command passthrough is a tight whitelist (`{"model", "compact"}`); known-blocked interactives (`{"mcp", "init"}`) return a canned local-terminal redirect. Unknown commands return the pinned usage hint.
+- `/cost`, `/usage`, `/agents`, `/skills` are local renders, NOT passthroughs to the upstream `claude` CLI.
+
+## Public surface
+### Entry point
+- `src/ccr/bot/app.py::build_dispatcher(settings, db_factory, session_manager=None) -> tuple[Bot, Dispatcher]` — registers `AllowlistMiddleware`, stashes `db_factory`, `session_manager`, `settings` in workflow data; includes pairing, session, permission, ask-user-question, and passthrough routers (passthrough must be last).
+- `src/ccr/bot/app.py::run_polling` — logs `"Bot started, awaiting updates"` then enters `dp.start_polling(bot)`.
+
+### Middleware + notification
+- `src/ccr/bot/middlewares.py::AllowlistMiddleware` — extracts sender, checks `auth.allowlist.is_paired`, injects `is_paired_user`, persists `last_chat_id`, short-circuits non-`/start` traffic from unpaired senders.
+- `src/ccr/bot/notify.py::notify_owner` — sends to the owner's `last_chat_id`; warns if no owner / null `last_chat_id`.
+- `src/ccr/bot/notify.py::broadcast_paired` — fans out to all paired users with non-null `last_chat_id`, skips an `exclude` set, swallows per-recipient `TelegramAPIError`.
+
+### Handlers (`src/ccr/bot/handlers/`)
+- `pairing.py` — `/start` (paired / bootstrap / normal branches; HTML username escape).
+- `session.py` — `/new`, `/stop`, `/clear`, `/who`, `/pid`, `/sessions`, `/continue`, plain-text passthrough. `/clear` divider gated on `prior_status != IDLE`. `/sessions` lists 20 most-recent rows. `/continue` accepts an optional 8-hex prefix; rejects bad format without manager call. plain-text filter is `F.text & ~F.text.startswith("/")` — slash commands fall through to passthrough.
+- `permission.py::cb_permission` — callback `perm:{session_id}:{request_id}:{choice}`; validates choice against `_pending_options` frozenset; rejects forged / stale / concurrent / malformed; edits message with `→ {choice} (by @{username})`.
+- `ask_user_question.py` — three reply paths (button tap callback, `/answer <id8> <text>` command, single-outstanding plain-text feed). `_ID8_RE = ^[0-9a-zA-Z_-]{8}$` (broadened for real-world prefixes like `toulu_…`). Stale / unknown ids rejected with canned message. Validates `tool_use_id`, calls `session_manager.send_tool_result`.
+- `passthrough.py` — three-branch dispatch: `WHITELIST = {"model", "compact"}` forwarded via `manager.send_slash`; `BLOCKED_INTERACTIVE = {"mcp", "init"}` returns canned redirect; unknown commands return usage hint. Dedicated branches for `/agents` (Running + Library), `/skills`, `/cost`, `/usage`.
+
+### Keyboards (`src/ccr/bot/keyboards.py`)
+- `permission_kb(session_id, request_id, options) -> InlineKeyboardMarkup` — one button per option using `_LABELS` (`{"allow": "Allow", "deny": "Deny", ...}`); unknown options fall back to `opt.capitalize()`. Callback data: `perm:{session_id}:{request_id}:{choice}`.
+- `ask_user_question_kb(tool_use_id, options) -> InlineKeyboardMarkup` — option-index callbacks under `ask:` prefix (kept under Telegram's 64-byte cap).
+
+### Formatting (`src/ccr/bot/formatting.py`)
+- `chunk_text(text)` — splits to Telegram's per-message cap.
+- `event_to_messages(event: ClaudeEvent) -> list[OutboundMessage]`, where `OutboundMessage = tuple[str, InlineKeyboardMarkup | _PendingKeyboard | None]`.
+- `_PendingKeyboard.kind` ∈ `{"permission", "ask_user_question"}` — sentinel resolved by `server._materialise_keyboards` (the formatter cannot see `session_id`).
+- `_AUQ_SUPPRESSED_TOOL_NAMES = frozenset({"AskUserQuestion"})` — defensive guard returning `[]` for suppressed tool names.
+- Result line format: `✅ done · {s}s · {N}k tokens` (post-CCR-018).
+
+### Typing
+- `src/ccr/bot/typing.py::TypingKeepalive` — per-chat task sending `send_chat_action("typing")` every 4s while a session is producing events; swallows `TelegramAPIError`; `start` / `cancel` / `wait_closed` lifecycle.
+
+### Server glue (cross-listed from claude-runtime, but lives in chat-bot land)
+- `src/ccr/server.py::serve(settings)` — runs bot polling, `_broadcast_loop`, `_typing_loop` concurrently. `_ChatSender` per-chat queue; `_broadcast_loop` materialises `_PendingKeyboard` sentinels via `_materialise_keyboards` (dispatching on `kind`); special-cases permission requests (flush buffer + send immediately); buffers non-permission events while a gate is paused; drains buffer on gate reopen. Calls `manager.shutdown()` in `finally`.
+
+### CLI glue
+- `src/ccr/cli.py::_cmd_serve` — wires `serve` subcommand to `asyncio.run(server.serve(Settings()))`.
+
+### Bot commands available today
+- `/start`, `/new`, `/stop`, `/clear`, `/who`, `/pid`, `/sessions`, `/continue`, `/answer <id8> <text>`, `/agents` (live Running + `.claude/agents/*.md` Library), `/skills` (from `system/init`), `/cost` (rich HTML), `/usage` (rate-limit snapshot), `/model`, `/compact` (passthroughs), and the canned-redirect for `/mcp`, `/init`.
+
+## Subtleties / gotchas
+- **`/agents` reads from `.claude/agents/*.md` on disk** — that path is a Claude Code convention and is correct; do *not* repoint it to `docs/` or `plans/`. Tests in `test_bot_passthrough.py` populate `tmp_path/.claude/agents/` to verify.
+- **HTML escape every user-controlled string.** Telegram HTML mode is forgiving but tests pin escape coverage. The pre-existing F1 advisory in `pairing.py` (unescaped username in HTML) was deferred at the time; revisit before adding more HTML messages there.
+- **Pre-existing F1 advisory in `AllowlistMiddleware`**: an unpaired callback-query tap does not call `cb.answer()`, leaving Telegram's spinner hanging. Tracked as a separate ticket; not regressed by current handlers.
+- **`_PendingKeyboard` is a sentinel because the formatter is pure** and cannot resolve `session_id` itself. Resolution happens in `server._materialise_keyboards` where the manager is available.
+- **AskUserQuestion source-suppresses at MCP** (claude-runtime owns that). The formatter's `_AUQ_SUPPRESSED_TOOL_NAMES` is *defensive only*. Do not rely on the formatter as the primary suppression — schema drift would leak the envelope.
+- **Slash-command filter narrowing.** `handle_text` excludes slash commands so they fall through to `passthrough.py`. If you add a new slash-command handler, register it before `passthrough_router` (which is included last in `app.py`).
+- **`/clear` divider** is gated on `prior_status != IDLE` and the read must happen before `manager.stop()` (status flips after stop).
+- **`/continue` argument validation** uses `_HEX8_RE` on the raw argv — invalid format must reject without invoking the manager (regression risk).
+- **`/cost` cost line is omitted when `total_cost_usd == 0`** — that signals a subscription user whose cost isn't tracked. Don't emit `$0.00`.
+- **`broadcast_paired` swallows per-recipient `TelegramAPIError`.** Don't add a global try/except that hides the per-recipient warning logs.
+- **TypingKeepalive cancel is idempotent.** Calling `cancel` on an already-cancelled task is fine; the broadcast loop relies on this.
+
+## Cross-feature relations
+- depends on: auth (allowlist + pairing), core (Settings, DB models, async engine), claude-runtime (every command speaks to `SessionManager`; the broadcast loop materialises `ClaudeEvent` + `McpPermissionRequest`).
+- used by: nothing (this is the user-visible surface; web-viewer is a separate read-only surface).
+
+## Status
+- State: IN PROGRESS
+- Tickets: CCR-006, CCR-008, CCR-009 (gating later removed in CCR-024), CCR-010, CCR-014 (planned), CCR-018, CCR-019, CCR-020, CCR-022, CCR-023, CCR-024, CCR-026, CCR-027 (deferred), CCR-028 (AUQ collision), CCR-030, CCR-031, CCR-032, CCR-033, CCR-034..CCR-040 (planned polish)
+- Last updated: CCR-033 (2026-05-05)

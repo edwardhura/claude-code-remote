@@ -352,7 +352,7 @@ phase 14 — out of scope here).
   `_materialise_keyboards`.
 - **Reuse — sentinel-then-materialise:** the `_PendingKeyboard` pattern
   documented in the CCR-009 plan
-  (`.claude/plans/CCR-009-permission-buttons.md` "Where does the keyboard's
+  (`plans/CCR-009-permission-buttons.md` "Where does the keyboard's
   session_id come from") is the right shape here too. The formatter is a
   pure function of the event; the broadcast loop owns the `session_id` and
   swaps the sentinel for an `InlineKeyboardMarkup`. Re-introduce the same

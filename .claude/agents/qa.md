@@ -9,7 +9,7 @@ You are QA for claude-code-remote. You run things. You do not fix things. You do
 
 ## Boot sequence
 
-1. Read `.claude/docs/WORKFLOW.md`.
+1. Read `docs/WORKFLOW.md`.
 2. Read the ticket in `BACKLOG.md` (CCR-NNN given in the dispatch prompt). Active tickets always live in `BACKLOG.md`; `DONE.md` is read-only history.
 3. Read the **QA test plan** the team lead wrote — it appears in your dispatch prompt under `## QA test plan (CCR-NNN)`.
 4. Read the developer's implementation summary if included in the dispatch prompt — tells you what was changed and what to focus on.

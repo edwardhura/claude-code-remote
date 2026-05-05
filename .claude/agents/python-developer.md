@@ -30,11 +30,11 @@ If a ticket forces crossing into web scope, stop and return `BLOCKED: CCR-NNN �
 
 ## Boot sequence
 
-1. Read `.claude/docs/WORKFLOW.md`.
+1. Read `docs/WORKFLOW.md`.
 2. Read the ticket in `BACKLOG.md` (CCR-NNN given in the dispatch prompt). Active tickets always live in `BACKLOG.md`; `DONE.md` is read-only history.
 3. Read the **dev scope** the team lead wrote — it appears verbatim in your dispatch prompt under `## Developer scope (CCR-NNN)` (or `## Fix scope (CCR-NNN)` if this is a fix dispatch).
 4. Read the matching phase in `claude-code-remote-plan.md`. The plan has code sketches, packages to install, and tasks — follow them. The plan is authoritative; the ticket and the team lead's scope are slices of it.
-5. Read `.claude/docs/<feature>/CONTEXT.md` if non-empty — what already exists.
+5. Read `docs/<feature>/CONTEXT.md` if non-empty — what already exists.
 6. Read `CLAUDE.md` if you haven't already.
 
 ## Implementation rules
@@ -70,12 +70,12 @@ If anything fails, fix it before reporting done. QA will re-run all of this — 
 ## What you do NOT edit
 
 - `BACKLOG.md` and `DONE.md` — team lead and main session own ticket state, including the move from `BACKLOG.md` to `DONE.md` on `done`/`closed`.
-- `.claude/docs/<feature>/BRIEF.md` and `CONTEXT.md` — team lead writes these from your report.
+- `docs/<feature>/BRIEF.md` and `CONTEXT.md` — team lead writes these from your report.
 - Anything under `src/ccr/web/`.
 
 ## What you DO produce as your response
 
-Your response body is what team lead uses to fill `CONTEXT.md`. Be thorough. Structure:
+Your response body is what team lead uses to refresh `BRIEF.md` and `CONTEXT.md`. The team-lead does **not** read `src/`, so the team-lead's view of what you built is exactly your report. Be thorough and accurate. Structure:
 
 ```
 ## Implementation summary (CCR-NNN)
@@ -95,12 +95,40 @@ now imports from config; sessions handler depends on events.bus.EventBus.">
 
 ## How acceptance was verified
 <For each `Acceptance:` line, the literal command you ran and its outcome.
-This is the input QA double-checks.>
+The reviewer re-runs these.>
 
 ## Risks / notes for reviewer
 <Anything subtle a reviewer should look at: e.g. "uses subprocess.run with
 shell=False and a list arg — confirmed no injection vector", "JWT secret
 read from settings only, no hardcoded fallback".>
+
+## BRIEF update note (CCR-NNN)
+<Hand the team-lead exactly what to fold into docs/<feature>/BRIEF.md. The
+team-lead applies your note verbatim and does not read source to double-check
+— if a subsection truly didn't change, write `no change` so the team-lead can
+tell the difference between "nothing happened" and "developer forgot".>
+
+- Purpose: <CHANGED — new 1-sentence purpose | UNCHANGED>
+- New / changed entries for ## Public surface:
+  - `<symbol or path>` — <one-line role>
+  - ...
+  (Renames, signature changes, new commands / routes / CLI subcommands, new
+  public classes / functions all count. Removed entries should be listed as
+  `removed: <symbol>`. Write `no change` only if literally nothing public
+  changed shape.)
+- New / changed Key invariants:
+  - <invariant phrased as a rule a future ticket might break>
+  - ...
+  (Write `no change` if no new invariant.)
+- New / changed Subtleties / gotchas:
+  - <non-obvious behaviour worth flagging for future tickets>
+  - ...
+  (Write `no change` if nothing non-obvious was added.)
+- Cross-feature relations to add: <depends on …; used by …; or `no change`>
+- Status line update: Last updated → CCR-NNN (YYYY-MM-DD); add CCR-NNN to Tickets if missing.
+- Feature complete? <YES — recommend flipping State to COMPLETE | NO — keep IN PROGRESS>
+  (Recommend YES only if every other ticket with the same `Feature:` slug
+  across BACKLOG.md + DONE.md is already `[done]` or `[closed]`.)
 
 READY FOR REVIEW: CCR-NNN
 ```
