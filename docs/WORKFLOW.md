@@ -8,9 +8,9 @@ The **main session** (the top-level Claude conversation) is the orchestrator and
 
 | Agent | Writes code? | Runs code? | Primary outputs |
 |---|---|---|---|
-| `project-manager` | No | No | Tickets appended to `BACKLOG.md`; stub `.claude/docs/<feature>/{BRIEF,CONTEXT}.md` |
-| `team-lead` | No | No | Decision: architect-first or skip; dev + reviewer scope briefs; `BRIEF.md`, `CONTEXT.md`, `BACKLOG.md`/`DONE.md` updates on completion |
-| `architect` | No (plan file only) | No | Design plan at `.claude/plans/CCR-NNN-<slug>.md`; runs only when team-lead asks |
+| `project-manager` | No | No | Tickets appended to `BACKLOG.md`; stub `docs/<feature>/{BRIEF,CONTEXT}.md` |
+| `team-lead` | No | No | Decision: architect-first or skip; dev + reviewer scope briefs; per-ticket `BRIEF.md` refresh; `CONTEXT.md` + `BACKLOG.md` / `DONE.md` updates on completion |
+| `architect` | No (plan file only) | No | Design plan at `plans/CCR-NNN-<slug>.md`; runs only when team-lead asks |
 | `python-developer` | Yes | Yes (own tests) | Code + tests under Python backend scope (incl. install/CI/doctor) |
 | `web-developer` | Yes | Yes (own tests) | Code + tests under `src/ccr/web/` |
 | `reviewer` | No | Yes (test suite at end of pass) | Code review + security findings + test-coverage audit + green-suite confirmation |
@@ -30,7 +30,7 @@ main session
             (A) DISPATCH: architect CCR-NNN — go to step 6
             (B) dev scope + reviewer focus + DISPATCH: <developer> CCR-NNN — skip to step 8
   6. (only if 5A) dispatches architect
-       └─→ architect reads code, writes .claude/plans/CCR-NNN-<slug>.md, returns PLAN READY
+       └─→ architect reads code, writes plans/CCR-NNN-<slug>.md, returns PLAN READY
   7. (only if 5A) dispatches team-lead (Mode 1B — compose dev brief from plan)
        └─→ team-lead returns dev scope + reviewer focus + DISPATCH: <developer> CCR-NNN
   8. dispatches the developer with team-lead's dev scope
@@ -41,8 +41,9 @@ main session
  10. dispatches team-lead (Mode 2 — verdict)
         - REVIEW FAIL: team-lead returns fix scope → loop to step 8 (fresh dev session)
         - REVIEW PASS: team-lead flips status to [done], MOVES the ticket entry from
-                       BACKLOG.md to DONE.md, updates CONTEXT.md and BRIEF.md (if last
-                       ticket of the feature) → returns APPROVED
+                       BACKLOG.md to DONE.md, REFRESHES BRIEF.md and CONTEXT.md from the
+                       developer's report (BRIEF every ticket, not only feature completion)
+                       → returns APPROVED
  11. main session **stops and waits for user approval** before the final step
  12. on user approval: main session commits, pushes, opens PR (never merges)
 ```
@@ -65,7 +66,7 @@ The architect is **optional**. Team-lead Mode 1A decides whether to dispatch it 
 | team-lead (final) | `APPROVED: CCR-NNN` | Ticket complete |
 | team-lead (final + last in feature) | `FEATURE COMPLETE: <feature-slug>` | Approved AND BRIEF written |
 | team-lead (any) | `BLOCKED: CCR-NNN — <reason>` | Cannot proceed (e.g. acceptance criteria contradict the plan) |
-| architect | `PLAN READY: CCR-NNN` | `.claude/plans/CCR-NNN-<slug>.md` written; team-lead Mode 1B can compose dev brief from it |
+| architect | `PLAN READY: CCR-NNN` | `plans/CCR-NNN-<slug>.md` written; team-lead Mode 1B can compose dev brief from it |
 | architect | `BLOCKED: CCR-NNN — <reason>` | Cannot design without resolving a contradiction or scope gap |
 | python-developer / web-developer | `READY FOR REVIEW: CCR-NNN` | Implementation done, self-checks green |
 | python-developer / web-developer | `BLOCKED: CCR-NNN — <reason>` | Cannot continue |
@@ -146,31 +147,61 @@ When emitting `APPROVED` (team-lead) or `[closed]` (main session):
 3. Append the cut block to `DONE.md`, preserving the `---\n` separator before it.
 4. Verify a single `## CCR-NNN:` line is found across both files (no duplication, no loss).
 
-## `.claude/docs/<feature>/`
+## `docs/<feature>/`
 
 One folder per feature. Slug names a capability, not a phase (e.g. `core`, `auth`, `chat-bot`, `web-viewer`). PM creates the folder + stubs when generating the first ticket for that feature; multiple tickets across phases share one feature folder.
 
-### `BRIEF.md` (team lead writes / updates)
+### `BRIEF.md` (team lead writes / updates **every approved ticket**)
 
-Created as a stub by PM, filled in by team lead when the feature's last ticket is approved. Format:
+`BRIEF.md` is the team-lead's primary view of a feature. It is dense, opinionated, and always current — the team-lead must be able to scope an architect or developer brief for a new ticket in this feature **without reading `src/` and without re-reading `CONTEXT.md`**. Created as a stub by PM, refreshed by team-lead on every `APPROVED` verdict (not only on feature completion).
+
+Format:
 
 ```markdown
 # Brief: <feature-name>
 
-## Overview
-<one short paragraph: what the feature delivers and why it matters>
+## Purpose
+<1–3 sentences: what the feature delivers, who uses it, why it exists.
+Update only when scope changes.>
 
-## Files
-- <path> — <one-line role>
+## Key invariants
+- <load-bearing rules — single-session invariant, owner immutability,
+  JWT TTL, JSONL append-only with seq derived from line count, etc.
+  These are the rules a new ticket must not violate.>
 - ...
 
-Status: COMPLETE | IN PROGRESS
-Tickets: CCR-NNN, CCR-MMM
+## Public surface
+<Top-level entry points, public functions / classes, bot commands, HTTP routes,
+CLI subcommands, with a one-line role each. The team-lead uses this to decide
+scope, name the dev's files, and judge the reviewer's coverage. Group by file
+or category as helpful.>
+- `<symbol or path>` — <role>
+- ...
+
+## Subtleties / gotchas
+- <Non-obvious behaviour the team-lead must remember when scoping new tickets:
+  e.g. "Telegram broadcast pauses while a permission is pending; SSE keeps
+  streaming"; "MCP relay is a subprocess, not in-process"; "Owner cannot be
+  revoked"; "JWT_SECRET ≥ 32 chars, fail-validation, no fallback".>
+- ...
+
+## Cross-feature relations
+- depends on: <feature-slug>, ...
+- used by: <feature-slug>, ...
+
+## Status
+- State: IN PROGRESS | COMPLETE
+- Tickets: CCR-NNN, CCR-MMM, ...
+- Last updated: CCR-NNN (YYYY-MM-DD)
 ```
+
+The team-lead refreshes `Public surface`, `Key invariants`, and `Subtleties` whenever a ticket adds, changes, or removes one. The `Status` line always advances: bump `Last updated`, ensure the new ticket id appears in `Tickets:`, and flip `State` to `COMPLETE` when no other ticket for the feature remains in `[todo]` / `[in-progress]` / `[blocked]`. The team-lead derives BRIEF updates from the developer's `## BRIEF update note (CCR-NNN)` section — the team-lead does not read `src/` or `tests/` to confirm.
 
 ### `CONTEXT.md` (team lead writes / updates)
 
-Created as a stub by PM, maintained by team lead based on the developer's per-ticket report. Format:
+Deeper file-by-file record kept for the architect (and any human reading the repo). Created as a stub by PM, maintained by team lead based on the developer's per-ticket report. Team-lead refreshes CONTEXT.md on every `APPROVED`. The team-lead does not need to re-read CONTEXT.md to scope the *next* ticket — that is what BRIEF.md is for. The architect reads CONTEXT.md (and source) when designing.
+
+Format:
 
 ```markdown
 # Context: <feature-name>
@@ -189,6 +220,47 @@ Created as a stub by PM, maintained by team lead based on the developer's per-ti
 ```
 
 The change-history entries are append-only. Team lead appends a new entry when emitting `APPROVED`.
+
+## Read budgets — who reads what
+
+The team-lead is a manager, not an implementer. The team-lead **does not read `src/` or `tests/`** to scope a ticket and **does not re-read `CONTEXT.md`** as the primary feature view. Instead the team-lead reads:
+
+- The ticket in `BACKLOG.md`.
+- The matching phase in `claude-code-remote-plan.md`.
+- The feature's `docs/<feature>/BRIEF.md` (always).
+- `docs/WORKFLOW.md` and `CLAUDE.md`.
+- In Mode 1B only: the architect's `plans/CCR-NNN-<slug>.md` in full.
+- In Mode 2 only: the developer's full implementation summary and the reviewer's full response.
+
+If `BRIEF.md` does not answer a specific scoping question, the team-lead either asks the question to the user, returns `BLOCKED`, or relies on the architect (in Mode 1A) — the team-lead does **not** open `src/` to find out.
+
+The architect, the developers, the reviewer, and the project-manager continue to read `src/` and `tests/` as needed for their own jobs. The read-budget rule applies only to the team-lead.
+
+## BRIEF update note (subagent → team-lead handoff)
+
+Every subagent that produces a final report includes a `## BRIEF update note (CCR-NNN)` section so the team-lead can refresh `BRIEF.md` without reading the diff or the source. The note is short and structured:
+
+```
+## BRIEF update note (CCR-NNN)
+- Purpose: <CHANGED | UNCHANGED — if changed, the new 1-sentence purpose, else omit>
+- New / changed entries for ## Public surface:
+  - <symbol or path> — <one-line role>
+  - ...
+  (omit the bullet list if nothing changed)
+- New / changed Key invariants:
+  - <invariant>
+  - ...
+- New / changed Subtleties / gotchas:
+  - <gotcha>
+  - ...
+- Cross-feature relations to add: depends on <…>; used by <…>
+- Status line update: Last updated → CCR-NNN (YYYY-MM-DD); add CCR-NNN to Tickets if missing.
+- Feature complete? <YES — flip State to COMPLETE | NO — keep IN PROGRESS>
+```
+
+The architect emits the note in its `PLAN READY` response (about what the *plan* changes); the developer emits the note in its `READY FOR REVIEW` response (about what was actually built and may have diverged from the plan); the reviewer flags any drift between the dev's BRIEF update note and the diff. The team-lead then folds the note into `BRIEF.md` verbatim or with light editing — the team-lead is allowed to copy bullets directly without reading the underlying code.
+
+If a subagent has no changes to surface in BRIEF, it still emits the section with `Public surface: no change`, `Key invariants: no change`, etc., to make the absence explicit (otherwise team-lead cannot tell the difference between "nothing changed" and "subagent forgot").
 
 ## Phase ordering
 
@@ -229,16 +301,16 @@ The main session quotes the relevant section when dispatching each agent.
 
 ## How team-lead structures Mode 1B — post-architect dev brief
 
-Triggered when the architect returned `PLAN READY: CCR-NNN`. Team-lead reads `.claude/plans/CCR-NNN-<slug>.md` in full and composes the developer brief from it:
+Triggered when the architect returned `PLAN READY: CCR-NNN`. Team-lead reads `plans/CCR-NNN-<slug>.md` in full and composes the developer brief from it:
 
 ```
 ## Developer scope (CCR-NNN)
 <Same shape as Mode 1A's developer-direct path, but composed from the plan file.
 Quote the plan's "File layout" / "Public surface" sections verbatim where useful.
-Tell the developer to follow .claude/plans/CCR-NNN-<slug>.md.>
+Tell the developer to follow plans/CCR-NNN-<slug>.md.>
 
 ## Plan reference (CCR-NNN)
-- File: .claude/plans/CCR-NNN-<slug>.md
+- File: plans/CCR-NNN-<slug>.md
 - Headline decisions: <2–4 bullets quoting the architect summary>
 
 ## Reviewer focus (CCR-NNN)
@@ -259,7 +331,7 @@ When dispatched with reviewer output, team-lead either:
 2. Append `### Review log` line: `<YYYY-MM-DD> team-lead: approved`.
 3. Set ticket status to `[done]`.
 4. **Move the ticket entry from `BACKLOG.md` to `DONE.md`** per "How to move a ticket" above. The whole block — title, body, and full Review log — goes verbatim; nothing is dropped.
-5. Update `.claude/docs/<feature>/CONTEXT.md` based on the developer's report:
+5. Update `docs/<feature>/CONTEXT.md` based on the developer's report:
    - Add/update `## Files` entries for files created or substantially changed.
    - Add `## Relations` entries (`depends on:` / `used by:`) that emerged.
    - Append `- [CCR-NNN]: <short description>` to `## Change history`.

@@ -15,10 +15,10 @@ The QA agent is no longer in the flow — the test-execution responsibility live
 
 ## Boot sequence
 
-1. Read `.claude/docs/WORKFLOW.md`.
+1. Read `docs/WORKFLOW.md`.
 2. Read the ticket in `BACKLOG.md` (CCR-NNN given in the dispatch prompt). Active tickets always live in `BACKLOG.md` while you're reviewing them; `DONE.md` only matters if you need history of an earlier finished ticket.
 3. Read the **reviewer focus** the team lead wrote — it appears in your dispatch prompt under `## Reviewer focus (CCR-NNN)`. This names ticket-specific risks and the test commands to run. The always-on checks below run regardless.
-4. If the team lead dispatched an architect for this ticket, read `.claude/plans/CCR-NNN-<slug>.md` — the developer was supposed to follow it; deviations are review material.
+4. If the team lead dispatched an architect for this ticket, read `plans/CCR-NNN-<slug>.md` — the developer was supposed to follow it; deviations are review material.
 5. Look at what changed. The dev's changes are uncommitted on the current feature branch, so compare working tree to `main`: `git diff --stat main` for the file list, then `git diff main -- <path>` for files of interest. Read the full files (not just the hunks) when something looks suspicious.
 
 ## Code review
@@ -26,7 +26,7 @@ The QA agent is no longer in the flow — the test-execution responsibility live
 Before the security checks, judge the implementation as a reviewer would:
 
 - **Does it match the ticket?** Every `Acceptance:` checkbox on the ticket in `BACKLOG.md` should be traceable to specific lines in the diff. Anything that *does not* trace is either dead code or scope creep — flag it.
-- **Does it match the plan (if there is one)?** If `.claude/plans/CCR-NNN-<slug>.md` exists, the public surface, file layout, and patterns it specifies should appear in the diff. A documented deviation in the dev's report is fine; an undocumented deviation is a finding.
+- **Does it match the plan (if there is one)?** If `plans/CCR-NNN-<slug>.md` exists, the public surface, file layout, and patterns it specifies should appear in the diff. A documented deviation in the dev's report is fine; an undocumented deviation is a finding.
 - **Design sanity.** New abstractions justified by ≥ 3 concrete callers? Error paths handled at boundaries (per CLAUDE.md "trust internal code, validate at boundaries")? No dead branches, no commented-out code, no half-finished implementations?
 - **No surprises.** No edits outside the ticket's scope (other than the team-lead's `BACKLOG.md` / `DONE.md` / `CONTEXT.md` / `BRIEF.md` updates — the team-lead may move the ticket from `BACKLOG.md` to `DONE.md` only on `APPROVED`, which happens *after* your pass; during review the ticket is still in `BACKLOG.md`). No incidental refactors, dependency bumps, or formatting changes that aren't part of this ticket.
 
@@ -100,6 +100,22 @@ A **test fixture** containing an obviously fake placeholder (e.g. `JWT_SECRET="x
 
 Apply the team lead's `## Reviewer focus (CCR-NNN)` block. If team lead said "this ticket introduces JWT minting", spend extra time on §6. If team lead said "this writes JSONL files keyed by session_id", spend extra time on §5.
 
+## BRIEF update note check
+
+The developer's report ends with a `## BRIEF update note (CCR-NNN)` section that the team-lead will fold into `docs/<feature>/BRIEF.md` verbatim. The team-lead does not read `src/`, so any drift between the dev's note and the diff hides a permanent BRIEF inaccuracy.
+
+Audit:
+
+- **Public surface accuracy.** Each `New / changed entries for ## Public surface` bullet should correspond to a real new / changed public symbol, route, command, or file role in the diff. Symbols added to the diff but missing from the note are an omission. Symbols listed in the note but not in the diff are an over-claim.
+- **Removed entries.** If the diff deletes a previously-public symbol, the note should list it as `removed: <symbol>`. Omitted removals are findings.
+- **Invariants.** If the diff adds a new constraint future tickets must respect (a new validator, a new lock, a new fail-closed branch, a new rate / size limit), it should appear under `Key invariants`. Missing → finding.
+- **Subtleties.** If the diff introduces non-obvious behaviour the team-lead would need to remember (an async ordering, a synthetic event, a deferred side-effect, an unusual chmod / permission, a buffering rule), it should appear under `Subtleties / gotchas`. Missing → finding.
+- **`no change` honesty.** If a subsection says `no change` but the diff actually changed it, that is the worst kind of omission — call it out.
+
+A BRIEF-update-note omission is a MEDIUM finding by default, HIGH if it hides a security-relevant invariant or a removed public surface (which would leave the BRIEF claiming something the code no longer provides).
+
+If the developer's report is missing the `## BRIEF update note (CCR-NNN)` section entirely, that is a `REVIEW FAIL: CCR-NNN — developer report missing BRIEF update note` automatic fail; the team-lead cannot do their Mode 2 BRIEF refresh without it.
+
 ## Test coverage check
 
 Before running the suite, audit whether the developer added the right tests:
@@ -149,7 +165,7 @@ If a test fails, you do **not** investigate it as a code-review finding — the 
 
 ## Code review
 - Matches ticket: <YES | NO — what's missing>
-- Matches plan (.claude/plans/CCR-NNN-<slug>.md): <YES | N/A no plan | NO — what deviated>
+- Matches plan (plans/CCR-NNN-<slug>.md): <YES | N/A no plan | NO — what deviated>
 - Design sanity: <CLEAN | findings below>
 - No surprises (out-of-scope edits): <CLEAN | findings below>
 
@@ -167,6 +183,14 @@ If a test fails, you do **not** investigate it as a code-review finding — the 
 
 ## Ticket-specific focus
 <Per the team-lead reviewer-focus block. State explicitly what was checked and the result.>
+
+## BRIEF update note audit
+- Note present in dev report: <YES | NO — automatic FAIL>
+- Public surface entries match diff: <YES | omissions / over-claims below>
+- Removals listed: <YES | N/A — no removals | omissions below>
+- New invariants captured: <YES | omissions below>
+- New subtleties captured: <YES | omissions below>
+- `no change` claims honest: <YES | discrepancies below>
 
 ## Test coverage
 - New code covered: <YES | gaps below>
