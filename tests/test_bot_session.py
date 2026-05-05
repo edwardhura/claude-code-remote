@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock
 import pytest_asyncio
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import Chat, Message, User
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -624,3 +625,63 @@ async def test_cmd_sessions_status_field_passed_through_verbatim(
     reply = msg.answer.await_args.args[0]
     assert "crashed" in reply
     assert "completed" in reply
+
+
+async def test_cmd_sessions_renders_started_at_via_helper_short_format_utc(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Each session row's started_at renders via format_user_datetime("short"), UTC fallback."""
+    sid = uuid.UUID("12345678-0000-0000-0000-000000000099")
+    started_at = datetime(2026, 5, 5, 14, 3, 17, tzinfo=UTC)
+    await _seed_session(
+        session_factory,
+        session_id=sid,
+        started_at=started_at,
+        status="completed",
+        first_prompt="hi",
+    )
+
+    msg = _make_message(text="/sessions", user_id=42)
+    await cmd_sessions(msg, db_factory=session_factory)
+
+    reply = msg.answer.await_args.args[0]
+    # New helper output ("short" mode, UTC since the caller is unpaired).
+    assert "14:03 - 5 May" in reply
+    # Old isoformat shape must NOT appear (regression vs. CCR-035 sweep).
+    assert "2026-05-05T14:03:17" not in reply
+
+
+async def test_cmd_sessions_applies_caller_timezone_to_started_at(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A paired caller with a non-UTC timezone shifts the rendered started_at."""
+    # Seed a paired caller with Asia/Tokyo (UTC+9 year-round).
+    await _seed_paired_user(
+        session_factory,
+        tg_user_id=42,
+        last_chat_id=1000,
+        is_owner=False,
+    )
+    async with session_factory() as db:
+        u = (await db.scalars(select(PairedUser).where(PairedUser.tg_user_id == 42))).one()
+        u.timezone = "Asia/Tokyo"
+        await db.commit()
+
+    sid = uuid.UUID("99999999-0000-0000-0000-000000000123")
+    started_at = datetime(2026, 5, 5, 23, 30, 0, tzinfo=UTC)
+    await _seed_session(
+        session_factory,
+        session_id=sid,
+        started_at=started_at,
+        status="completed",
+        first_prompt="hi",
+    )
+
+    msg = _make_message(text="/sessions", user_id=42)
+    await cmd_sessions(msg, db_factory=session_factory)
+
+    reply = msg.answer.await_args.args[0]
+    # Tokyo render of 2026-05-05 23:30 UTC → 08:30 next day (6 May).
+    assert "08:30 - 6 May" in reply
+    # The UTC-rendered string must NOT appear.
+    assert "23:30 - 5 May" not in reply

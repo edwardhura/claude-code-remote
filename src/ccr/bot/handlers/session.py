@@ -28,7 +28,8 @@ from ccr.claude.manager import (
     SessionNotFoundError,
 )
 from ccr.claude.state import SessionStatus
-from ccr.db.models import Session
+from ccr.db.models import PairedUser, Session
+from ccr.utils import format_user_datetime
 
 if TYPE_CHECKING:
     from aiogram.types import Message
@@ -248,12 +249,22 @@ async def cmd_sessions(
 ) -> None:
     """List the most recent sessions (up to 20), newest first.
 
-    Each line is ``<id8> · <status> · <started_at iso> · <first_prompt> · by <user>``.
-    Replies with the stable empty-state string ``"(no sessions)"`` when the DB
-    has no rows. The body is chunked through :func:`chunk_text` so very long
-    listings stay below Telegram's 4096-char limit.
+    Each line is ``<id8> · <status> · <started_at> · <first_prompt> · by <user>``,
+    where the timestamp is rendered via :func:`format_user_datetime` in
+    ``"short"`` mode using the calling user's timezone preference (or UTC when
+    the caller has none / is unpaired). Replies with the stable empty-state
+    string ``"(no sessions)"`` when the DB has no rows. The body is chunked
+    through :func:`chunk_text` so very long listings stay below Telegram's
+    4096-char limit.
     """
+    user: PairedUser | None = None
     async with db_factory() as db:
+        if msg.from_user is not None:
+            user = (
+                await db.scalars(
+                    select(PairedUser).where(PairedUser.tg_user_id == msg.from_user.id),
+                )
+            ).first()
         rows = (
             await db.scalars(
                 select(Session).order_by(Session.started_at.desc()).limit(_SESSIONS_LIMIT),
@@ -264,16 +275,16 @@ async def cmd_sessions(
         await msg.answer(_EMPTY_SESSIONS_REPLY)
         return
 
-    lines = [_format_session_row(row) for row in rows]
+    lines = [_format_session_row(row, user) for row in rows]
     body = "\n".join(lines)
     for chunk in chunk_text(body):
         await msg.answer(chunk)
 
 
-def _format_session_row(row: Session) -> str:
+def _format_session_row(row: Session, user: PairedUser | None) -> str:
     id8 = str(row.id)[:8]
     status = html.escape(row.status)
-    started = row.started_at.isoformat()
+    started = format_user_datetime(row.started_at, user, "short")
     prompt_display = (
         "—"
         if row.first_prompt is None

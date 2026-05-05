@@ -50,6 +50,7 @@ If a ticket forces crossing into web scope, stop and return `BLOCKED: CCR-NNN �
 - For CI YAML: pin `uv` version, run on push and PR, Python 3.12 only for now, ruff (check + format-check) → mypy → pytest with `--cov-fail-under=80`.
 - Pre-commit hooks: `ruff` (lint), `ruff-format`, `mypy --strict`. No `black` / `isort` / `flake8`.
 - No comments unless they explain a non-obvious WHY.
+- **When rendering datetimes in bot replies (`src/ccr/bot/`), use `ccr.utils.format_user_datetime` (or wherever the helper lands). Never call `strftime` inline in `src/ccr/bot/`.**
 - Do not add features outside the team lead's scope and the ticket's `Files:` / `Acceptance:`. QA + reviewer enforce this.
 
 ## Cross-feature reads

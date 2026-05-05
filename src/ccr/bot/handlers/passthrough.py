@@ -44,6 +44,7 @@ from aiogram.filters import Command, CommandObject
 
 from ccr.bot.formatting import SAFE_CHUNK
 from ccr.claude.manager import NoActiveSessionError
+from ccr.utils import format_user_datetime
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -200,29 +201,31 @@ async def _reply_cost(msg: Message, session_manager: SessionManager) -> None:
 
 
 def _format_resets_at(epoch_seconds: int | None) -> str:
-    """Render ``epoch_seconds`` as a UTC ISO timestamp + relative delta.
+    """Render ``epoch_seconds`` as a UTC timestamp + relative delta.
 
     Returns ``"unknown"`` when ``epoch_seconds`` is ``None`` or non-positive
     (claude does not emit zero/negative epochs in practice but the field
-    is forward-compat optional). For epochs in the past the absolute UTC
-    timestamp is rendered followed by ``"in the past"`` rather than a
-    negative duration. Future epochs render as ``"in Xm Ys"`` for < 1 h
-    and ``"in Xh Ym"`` otherwise.
+    is forward-compat optional). The absolute timestamp is rendered via
+    :func:`format_user_datetime` in ``"full"`` mode (UTC fallback — CCR-039
+    will thread the calling user through). For epochs in the past the
+    timestamp is followed by ``"in the past"`` rather than a negative
+    duration. Future epochs render as ``"in Xm Ys"`` for < 1 h and
+    ``"in Xh Ym"`` otherwise.
     """
     if epoch_seconds is None or epoch_seconds <= 0:
         return "unknown"
     target = datetime.fromtimestamp(epoch_seconds, tz=UTC)
-    iso = target.strftime("%Y-%m-%dT%H:%M:%SZ")
+    rendered = format_user_datetime(target, None, "full")
     delta_seconds = int(epoch_seconds - datetime.now(tz=UTC).timestamp())
     if delta_seconds <= 0:
-        return f"{iso} (in the past)"
+        return f"{rendered} (in the past)"
     if delta_seconds < _SECONDS_PER_HOUR:
         minutes = delta_seconds // _SECONDS_PER_MINUTE
         seconds = delta_seconds % _SECONDS_PER_MINUTE
-        return f"{iso} (in {minutes}m {seconds}s)"
+        return f"{rendered} (in {minutes}m {seconds}s)"
     hours = delta_seconds // _SECONDS_PER_HOUR
     minutes = (delta_seconds % _SECONDS_PER_HOUR) // _SECONDS_PER_MINUTE
-    return f"{iso} (in {hours}h {minutes}m)"
+    return f"{rendered} (in {hours}h {minutes}m)"
 
 
 def _render_usage_reply(rl: RateLimitEvent) -> str:

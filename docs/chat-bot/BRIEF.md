@@ -18,6 +18,9 @@ The aiogram-based Telegram bot. This is the user's primary control surface: pair
 - `cfg:*` callbacks use the calling `tg_user_id` (`cb.from_user.id`) as the DB lookup key — never trust the callback payload for the update target. Callback data carries only an integer index into a server-controlled list.
 - Timezone validation MUST use stdlib `zoneinfo.ZoneInfo(name)` and treat `ZoneInfoNotFoundError` as a user error (no DB write).
 - `paired_users.timezone` is nullable; NULL means UTC at render time. Do not hard-code a server default in the migration or the model.
+- Every datetime rendered in `src/ccr/bot/` goes through `ccr.utils.format_user_datetime`. Inline `strftime` in `src/ccr/bot/` is forbidden — enforced by the grep canary `grep -rnE "strftime\(" src/ccr/bot/`.
+- `format_user_datetime` never raises: an unresolvable `user.timezone` logs a structlog warning and falls back to UTC.
+- Naive `datetime` input to the helper is interpreted as UTC (because SQLite drops `tzinfo` on round-trip even with `DateTime(timezone=True)`).
 
 ## Public surface
 ### Entry point
@@ -31,7 +34,7 @@ The aiogram-based Telegram bot. This is the user's primary control surface: pair
 
 ### Handlers (`src/ccr/bot/handlers/`)
 - `pairing.py` — `/start` (paired / bootstrap / normal branches; HTML username escape).
-- `session.py` — `/new`, `/stop`, `/clear`, `/who`, `/pid`, `/sessions`, `/continue`, plain-text passthrough. `/clear` divider gated on `prior_status != IDLE`. `/sessions` lists 20 most-recent rows. `/continue` accepts an optional 8-hex prefix; rejects bad format without manager call. plain-text filter is `F.text & ~F.text.startswith("/")` — slash commands fall through to passthrough.
+- `session.py` — `/new`, `/stop`, `/clear`, `/who`, `/pid`, `/sessions`, `/continue`, plain-text passthrough. `/clear` divider gated on `prior_status != IDLE`. `/sessions` lists 20 most-recent rows. `/continue` accepts an optional 8-hex prefix; rejects bad format without manager call. plain-text filter is `F.text & ~F.text.startswith("/")` — slash commands fall through to passthrough. `_format_session_row(row, user: PairedUser | None)` renders `started_at` via `format_user_datetime(..., "short")`.
 - `permission.py::cb_permission` — callback `perm:{session_id}:{request_id}:{choice}`; validates choice against `_pending_options` frozenset; rejects forged / stale / concurrent / malformed; edits message with `→ {choice} (by @{username})`.
 - `ask_user_question.py` — three reply paths (button tap callback, `/answer <id8> <text>` command, single-outstanding plain-text feed). `_ID8_RE = ^[0-9a-zA-Z_-]{8}$` (broadened for real-world prefixes like `toulu_…`). Stale / unknown ids rejected with canned message. Validates `tool_use_id`, calls `session_manager.send_tool_result`.
 - `passthrough.py` — three-branch dispatch: `WHITELIST = {"model", "compact"}` forwarded via `manager.send_slash`; `BLOCKED_INTERACTIVE = {"mcp", "init"}` returns canned redirect; unknown commands return usage hint. Dedicated branches for `/agents` (Running + Library), `/skills`, `/cost`, `/usage`.
@@ -40,6 +43,9 @@ The aiogram-based Telegram bot. This is the user's primary control surface: pair
 - `config.py::cb_open_tz_picker` — `cfg:tz` callback; renders the curated picker (13 zones).
 - `config.py::cb_pick_tz` — `cfg:tz:<idx>` callback; persists `_CURATED_ZONES[idx]` for the caller.
 - `config.py::cb_close` — `cfg:close` callback; edits to "Menu closed." and drops `reply_markup`.
+
+### Datetime helper
+- `ccr.utils.format_user_datetime(dt, user, mode) -> str` — single source of truth for rendering datetimes in bot replies; modes `"full"` (`HH:MM - DD/MM/YYYY`), `"short"` (`HH:MM - D Mon`, English month abbreviation, no leading zero on day), `"time"` (`HH:MM`); applies `user.timezone` (defensive UTC fallback on `None` / unresolvable zone).
 
 ### DB schema additions (chat-bot)
 - `src/ccr/db/models.py::PairedUser.timezone` — new nullable IANA-zone column; NULL means UTC at render time (consumer is CCR-035).
@@ -83,6 +89,8 @@ The aiogram-based Telegram bot. This is the user's primary control surface: pair
 - **`/cost` cost line is omitted when `total_cost_usd == 0`** — that signals a subscription user whose cost isn't tracked. Don't emit `$0.00`.
 - **`broadcast_paired` swallows per-recipient `TelegramAPIError`.** Don't add a global try/except that hides the per-recipient warning logs.
 - **TypingKeepalive cancel is idempotent.** Calling `cancel` on an already-cancelled task is fine; the broadcast loop relies on this.
+- **SQLite roundtrip strips `tzinfo` from `DateTime(timezone=True)` columns.** Do not assume `Session.started_at.tzinfo is not None` when reading back from the DB. The `format_user_datetime` helper handles this defensively (treats naive input as UTC), but other code paths must remain aware.
+- **`_format_resets_at` in `passthrough.py` still passes `user=None` to `format_user_datetime`** (UTC fallback). Threading the calling `PairedUser` through that path is owned by CCR-039.
 
 ## Cross-feature relations
 - depends on: auth (allowlist + pairing), core (Settings, DB models, async engine), claude-runtime (every command speaks to `SessionManager`; the broadcast loop materialises `ClaudeEvent` + `McpPermissionRequest`).
@@ -90,5 +98,5 @@ The aiogram-based Telegram bot. This is the user's primary control surface: pair
 
 ## Status
 - State: IN PROGRESS
-- Tickets: CCR-006, CCR-008, CCR-009 (gating later removed in CCR-024), CCR-010, CCR-014 (planned), CCR-018, CCR-019, CCR-020, CCR-022, CCR-023, CCR-024, CCR-026, CCR-027 (deferred), CCR-028 (AUQ collision), CCR-030, CCR-031, CCR-032, CCR-033, CCR-034, CCR-035..CCR-040 (planned polish)
-- Last updated: CCR-034 (2026-05-05)
+- Tickets: CCR-006, CCR-008, CCR-009 (gating later removed in CCR-024), CCR-010, CCR-014 (planned), CCR-018, CCR-019, CCR-020, CCR-022, CCR-023, CCR-024, CCR-026, CCR-027 (deferred), CCR-028 (AUQ collision), CCR-030, CCR-031, CCR-032, CCR-033, CCR-034, CCR-035, CCR-036..CCR-040 (planned polish)
+- Last updated: CCR-035 (2026-05-05)

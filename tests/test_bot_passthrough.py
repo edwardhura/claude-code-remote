@@ -932,8 +932,8 @@ async def test_usage_renders_using_overage_false_distinct_from_none(
 
 @pytest.mark.asyncio
 async def test_usage_resets_at_in_the_past(tmp_path: Path) -> None:
-    """A 2020 epoch renders an absolute UTC timestamp + ``"in the past"``."""
-    # 2020-01-01T00:00:00Z = 1577836800
+    """A 2020 epoch renders an absolute UTC timestamp (helper format) + ``"in the past"``."""
+    # 2020-01-01T00:00:00Z = 1577836800; helper "full" mode → "00:00 01-01-2020".
     rl = _probe_rate_limit_event(
         resets_at=1577836800,
         # Trim other fields to keep the assertion focused.
@@ -956,8 +956,8 @@ async def test_usage_resets_at_in_the_past(tmp_path: Path) -> None:
 
     text = _captured_text(msg)
     assert "<b>Resets at:</b>" in text
-    # Absolute UTC timestamp surfaces.
-    assert "2020-01-01T00:00:00Z" in text
+    # Absolute UTC timestamp via format_user_datetime("full") — HH:MM - DD/MM/YYYY.
+    assert "00:00 - 01/01/2020" in text
     # Past delta surfaces as "in the past" rather than a negative duration.
     assert "in the past" in text
     # The relative-delta segment (everything inside the parens after "in")
