@@ -624,3 +624,230 @@ async def test_socket_listener_chmods_socket_to_owner_only(tmp_path: Path) -> No
         assert mode == 0o700
     finally:
         await server.stop()
+
+
+# --------------------------------------------------------------------------- #
+# CCR-028: suppressed-tool routing.
+#
+# Suppressed tools (``AskUserQuestion`` today, ``ExitPlanMode`` tomorrow per
+# CCR-027) bypass the bus envelope and route through a manager-registered
+# handler. The Future / resolution / timeout machinery is unchanged.
+# --------------------------------------------------------------------------- #
+
+
+async def _drain_session_events_into(bus: EventBus, captured: list[McpPermissionRequest]) -> None:
+    """Forever-running collector — caller cancels."""
+    async for payload in bus.subscribe("session.event"):
+        if not isinstance(payload, dict):
+            continue
+        event = payload.get("event")
+        if isinstance(event, McpPermissionRequest):
+            captured.append(event)
+
+
+async def test_suppressed_tool_call_does_not_publish_bus_envelope(
+    tmp_path: Path,
+) -> None:
+    """An ``AskUserQuestion`` MCP call invokes the handler, NOT the bus."""
+    bus = EventBus()
+    server = McpPermissionServer(
+        bus=bus,
+        timeout_seconds=5.0,
+        data_dir=tmp_path,
+        suppressed_tool_names=frozenset({"AskUserQuestion"}),
+    )
+    server.set_current_session(_SESSION_ID)
+
+    handler_calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _handler(request_id: str, tool_name: str, tool_input: dict[str, Any]) -> None:
+        handler_calls.append((request_id, tool_name, tool_input))
+
+    server.set_suppressed_tool_handler(_handler)
+
+    captured: list[McpPermissionRequest] = []
+    collector = asyncio.create_task(_drain_session_events_into(bus, captured))
+    await asyncio.sleep(0)
+
+    async with create_connected_server_and_client_session(server.server) as client:
+
+        async def _resolver() -> None:
+            # Wait until the handler has been invoked (Future is registered).
+            for _ in range(50):
+                if handler_calls:
+                    break
+                await asyncio.sleep(0.01)
+            assert handler_calls, "expected suppressed handler to be invoked"
+            await server.resolve(
+                handler_calls[0][0],
+                {"behavior": "deny", "message": "ok"},
+            )
+
+        resolver_task = asyncio.create_task(_resolver())
+        await client.call_tool(
+            "ccr_permission_prompt",
+            {"tool_name": "AskUserQuestion", "input": {"questions": []}},
+        )
+        await resolver_task
+
+    # Give the bus a microtask boundary to ensure no envelope was published.
+    await asyncio.sleep(0.01)
+
+    collector.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await collector
+
+    assert len(handler_calls) == 1
+    rid, name, tool_input = handler_calls[0]
+    assert name == "AskUserQuestion"
+    assert tool_input == {"questions": []}
+    assert isinstance(rid, str)
+    assert rid
+    assert captured == []
+
+
+async def test_suppressed_tool_resolve_unblocks_in_flight_call(
+    tmp_path: Path,
+) -> None:
+    """``server.resolve(request_id, ...)`` unblocks the suppressed-tool call."""
+    bus = EventBus()
+    server = McpPermissionServer(
+        bus=bus,
+        timeout_seconds=5.0,
+        data_dir=tmp_path,
+        suppressed_tool_names=frozenset({"AskUserQuestion"}),
+    )
+    server.set_current_session(_SESSION_ID)
+
+    handler_request_ids: list[str] = []
+
+    async def _handler(request_id: str, _tool_name: str, _tool_input: dict[str, Any]) -> None:
+        handler_request_ids.append(request_id)
+        await server.resolve(request_id, {"behavior": "deny", "message": "Red"})
+
+    server.set_suppressed_tool_handler(_handler)
+
+    async with create_connected_server_and_client_session(server.server) as client:
+        result = await client.call_tool(
+            "ccr_permission_prompt",
+            {"tool_name": "AskUserQuestion", "input": {}},
+        )
+
+    assert handler_request_ids
+    payload = _tool_result_payload(result)
+    assert payload == {"behavior": "deny", "message": "Red"}
+
+
+async def test_suppressed_tool_timeout_returns_canned_deny(
+    tmp_path: Path,
+) -> None:
+    """When the handler does not call resolve, the canonical timeout deny lands."""
+    bus = EventBus()
+    server = McpPermissionServer(
+        bus=bus,
+        timeout_seconds=0.05,
+        data_dir=tmp_path,
+        suppressed_tool_names=frozenset({"AskUserQuestion"}),
+    )
+    server.set_current_session(_SESSION_ID)
+
+    handler_invoked: list[str] = []
+
+    async def _handler(request_id: str, _tool_name: str, _tool_input: dict[str, Any]) -> None:
+        handler_invoked.append(request_id)
+
+    server.set_suppressed_tool_handler(_handler)
+
+    async with create_connected_server_and_client_session(server.server) as client:
+        result = await client.call_tool(
+            "ccr_permission_prompt",
+            {"tool_name": "AskUserQuestion", "input": {}},
+        )
+
+    assert handler_invoked
+    payload = _tool_result_payload(result)
+    assert payload["behavior"] == "deny"
+    assert "Timed out" in payload["message"]
+
+
+async def test_unsuppressed_tool_with_handler_set_still_publishes_envelope(
+    tmp_path: Path,
+) -> None:
+    """A non-suppressed tool name takes the legacy bus path even if a handler is registered."""
+    bus = EventBus()
+    server = McpPermissionServer(
+        bus=bus,
+        timeout_seconds=5.0,
+        data_dir=tmp_path,
+        suppressed_tool_names=frozenset({"AskUserQuestion"}),
+    )
+    server.set_current_session(_SESSION_ID)
+
+    handler_calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _handler(request_id: str, tool_name: str, tool_input: dict[str, Any]) -> None:
+        handler_calls.append((request_id, tool_name, tool_input))
+
+    server.set_suppressed_tool_handler(_handler)
+
+    captured: list[McpPermissionRequest] = []
+    collector = asyncio.create_task(_collect_first_envelope(bus, captured))
+    await asyncio.sleep(0)
+
+    async with create_connected_server_and_client_session(server.server) as client:
+
+        async def _resolver() -> None:
+            await collector
+            await server.resolve(
+                captured[0].request_id,
+                {"behavior": "allow", "updatedInput": None},
+            )
+
+        resolver_task = asyncio.create_task(_resolver())
+        await client.call_tool(
+            "ccr_permission_prompt",
+            {"tool_name": "Bash", "input": {"cmd": "ls"}},
+        )
+        await resolver_task
+
+    assert len(captured) == 1
+    assert captured[0].tool_name == "Bash"
+    assert handler_calls == []
+
+
+async def test_suppressed_tool_with_handler_unset_falls_through_to_bus(
+    tmp_path: Path,
+) -> None:
+    """Suppression set + no registered handler = legacy bus publish (defence in depth)."""
+    bus = EventBus()
+    server = McpPermissionServer(
+        bus=bus,
+        timeout_seconds=5.0,
+        data_dir=tmp_path,
+        suppressed_tool_names=frozenset({"AskUserQuestion"}),
+    )
+    server.set_current_session(_SESSION_ID)
+    # Deliberately do NOT call set_suppressed_tool_handler.
+
+    captured: list[McpPermissionRequest] = []
+    collector = asyncio.create_task(_collect_first_envelope(bus, captured))
+    await asyncio.sleep(0)
+
+    async with create_connected_server_and_client_session(server.server) as client:
+
+        async def _resolver() -> None:
+            await collector
+            await server.resolve(
+                captured[0].request_id,
+                {"behavior": "deny", "message": "fallback"},
+            )
+
+        resolver_task = asyncio.create_task(_resolver())
+        await client.call_tool(
+            "ccr_permission_prompt",
+            {"tool_name": "AskUserQuestion", "input": {}},
+        )
+        await resolver_task
+
+    assert len(captured) == 1
+    assert captured[0].tool_name == "AskUserQuestion"

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+
 from ccr.bot.formatting import (
     SAFE_CHUNK,
     TELEGRAM_HARD_LIMIT,
@@ -10,6 +12,7 @@ from ccr.bot.formatting import (
 )
 from ccr.claude.events import (
     AssistantTurn,
+    McpPermissionRequest,
     ResultEvent,
     ResultUsage,
     SystemInit,
@@ -433,3 +436,42 @@ def test_assistant_turn_mixed_blocks_keeps_other_tool_uses_unchanged() -> None:
     assert out[1][1].kind == "auq"
     assert out[2][0].startswith("\U0001f527 Bash")
     assert out[2][1] is None
+
+
+# --------------------------------------------------------------------------- #
+# CCR-028: McpPermissionRequest formatter — defensive guard.
+# --------------------------------------------------------------------------- #
+
+
+_MCP_TEST_SESSION_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
+
+
+def test_event_to_messages_drops_mcp_permission_request_for_ask_user_question() -> None:
+    """A stray AUQ McpPermissionRequest is silently dropped at the formatter."""
+    event = McpPermissionRequest(
+        request_id="abcdef01",
+        session_id=_MCP_TEST_SESSION_ID,
+        tool_name="AskUserQuestion",
+        tool_input={"questions": []},
+    )
+    assert event_to_messages(event) == []
+
+
+def test_event_to_messages_keeps_mcp_permission_request_for_other_tools() -> None:
+    """Non-AUQ McpPermissionRequest envelopes still render the keyboard message."""
+    from ccr.bot.formatting import _PendingKeyboard
+
+    event = McpPermissionRequest(
+        request_id="cafebabe",
+        session_id=_MCP_TEST_SESSION_ID,
+        tool_name="Bash",
+        tool_input={"cmd": "ls"},
+    )
+    out = event_to_messages(event)
+    assert len(out) == 1
+    text, kb = out[0]
+    assert "Permission requested" in text
+    assert "Bash" in text
+    assert isinstance(kb, _PendingKeyboard)
+    assert kb.kind == "perm"
+    assert kb.request_id == "cafebabe"

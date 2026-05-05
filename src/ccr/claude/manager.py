@@ -24,12 +24,13 @@ debounced to at most one update per second.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from sqlalchemy import select
@@ -137,12 +138,23 @@ class _PendingQuestion:
     free-text question. ``timeout_task`` is the ``asyncio.Task`` scheduled
     to fire after ``settings.ask_user_question_timeout_seconds``; cancelled
     on resolution and on teardown.
+
+    CCR-028: ``mcp_request_id`` is set when this AUQ tool_use was paired
+    with an MCP ``--permission-prompt-tool`` invocation. When non-``None``,
+    :meth:`SessionManager.send_tool_result` resolves the MCP Future with
+    ``{"behavior": "deny", "message": <answer>}`` instead of writing a
+    synthetic ``tool_result`` to claude's stdin (claude's harness writes
+    the synthetic ``tool_result`` itself once the deny lands, and a
+    parallel ``send_user_turn`` would race it). For MCP-paired entries
+    the caller's ``is_error`` flag is ignored — claude's harness flags
+    every deny as ``is_error=True`` on the wire.
     """
 
     tool_use_id: str
     session_id: uuid.UUID
     options: list[str]
     timeout_task: asyncio.Task[None] | None = None
+    mcp_request_id: str | None = None
 
 
 class SessionError(Exception):
@@ -234,17 +246,32 @@ class SessionManager:
         # started on the first new_session / continue_session call so a
         # SessionManager constructed in tests that never spins claude does
         # not pay the listener cost.
+        #
+        # CCR-028: ``AskUserQuestion`` is routed by claude through the same
+        # ``--permission-prompt-tool`` channel as regular permissions, so
+        # we suppress its bus envelope and route the MCP call to the
+        # AUQ-specific handler that pairs it with ``_pending_questions``.
         self._mcp = McpPermissionServer(
             bus=bus,
             timeout_seconds=float(settings.mcp_permission_timeout_seconds),
             data_dir=settings.data_dir,
+            suppressed_tool_names=frozenset({_ASK_USER_QUESTION_TOOL_NAME}),
         )
+        self._mcp.set_suppressed_tool_handler(self._on_mcp_ask_user_question)
         self._mcp_started = False
 
         # CCR-026 AskUserQuestion bookkeeping. Lifetime = current session;
         # cleared in _teardown_locked. Maps ``tool_use_id`` (the full,
         # opaque id supplied by Claude) to the per-question record.
         self._pending_questions: dict[str, _PendingQuestion] = {}
+
+        # CCR-028: AUQ MCP request_ids that arrived BEFORE the matching
+        # ``AssistantTurn`` JSONL line registered ``_pending_questions``.
+        # FIFO-drained from :meth:`_track_ask_user_question` when a fresh
+        # question is registered. In observed real-claude runs the
+        # AssistantTurn always lands first so this deque is effectively
+        # empty in practice; defensive against stream reordering.
+        self._unpaired_mcp_auq_calls: collections.deque[str] = collections.deque()
 
     # ------------------------------------------------------------------ #
     # Public API.
@@ -565,6 +592,40 @@ class SessionManager:
         """Return ``True`` iff a Future is registered for ``request_id``."""
         return self._mcp.is_pending(request_id)
 
+    async def _on_mcp_ask_user_question(
+        self,
+        request_id: str,
+        tool_name: str,  # noqa: ARG002 — kept for handler symmetry
+        tool_input: dict[str, Any],  # noqa: ARG002 — kept for handler symmetry
+    ) -> None:
+        """Pair an incoming AUQ MCP call with a :class:`_PendingQuestion` entry.
+
+        The :class:`AssistantTurn` JSONL line carrying the AUQ ``tool_use``
+        block and the MCP ``_on_tool_call`` invocation arrive on different
+        streams (stdout vs Unix socket). In every observed real-claude run
+        the AssistantTurn lands first, so the FIFO loop pairs the incoming
+        ``request_id`` with the first :attr:`_pending_questions` entry
+        whose ``mcp_request_id`` is ``None``.
+
+        If no un-paired entry exists, the request_id is parked in
+        :attr:`_unpaired_mcp_auq_calls`. :meth:`_track_ask_user_question`
+        consumes from that deque on the next AUQ observation. Walking past
+        an already-paired entry is logged as a warning — it means a
+        duplicate MCP call landed for an AUQ that already had a pairing
+        (claude bug, our pairing bug, or stream replay).
+        """
+        for pending in self._pending_questions.values():
+            if pending.mcp_request_id is None:
+                pending.mcp_request_id = request_id
+                return
+            log.warning(
+                "session_manager.auq_mcp_pairing_walk_past_paired",
+                tool_use_id=pending.tool_use_id,
+                existing_mcp_request_id=pending.mcp_request_id,
+                incoming_mcp_request_id=request_id,
+            )
+        self._unpaired_mcp_auq_calls.append(request_id)
+
     # ------------------------------------------------------------------ #
     # CCR-026: AskUserQuestion gate.
     # ------------------------------------------------------------------ #
@@ -583,16 +644,26 @@ class SessionManager:
         resolution guard against concurrent button taps / ``/answer``
         races.
 
+        CCR-028: when the popped entry carries an ``mcp_request_id`` (the
+        AUQ-via-MCP path), the answer is delivered by resolving the MCP
+        Future with ``{"behavior": "deny", "message": <content>}``.
+        claude's harness writes the synthetic ``tool_result`` itself once
+        the deny lands; we MUST NOT also write one via
+        :meth:`_deliver_tool_result` or two ``tool_result`` envelopes
+        would race for the same ``tool_use_id``. The caller's
+        ``is_error`` flag is ignored on the MCP path — claude's harness
+        flags every deny as ``is_error=True`` on the wire.
+
+        Legacy path (``mcp_request_id is None``): keeps the existing
+        wire write so callers that inject a raw ``tool_result`` outside
+        the AUQ-MCP collision window still work.
+
         Returns ``True`` if THIS call delivered (the id was registered);
         ``False`` if the id was unknown / already resolved / the session
         crashed mid-flight (``RuntimeError`` from
         :meth:`ClaudeProcess.send_user_turn`). The bot maps ``False`` to
         the canned ``"Stale prompt"`` alert — same shape as
         :meth:`resolve_permission`.
-
-        Wire path: builds a single ``ToolResultBlock`` and reuses
-        :meth:`ClaudeProcess.send_user_turn` — no new low-level write
-        method on :class:`ClaudeProcess`.
 
         Raises :class:`NoActiveSessionError` when no Claude subprocess is
         held (caller bug — same precondition as :meth:`send`).
@@ -606,6 +677,10 @@ class SessionManager:
             return False
         if pending.timeout_task is not None and not pending.timeout_task.done():
             pending.timeout_task.cancel()
+
+        if pending.mcp_request_id is not None:
+            decision: dict[str, object] = {"behavior": "deny", "message": content}
+            return await self._mcp.resolve(pending.mcp_request_id, decision)
 
         try:
             await self._deliver_tool_result(tool_use_id, content, is_error=is_error)
@@ -691,9 +766,14 @@ class SessionManager:
 
         # Resolve any outstanding permission Futures with deny BEFORE we
         # send SIGTERM so claude's tool dispatch sees a clean deny rather
-        # than a hung MCP socket.
+        # than a hung MCP socket. ``cancel_pending`` covers AUQ-paired
+        # Futures too — they share the same ``_futures`` map.
         await self._mcp.cancel_pending(session_id)
         self._mcp.set_current_session(None)
+        # CCR-028: drop any parked-but-unmatched AUQ MCP request_ids.
+        # No Future is registered for them under the post-cancel state,
+        # so this is plain bookkeeping cleanup.
+        self._unpaired_mcp_auq_calls.clear()
 
         # CCR-026: cancel every outstanding AskUserQuestion timeout task
         # and drop the bookkeeping. We do NOT send synthetic
@@ -823,11 +903,19 @@ class SessionManager:
             if block.id in self._pending_questions:
                 continue
             options = _extract_ask_user_question_options(block.input)
+            # CCR-028: drain a parked AUQ MCP request_id (covers the
+            # MCP-arrives-before-AssistantTurn race). In observed
+            # real-claude runs this deque is always empty and the
+            # pairing happens later in ``_on_mcp_ask_user_question``.
+            mcp_request_id = (
+                self._unpaired_mcp_auq_calls.popleft() if self._unpaired_mcp_auq_calls else None
+            )
             pending = _PendingQuestion(
                 tool_use_id=block.id,
                 session_id=session_id,
                 options=options,
                 timeout_task=None,
+                mcp_request_id=mcp_request_id,
             )
             self._pending_questions[block.id] = pending
             self._schedule_question_timeout(pending)
@@ -864,6 +952,15 @@ class SessionManager:
             timeout_seconds=deadline,
         )
         message = f"Timed out — no paired user responded within {int(deadline)}s"
+        if pending.mcp_request_id is not None:
+            # CCR-028 — same MCP-deny semantics as the happy-path
+            # ``send_tool_result`` branch. claude's harness writes the
+            # synthetic ``tool_result`` from the deny decision.
+            await self._mcp.resolve(
+                pending.mcp_request_id,
+                {"behavior": "deny", "message": message},
+            )
+            return
         try:
             await self._deliver_tool_result(tool_use_id, message, is_error=True)
         except (RuntimeError, NoActiveSessionError) as exc:

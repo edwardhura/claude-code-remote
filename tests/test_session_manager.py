@@ -1743,3 +1743,400 @@ def AsyncMock_helper():  # noqa: N802 — test-helper naming
         return None
 
     return _noop
+
+
+# --------------------------------------------------------------------------- #
+# CCR-028: AskUserQuestion / MCP collision handling — pairing, deny-on-resolve,
+# timeout-via-MCP, teardown drain.
+# --------------------------------------------------------------------------- #
+
+
+def _seed_pending_question_with_mcp(
+    manager: SessionManager,
+    *,
+    tool_use_id: str,
+    mcp_request_id: str,
+    options: list[str] | None = None,
+) -> None:
+    """Seed a paired AUQ entry directly so tests skip the AssistantTurn parse."""
+    from ccr.claude.manager import _PendingQuestion
+
+    sid = manager.current_session_id or uuid.UUID("99999999-9999-9999-9999-999999999999")
+    manager._pending_questions[tool_use_id] = _PendingQuestion(  # noqa: SLF001
+        tool_use_id=tool_use_id,
+        session_id=sid,
+        options=list(options or []),
+        timeout_task=None,
+        mcp_request_id=mcp_request_id,
+    )
+
+
+def _register_mcp_future(
+    manager: SessionManager,
+    *,
+    request_id: str,
+    session_id: uuid.UUID | None = None,
+) -> asyncio.Future[dict[str, object]]:
+    """Pre-seed the MCP server's ``_futures`` map for direct-resolve assertions."""
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[dict[str, object]] = loop.create_future()
+    manager._mcp._futures[request_id] = fut  # noqa: SLF001
+    sid = session_id or manager.current_session_id or uuid.UUID(int=0)
+    manager._mcp._sessions[request_id] = sid  # noqa: SLF001
+    manager._mcp._inputs[request_id] = {}  # noqa: SLF001
+    return fut
+
+
+async def test_ask_user_question_pairs_with_mcp_request_id_when_mcp_arrives_after_assistant_turn(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """AssistantTurn registers _pending_questions; later MCP call sets mcp_request_id."""
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    tool_use_id = "toolu_assistant_first"
+    _seed_pending_question(manager, tool_use_id=tool_use_id, options=["red", "blue"])
+
+    await manager._on_mcp_ask_user_question(  # noqa: SLF001
+        "rid-A",
+        "AskUserQuestion",
+        {},
+    )
+
+    pending = manager._pending_questions[tool_use_id]  # noqa: SLF001
+    assert pending.mcp_request_id == "rid-A"
+    assert len(manager._unpaired_mcp_auq_calls) == 0  # noqa: SLF001
+
+
+async def test_ask_user_question_pairs_when_mcp_arrives_first(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """MCP call before AssistantTurn → request_id parks; later registration drains it."""
+    from ccr.claude.events import parse_event
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    await manager._on_mcp_ask_user_question(  # noqa: SLF001
+        "rid-B",
+        "AskUserQuestion",
+        {},
+    )
+    assert list(manager._unpaired_mcp_auq_calls) == ["rid-B"]  # noqa: SLF001
+
+    tool_use_id = "toolu_mcp_first"
+    auq_event = parse_event(
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": tool_use_id,
+                        "name": "AskUserQuestion",
+                        "input": {
+                            "questions": [
+                                {
+                                    "question": "?",
+                                    "options": [{"label": "x"}],
+                                },
+                            ],
+                        },
+                    },
+                ],
+            },
+        }
+    )
+    sid = uuid.UUID("88888888-8888-8888-8888-888888888888")
+    manager._track_ask_user_question(auq_event, sid)  # noqa: SLF001
+    pending = manager._pending_questions[tool_use_id]  # noqa: SLF001
+    assert pending.mcp_request_id == "rid-B"
+    assert len(manager._unpaired_mcp_auq_calls) == 0  # noqa: SLF001
+    # Cancel the timeout task scheduled by _track_ask_user_question to keep
+    # the test from leaking pending tasks.
+    if pending.timeout_task is not None and not pending.timeout_task.done():
+        pending.timeout_task.cancel()
+
+
+async def test_send_tool_result_resolves_mcp_future_with_deny_message(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MCP-paired send_tool_result resolves the Future with deny+message; no wire write."""
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script, delay_ms=500)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    await manager.new_session(prompt=None, started_by_tg_user_id=None)
+
+    sent: list[object] = []
+    proc = manager._proc  # noqa: SLF001
+    assert proc is not None
+
+    async def _spy(content: object) -> None:
+        sent.append(content)
+
+    proc.send_user_turn = _spy  # type: ignore[method-assign]
+
+    full_id = "toolu_mcp_paired_aaaa"
+    request_id = "rid-C"
+    fut = _register_mcp_future(manager, request_id=request_id)
+    _seed_pending_question_with_mcp(
+        manager,
+        tool_use_id=full_id,
+        mcp_request_id=request_id,
+        options=["Red", "Blue"],
+    )
+
+    delivered = await manager.send_tool_result(full_id, "Red")
+    assert delivered is True
+    assert manager.is_question_pending(full_id) is False
+    # The Future is resolved with deny+message.
+    assert fut.done()
+    assert fut.result() == {"behavior": "deny", "message": "Red"}
+    # The wire path was NOT exercised — no second tool_result envelope.
+    assert sent == []
+
+    await manager.stop()
+
+
+async def test_send_tool_result_legacy_path_when_no_mcp_pairing(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pending question with mcp_request_id=None still uses the legacy wire write."""
+    from ccr.claude.events import ToolResultBlock
+
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script, delay_ms=500)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    await manager.new_session(prompt=None, started_by_tg_user_id=None)
+
+    sent: list[object] = []
+    proc = manager._proc  # noqa: SLF001
+    assert proc is not None
+
+    async def _spy(content: object) -> None:
+        sent.append(content)
+
+    proc.send_user_turn = _spy  # type: ignore[method-assign]
+
+    full_id = "toolu_legacy_aaaa"
+    _seed_pending_question(manager, tool_use_id=full_id, options=["x"])
+
+    delivered = await manager.send_tool_result(full_id, "x")
+    assert delivered is True
+    assert len(sent) == 1
+    payload = sent[0]
+    assert isinstance(payload, list)
+    assert isinstance(payload[0], ToolResultBlock)
+    assert payload[0].tool_use_id == full_id
+    assert payload[0].content == "x"
+
+    await manager.stop()
+
+
+async def test_question_timeout_resolves_mcp_future_when_paired(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MCP-paired AUQ timeout resolves the Future with the canonical deny message; no wire write."""
+    test_settings = Settings(
+        telegram_bot_token="dummy-token",  # type: ignore[arg-type]
+        public_url="http://localhost",  # type: ignore[arg-type]
+        jwt_secret="x" * 32,  # type: ignore[arg-type]
+        data_dir=tmp_path,
+        claude_bin=str(FAKE_CLAUDE),
+        subprocess_grace_kill_seconds=2,
+        ask_user_question_timeout_seconds=1,
+    )
+
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script, delay_ms=2000)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=test_settings)
+
+    await manager.new_session(prompt=None, started_by_tg_user_id=None)
+
+    sent: list[object] = []
+    proc = manager._proc  # noqa: SLF001
+    assert proc is not None
+
+    async def _spy(content: object) -> None:
+        sent.append(content)
+
+    proc.send_user_turn = _spy  # type: ignore[method-assign]
+
+    full_id = "toolu_mcp_timeout_aa"
+    request_id = "rid-D"
+    fut = _register_mcp_future(manager, request_id=request_id)
+    from ccr.claude.manager import _PendingQuestion
+
+    pending = _PendingQuestion(
+        tool_use_id=full_id,
+        session_id=manager.current_session_id or uuid.UUID(int=0),
+        options=[],
+        timeout_task=None,
+        mcp_request_id=request_id,
+    )
+    manager._pending_questions[full_id] = pending  # noqa: SLF001
+    manager._schedule_question_timeout(pending)  # noqa: SLF001
+
+    await asyncio.sleep(1.5)
+
+    assert manager.is_question_pending(full_id) is False
+    assert fut.done()
+    decision = fut.result()
+    assert decision["behavior"] == "deny"
+    assert "Timed out" in str(decision["message"])
+    # No wire write happened — the harness writes the synthetic tool_result.
+    assert sent == []
+
+    await manager.stop()
+
+
+async def test_teardown_with_outstanding_auq_drains_mcp_via_cancel_pending(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Teardown with a paired AUQ Future: cancel_pending resolves it with the canonical deny."""
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script, delay_ms=500)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    await manager.new_session(prompt=None, started_by_tg_user_id=None)
+
+    full_id = "toolu_teardown_drain"
+    request_id = "rid-E"
+    fut = _register_mcp_future(
+        manager,
+        request_id=request_id,
+        session_id=manager.current_session_id,
+    )
+    _seed_pending_question_with_mcp(
+        manager,
+        tool_use_id=full_id,
+        mcp_request_id=request_id,
+        options=["x"],
+    )
+
+    await manager.stop()
+
+    assert fut.done()
+    assert fut.result() == {"behavior": "deny", "message": "Session torn down"}
+    assert manager.is_question_pending(full_id) is False
+    assert len(manager._unpaired_mcp_auq_calls) == 0  # noqa: SLF001
+
+
+async def test_unpaired_mcp_auq_calls_cleared_on_teardown(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parked unpaired MCP request_ids are cleared on teardown (no leak across sessions)."""
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script, delay_ms=500)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    await manager.new_session(prompt=None, started_by_tg_user_id=None)
+
+    manager._unpaired_mcp_auq_calls.append("rid-F1")  # noqa: SLF001
+    manager._unpaired_mcp_auq_calls.append("rid-F2")  # noqa: SLF001
+    assert len(manager._unpaired_mcp_auq_calls) == 2  # noqa: SLF001
+
+    await manager.stop()
+    assert len(manager._unpaired_mcp_auq_calls) == 0  # noqa: SLF001
+
+
+async def test_concurrent_send_tool_result_only_first_winner_resolves_mcp(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two send_tool_result calls on the same id: first wins; second returns False, no second resolve."""
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script, delay_ms=500)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    await manager.new_session(prompt=None, started_by_tg_user_id=None)
+
+    full_id = "toolu_concurrent_aaa"
+    request_id = "rid-G"
+    fut = _register_mcp_future(manager, request_id=request_id)
+    _seed_pending_question_with_mcp(
+        manager,
+        tool_use_id=full_id,
+        mcp_request_id=request_id,
+        options=["only"],
+    )
+
+    resolve_calls: list[tuple[str, dict[str, object]]] = []
+    real_resolve = manager._mcp.resolve  # noqa: SLF001
+
+    async def _spy_resolve(rid: str, decision: dict[str, object]) -> bool:
+        resolve_calls.append((rid, decision))
+        return await real_resolve(rid, decision)
+
+    manager._mcp.resolve = _spy_resolve  # type: ignore[method-assign] # noqa: SLF001
+
+    first = await manager.send_tool_result(full_id, "only")
+    second = await manager.send_tool_result(full_id, "only")
+
+    assert first is True
+    assert second is False
+    # The MCP resolve was called exactly once: from the first
+    # send_tool_result. The second call returned ``False`` from the
+    # ``pop`` guard before reaching ``self._mcp.resolve``.
+    assert len(resolve_calls) == 1
+    assert resolve_calls[0][1] == {"behavior": "deny", "message": "only"}
+    assert fut.done()
+
+    await manager.stop()

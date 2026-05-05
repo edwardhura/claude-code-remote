@@ -41,6 +41,7 @@ import os
 import secrets
 import tempfile
 import uuid
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -58,6 +59,18 @@ if TYPE_CHECKING:
     from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 
     from ccr.events import EventBus
+
+
+# Callback signature for ``McpPermissionServer.set_suppressed_tool_handler``.
+# Invoked at ``_on_tool_call`` time for any ``tool_name`` in
+# ``suppressed_tool_names``. Receives the freshly minted ``request_id`` so the
+# handler can pair it with manager-side state and resolve it later via
+# ``McpPermissionServer.resolve``. The bus envelope is NOT published for
+# suppressed-tool calls — the handler is the sole notification channel.
+SuppressedToolHandler = Callable[
+    [str, str, dict[str, Any]],
+    Awaitable[None],
+]
 
 
 log = structlog.get_logger(__name__)
@@ -103,6 +116,7 @@ class McpPermissionServer:
         bus: EventBus,
         timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
         data_dir: Path | None = None,
+        suppressed_tool_names: frozenset[str] = frozenset(),
     ) -> None:
         self._bus = bus
         self._timeout_seconds = timeout_seconds
@@ -117,6 +131,11 @@ class McpPermissionServer:
         self._listener: SocketListener | None = None
         self._listener_task: asyncio.Task[None] | None = None
         self._current_session_id: uuid.UUID | None = None
+        # CCR-028: tool-name set whose MCP calls bypass the bus envelope and
+        # delegate to ``_suppressed_handler`` instead. ``frozenset()`` keeps
+        # the legacy behaviour for every tool.
+        self._suppressed_tool_names = suppressed_tool_names
+        self._suppressed_handler: SuppressedToolHandler | None = None
 
     # ------------------------------------------------------------------ #
     # Lifecycle.
@@ -271,6 +290,20 @@ class McpPermissionServer:
         """
         self._current_session_id = session_id
 
+    def set_suppressed_tool_handler(
+        self,
+        handler: SuppressedToolHandler | None,
+    ) -> None:
+        """Register the callback invoked for suppressed-tool MCP calls.
+
+        Called once at :class:`SessionManager` construction. Idempotent:
+        passing ``None`` clears the handler and the suppressed path falls
+        back to the legacy bus-publish behaviour (defence in depth — a
+        misconfigured deployment surfaces broken UX rather than a silent
+        hang).
+        """
+        self._suppressed_handler = handler
+
     # ------------------------------------------------------------------ #
     # Internals.
     # ------------------------------------------------------------------ #
@@ -339,7 +372,16 @@ class McpPermissionServer:
         tool_name: str,
         tool_input: dict[str, Any],
     ) -> dict[str, Any]:
-        """Mint id, register Future, publish envelope, await resolution.
+        """Mint id, register Future, notify (bus or handler), await resolution.
+
+        For non-suppressed tools, publishes a :class:`McpPermissionRequest`
+        envelope to the bus and awaits the Future. For suppressed tools
+        (``tool_name in self._suppressed_tool_names`` and a handler is
+        registered) the bus envelope is skipped — the registered
+        :data:`SuppressedToolHandler` is invoked instead and the caller is
+        expected to resolve the Future via :meth:`resolve` once a paired
+        user supplies an answer (CCR-028 routes ``AskUserQuestion`` this
+        way).
 
         This event is NOT a JSONL line — it lives on the bus only. The
         ``seq`` key is omitted from the bus payload so SSE consumers do
@@ -356,34 +398,48 @@ class McpPermissionServer:
         self._sessions[request_id] = session_id
         self._inputs[request_id] = tool_input
 
-        envelope = McpPermissionRequest(
-            request_id=request_id,
-            session_id=session_id,
-            tool_name=tool_name,
-            tool_input=tool_input,
-        )
-
-        await self._bus.publish(
-            "session.event",
-            {
-                "session_id": session_id,
-                "event": envelope,
-            },
-        )
+        handler = self._suppressed_handler
+        suppressed = tool_name in self._suppressed_tool_names and handler is not None
 
         try:
-            return await asyncio.wait_for(future, timeout=self._timeout_seconds)
-        except TimeoutError:
-            log.warning(
-                "mcp_permission_server.timeout",
-                request_id=request_id,
-                tool_name=tool_name,
-                timeout_seconds=self._timeout_seconds,
-            )
-            return {
-                "behavior": "deny",
-                "message": _format_timeout_message(self._timeout_seconds),
-            }
+            if suppressed and handler is not None:
+                try:
+                    await handler(request_id, tool_name, tool_input)
+                except Exception:  # noqa: BLE001 — never let a buggy handler wedge the MCP loop
+                    log.warning(
+                        "mcp_permission_server.suppressed_handler_failed",
+                        request_id=request_id,
+                        tool_name=tool_name,
+                        exc_info=True,
+                    )
+            else:
+                envelope = McpPermissionRequest(
+                    request_id=request_id,
+                    session_id=session_id,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                )
+                await self._bus.publish(
+                    "session.event",
+                    {
+                        "session_id": session_id,
+                        "event": envelope,
+                    },
+                )
+
+            try:
+                return await asyncio.wait_for(future, timeout=self._timeout_seconds)
+            except TimeoutError:
+                log.warning(
+                    "mcp_permission_server.timeout",
+                    request_id=request_id,
+                    tool_name=tool_name,
+                    timeout_seconds=self._timeout_seconds,
+                )
+                return {
+                    "behavior": "deny",
+                    "message": _format_timeout_message(self._timeout_seconds),
+                }
         finally:
             self._futures.pop(request_id, None)
             self._sessions.pop(request_id, None)
@@ -564,4 +620,4 @@ async def _socket_writer(
         return
 
 
-__all__ = ["McpPermissionServer", "McpServerStartError"]
+__all__ = ["McpPermissionServer", "McpServerStartError", "SuppressedToolHandler"]
