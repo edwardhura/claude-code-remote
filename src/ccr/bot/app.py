@@ -19,6 +19,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 from ccr.bot.handlers.ask_user_question import router as ask_user_question_router
+from ccr.bot.handlers.config import router as config_router
 from ccr.bot.handlers.pairing import router as pairing_router
 from ccr.bot.handlers.passthrough import router as passthrough_router
 from ccr.bot.handlers.permission import router as permission_router
@@ -59,6 +60,7 @@ def build_dispatcher(
     dp.include_router(ask_user_question_router)
     dp.include_router(session_router)
     dp.include_router(permission_router)
+    dp.include_router(config_router)
     dp.include_router(passthrough_router)
 
     bot = Bot(

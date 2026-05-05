@@ -295,42 +295,6 @@ Notes:
   - 2026-05-01 main: marked [blocked] — schema reconciliation work in this ticket is moot (no schema to reconcile to); supersedes filed as CCR-024 (remove dead permission code from CCR-009) and CCR-025 (MCP permission-prompt-tool integration). This ticket stays open as a tracking pin until CCR-025 lands; revisit if upstream Claude `-p` ever exposes a stdout permission channel.
 ---
 
-## CCR-034: `/config` command + per-user timezone preference [todo]
-Phase: n/a (post-CCR-010 UX polish — foundation for user-level prefs)
-Feature: chat-bot
-Files:
-  - `alembic/versions/000X_add_paired_users_timezone.py` (new migration) — add nullable `timezone TEXT` column to `paired_users`. Hand-written, additive. Existing rows get `NULL` (interpreted as UTC at render time).
-  - `src/ccr/db/models.py` — add `timezone: Mapped[str | None]` field on `PairedUser`.
-  - `src/ccr/bot/handlers/config.py` (new) — `/config` command handler opening an inline-keyboard menu with one entry today (`Timezone`) plus a `Back` button. Tapping `Timezone` opens a sub-menu listing common IANA zones (developer's call: a curated short list of ~10–20 plus a free-text fallback `/config tz <IANA name>`, OR a paged picker — pick whichever is cleaner UX). Selecting a zone writes it to `paired_users.timezone` for the calling `tg_user_id`. `Back` closes the menu cleanly (edit message back to a closed acknowledgement, or delete the menu — pick the cleaner UX).
-  - `src/ccr/bot/app.py` — register the new config router.
-  - `src/ccr/bot/handlers/passthrough.py` — update `_UNKNOWN_USAGE_HINT` to include `/config` if it currently lists slash commands.
-  - `tests/test_bot_config.py` (new) — `/config` opens menu; tapping `Timezone` opens picker; selecting a valid IANA zone persists to DB; selecting `Back` closes menu cleanly; invalid free-text IANA name returns a clear error and does not write; unpaired sender is short-circuited by the existing `AllowlistMiddleware` (regression).
-  - `tests/fakes/` — extend aiogram fake / fixtures if needed for callback-query menu flows.
-Out of scope:
-  - Other config entries (display name fallback, etc.) — file separately when needed; this ticket only adds the framework + `Timezone`.
-  - Web-side preference UI.
-  - Migrating the schema in any non-additive way (the column is nullable).
-  - The datetime helper that consumes this column — that's CCR-035.
-  - Standardising existing bot-side timestamp rendering — that's CCR-035.
-Acceptance:
-  - [ ] Alembic migration adds nullable `timezone` column to `paired_users`; `alembic downgrade base && alembic upgrade head` round-trips clean.
-  - [ ] `/config` opens an inline-keyboard menu with at least a `Timezone` entry and a `Back` button.
-  - [ ] Tapping `Timezone` lets the user pick (or type) an IANA zone; the choice persists to `paired_users.timezone` for the calling `tg_user_id` and is visible after a fresh `/config` invocation.
-  - [ ] An invalid IANA name (e.g. `Not/A/Zone`) is rejected with a clear error; the column is not updated. Validation uses Python stdlib `zoneinfo.ZoneInfo(...)` (raises `ZoneInfoNotFoundError`).
-  - [ ] `Back` cleanly dismisses the menu (edit-to-closed or delete — developer's call); no orphaned message remains in an interactive state.
-  - [ ] Default when no preference is set is `UTC` (the column is `NULL`; render-time fallback handled by the helper in CCR-035 — this ticket only ensures the column reads back `NULL` when unset).
-  - [ ] `pytest tests/test_bot_config.py` passes.
-  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
-Depends on: CCR-010
-Notes:
-  Phase n/a in the plan — post-CCR-010 UX polish. Foundation for any future user-level prefs (display name fallback, etc.). Stored on `paired_users` as a nullable column rather than a new `user_prefs` table per the user's "simpler is one nullable column" steer.
-  Mode 1A note for team-lead: probably skip the architect — additive UX surface (one new handler, one column, one migration). The only mildly load-bearing call is the picker UX shape (curated short-list + free-text fallback vs. paged picker); developer's call inside the ticket scope.
-  This ticket is the prerequisite for CCR-035 (datetime helper) producing user-localised output. Without `paired_users.timezone`, the helper would always fall back to UTC.
-  The test for an invalid IANA name should pin the validation entry point to `zoneinfo.ZoneInfo` so future zone updates do not require code changes.
-
-### Review log
----
-
 ## CCR-035: `format_user_datetime` helper + bot-wide datetime standardisation [todo]
 Phase: n/a (post-CCR-034 UX polish)
 Feature: chat-bot
