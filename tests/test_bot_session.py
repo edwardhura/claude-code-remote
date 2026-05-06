@@ -27,9 +27,11 @@ from sqlalchemy.ext.asyncio import (
 from ccr.auth.pairing import approve, create_code
 from ccr.bot.handlers.session import (
     _DIVIDER_MESSAGE,
+    _RENAME_USAGE_HINT,
     cmd_clear,
     cmd_new,
     cmd_pid,
+    cmd_rename,
     cmd_sessions,
     cmd_stop,
     cmd_who,
@@ -513,6 +515,8 @@ async def _seed_session(
     status: str = "completed",
     started_by_tg_user_id: int | None = 42,
     first_prompt: str | None = "hello world",
+    name: str | None = None,
+    claude_session_id: str | None = None,
 ) -> None:
     async with session_factory() as db:
         db.add(
@@ -522,6 +526,8 @@ async def _seed_session(
                 status=status,
                 started_by_tg_user_id=started_by_tg_user_id,
                 first_prompt=first_prompt,
+                name=name,
+                claude_session_id=claude_session_id,
             ),
         )
         await db.commit()
@@ -580,9 +586,10 @@ async def test_cmd_sessions_three_rows_returns_three_lines_in_desc_order(
     assert pos_newest < pos_middle < pos_oldest
 
 
-async def test_cmd_sessions_long_prompt_truncated_to_60_chars(
+async def test_cmd_sessions_renders_unnamed_placeholder_when_name_is_null(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    """Rows with NULL ``Session.name`` render the stable ``(unnamed)`` placeholder."""
     sid = uuid.UUID("dddddddd-0000-0000-0000-000000000004")
     await _seed_session(
         session_factory,
@@ -590,14 +597,14 @@ async def test_cmd_sessions_long_prompt_truncated_to_60_chars(
         started_at=datetime(2026, 4, 30, 13, 0, 0, tzinfo=UTC),
         status="completed",
         first_prompt="x" * 80,
+        name=None,
     )
 
     msg = _make_message(text="/sessions")
     await cmd_sessions(msg, db_factory=session_factory)
 
     reply = msg.answer.await_args.args[0]
-    assert "x" * 60 in reply
-    assert "x" * 61 not in reply
+    assert "(unnamed)" in reply
 
 
 async def test_cmd_sessions_status_field_passed_through_verbatim(
@@ -685,3 +692,302 @@ async def test_cmd_sessions_applies_caller_timezone_to_started_at(
     assert "08:30 - 6 May" in reply
     # The UTC-rendered string must NOT appear.
     assert "23:30 - 5 May" not in reply
+
+
+# --------------------------------------------------------------------------- #
+# CCR-037: /sessions five-field listing format.
+# --------------------------------------------------------------------------- #
+
+
+async def test_cmd_sessions_renders_five_field_format_with_claude_session_id_and_username(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Fully-populated row renders as
+    ``<claude_session_id> · <status> · <name> · HH:MM - D Mon · by @<username>``.
+    """
+    await _seed_paired_user(
+        session_factory,
+        tg_user_id=77,
+        last_chat_id=1077,
+        is_owner=False,
+    )
+    sid = uuid.UUID("12345678-aaaa-bbbb-cccc-000000000001")
+    await _seed_session(
+        session_factory,
+        session_id=sid,
+        started_at=datetime(2026, 5, 6, 10, 15, 0, tzinfo=UTC),
+        status="completed",
+        started_by_tg_user_id=77,
+        first_prompt="kicked off",
+        name="Refactor pairing flow",
+        claude_session_id="claude-session-deadbeef",
+    )
+
+    msg = _make_message(text="/sessions", user_id=77, username="u77")
+    await cmd_sessions(msg, db_factory=session_factory)
+
+    reply = msg.answer.await_args.args[0]
+    # CCR-035 short format is "HH:MM - D Mon"; the ticket-spec shorthand
+    # "HH:MM DD-MM" maps to that helper output via mode="short".
+    expected = (
+        "<code>claude-session-deadbeef</code> · completed · Refactor pairing flow · "
+        "10:15 - 6 May · by @u77"
+    )
+    assert expected in reply
+
+
+async def test_cmd_sessions_falls_back_to_uuid_prefix_when_claude_session_id_is_null(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Legacy rows with ``claude_session_id IS NULL`` show the 8-hex UUID prefix."""
+    sid = uuid.UUID("abcdef01-1111-2222-3333-444444444444")
+    await _seed_session(
+        session_factory,
+        session_id=sid,
+        started_at=datetime(2026, 5, 6, 11, 0, 0, tzinfo=UTC),
+        status="completed",
+        started_by_tg_user_id=42,
+        first_prompt="legacy",
+        name="legacy",
+        claude_session_id=None,
+    )
+
+    msg = _make_message(text="/sessions", user_id=42)
+    await cmd_sessions(msg, db_factory=session_factory)
+
+    reply = msg.answer.await_args.args[0]
+    assert "<code>abcdef01</code>" in reply
+
+
+async def test_cmd_sessions_falls_back_to_tg_user_id_when_username_missing(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Rows started by a paired user with no ``tg_username`` render ``by <tg_user_id>``."""
+    # Seed a paired user explicitly with NULL username.
+    async with session_factory() as db:
+        db.add(
+            PairedUser(
+                tg_user_id=555,
+                tg_username=None,
+                is_owner=False,
+                approved_at=datetime.now(UTC),
+                last_chat_id=2000,
+            ),
+        )
+        await db.commit()
+
+    sid = uuid.UUID("99999999-aaaa-bbbb-cccc-000000000099")
+    await _seed_session(
+        session_factory,
+        session_id=sid,
+        started_at=datetime(2026, 5, 6, 12, 0, 0, tzinfo=UTC),
+        status="completed",
+        started_by_tg_user_id=555,
+        first_prompt="anon",
+        name="anon",
+    )
+
+    msg = _make_message(text="/sessions", user_id=555, username=None)
+    await cmd_sessions(msg, db_factory=session_factory)
+
+    reply = msg.answer.await_args.args[0]
+    assert "by 555" in reply
+    # No leading "@" should appear before the user id.
+    assert "by @555" not in reply
+
+
+async def test_cmd_sessions_falls_back_to_tg_user_id_when_no_paired_row(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Rows started by a tg_user_id with no matching ``paired_users`` row also fall back."""
+    sid = uuid.UUID("88888888-aaaa-bbbb-cccc-000000000088")
+    await _seed_session(
+        session_factory,
+        session_id=sid,
+        started_at=datetime(2026, 5, 6, 12, 30, 0, tzinfo=UTC),
+        status="completed",
+        started_by_tg_user_id=999,
+        first_prompt="lone",
+        name="lone",
+    )
+
+    msg = _make_message(text="/sessions", user_id=42)
+    await cmd_sessions(msg, db_factory=session_factory)
+
+    reply = msg.answer.await_args.args[0]
+    assert "by 999" in reply
+
+
+async def test_cmd_sessions_html_escapes_name_with_special_chars(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A session name with ``<``, ``>``, ``&`` is HTML-escaped on render."""
+    sid = uuid.UUID("77777777-aaaa-bbbb-cccc-000000000077")
+    await _seed_session(
+        session_factory,
+        session_id=sid,
+        started_at=datetime(2026, 5, 6, 13, 0, 0, tzinfo=UTC),
+        status="completed",
+        started_by_tg_user_id=42,
+        first_prompt="x",
+        name="<script> & </script>",
+    )
+
+    msg = _make_message(text="/sessions", user_id=42)
+    await cmd_sessions(msg, db_factory=session_factory)
+
+    reply = msg.answer.await_args.args[0]
+    # Raw angle brackets MUST NOT appear inside the name slot — they
+    # would be parsed as HTML tags by Telegram and break the message.
+    assert "&lt;script&gt;" in reply
+    assert "&amp;" in reply
+    assert "<script>" not in reply
+
+
+# --------------------------------------------------------------------------- #
+# CCR-037: /rename
+# --------------------------------------------------------------------------- #
+
+
+async def test_cmd_rename_overwrites_null_name(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    sid = uuid.UUID("11112222-3333-4444-5555-666677778888")
+    await _seed_session(
+        session_factory,
+        session_id=sid,
+        started_at=datetime(2026, 5, 6, 14, 0, 0, tzinfo=UTC),
+        status="completed",
+        first_prompt="hello",
+        name=None,
+    )
+
+    msg = _make_message(text="/rename 11112222 New label", user_id=42)
+    await cmd_rename(msg, db_factory=session_factory)
+
+    msg.answer.assert_awaited_once()
+    reply = msg.answer.await_args.args[0]
+    assert "11112222" in reply
+    assert "New label" in reply
+
+    async with session_factory() as db:
+        row = await db.scalar(select(Session).where(Session.id == sid))
+    assert row is not None
+    assert row.name == "New label"
+
+
+async def test_cmd_rename_overwrites_existing_name(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """``/rename`` overwrites a non-NULL value (manual rename always wins)."""
+    sid = uuid.UUID("aaaa1111-2222-3333-4444-555566667777")
+    await _seed_session(
+        session_factory,
+        session_id=sid,
+        started_at=datetime(2026, 5, 6, 14, 30, 0, tzinfo=UTC),
+        status="completed",
+        first_prompt="hello",
+        name="old name",
+    )
+
+    msg = _make_message(text="/rename aaaa1111 brand new", user_id=42)
+    await cmd_rename(msg, db_factory=session_factory)
+
+    async with session_factory() as db:
+        row = await db.scalar(select(Session).where(Session.id == sid))
+    assert row is not None
+    assert row.name == "brand new"
+
+
+def test_cmd_rename_usage_hint_is_html_safe() -> None:
+    assert "<" not in _RENAME_USAGE_HINT
+    assert ">" not in _RENAME_USAGE_HINT
+
+
+async def test_cmd_rename_no_args_returns_usage_hint(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    msg = _make_message(text="/rename", user_id=42)
+    await cmd_rename(msg, db_factory=session_factory)
+
+    msg.answer.assert_awaited_once()
+    reply = msg.answer.await_args.args[0]
+    assert reply.startswith("Usage: /rename")
+
+
+async def test_cmd_rename_only_prefix_returns_usage_hint(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    msg = _make_message(text="/rename 11112222", user_id=42)
+    await cmd_rename(msg, db_factory=session_factory)
+
+    msg.answer.assert_awaited_once()
+    reply = msg.answer.await_args.args[0]
+    assert reply.startswith("Usage: /rename")
+
+
+async def test_cmd_rename_blank_name_returns_usage_hint(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    msg = _make_message(text="/rename 11112222    ", user_id=42)
+    await cmd_rename(msg, db_factory=session_factory)
+
+    msg.answer.assert_awaited_once()
+    reply = msg.answer.await_args.args[0]
+    assert reply.startswith("Usage: /rename")
+
+
+async def test_cmd_rename_unknown_prefix_returns_error(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    sid = uuid.UUID("aabbccdd-1111-2222-3333-444455556666")
+    await _seed_session(
+        session_factory,
+        session_id=sid,
+        started_at=datetime(2026, 5, 6, 15, 0, 0, tzinfo=UTC),
+        status="completed",
+        first_prompt="x",
+    )
+
+    msg = _make_message(text="/rename deadbeef whatever", user_id=42)
+    await cmd_rename(msg, db_factory=session_factory)
+
+    msg.answer.assert_awaited_once()
+    reply = msg.answer.await_args.args[0]
+    assert "No session found" in reply
+    assert "deadbeef" in reply
+
+
+async def test_cmd_rename_invalid_prefix_returns_usage_hint(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A prefix that is not 8 hex chars returns the usage hint, no DB hit."""
+    msg = _make_message(text="/rename ZZZZZZZZ name", user_id=42)
+    await cmd_rename(msg, db_factory=session_factory)
+
+    msg.answer.assert_awaited_once()
+    reply = msg.answer.await_args.args[0]
+    assert reply.startswith("Usage: /rename")
+
+
+async def test_cmd_rename_truncates_long_name_to_40_chars(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    sid = uuid.UUID("ccccdddd-1111-2222-3333-444455556666")
+    await _seed_session(
+        session_factory,
+        session_id=sid,
+        started_at=datetime(2026, 5, 6, 15, 30, 0, tzinfo=UTC),
+        status="completed",
+        first_prompt="x",
+    )
+    long_name = "x" * 80
+
+    msg = _make_message(text=f"/rename ccccdddd {long_name}", user_id=42)
+    await cmd_rename(msg, db_factory=session_factory)
+
+    async with session_factory() as db:
+        row = await db.scalar(select(Session).where(Session.id == sid))
+    assert row is not None
+    assert row.name is not None
+    assert len(row.name) <= 40

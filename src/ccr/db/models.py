@@ -113,6 +113,7 @@ class Session(Base):
     exit_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     claude_session_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    name: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
 
     __table_args__ = (
         Index("ix_sessions_status", "status"),
