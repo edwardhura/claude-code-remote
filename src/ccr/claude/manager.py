@@ -67,6 +67,32 @@ _LAST_EVENT_DEBOUNCE_SECONDS = 1.0
 _INIT_WAIT_TIMEOUT_SECONDS = 30.0
 _CRASH_REASON_TAIL_BYTES = 200
 
+# CCR-037: cap on auto-derived ``Session.name`` length. The ``/sessions``
+# listing aligns columns at this width, so longer auto-fills would push
+# subsequent fields off-screen on mobile. Manual ``/rename`` writes share
+# the same cap to keep the listing visually consistent.
+_SESSION_NAME_MAX_LEN = 40
+
+
+def _truncate_session_name(text: str) -> str:
+    """Return ``text`` reduced to at most ``_SESSION_NAME_MAX_LEN`` characters.
+
+    Whitespace is collapsed and the result is stripped. If the cleaned
+    text fits, it is returned as-is. Otherwise the result is hard-cut at
+    ``_SESSION_NAME_MAX_LEN - 1`` and an ellipsis (``"…"``, U+2026) is
+    appended so the caller can tell at a glance the name was clipped.
+    The total length is guaranteed ≤ :data:`_SESSION_NAME_MAX_LEN`. An
+    input that is empty after stripping returns the empty string — the
+    caller decides whether to skip the auto-fill in that case.
+    """
+    cleaned = " ".join(text.split())
+    if not cleaned:
+        return ""
+    if len(cleaned) <= _SESSION_NAME_MAX_LEN:
+        return cleaned
+    return cleaned[: _SESSION_NAME_MAX_LEN - 1] + "…"
+
+
 # Tool names that mark a subagent dispatch in stream-json. ``Task`` is the
 # modern name (per ``SystemInit.tools`` in v2.1.123 logs); ``Agent`` appears
 # in older session logs. Both are accepted to be forward/backward compatible.
@@ -1170,6 +1196,47 @@ class SessionManager:
         except Exception:
             log.exception(
                 "session_manager.session_insert_failed",
+                session_id=str(session_id),
+            )
+        # CCR-037: auto-fill ``Session.name`` from the first user prompt as
+        # a separate UPDATE so the ``WHERE name IS NULL`` guard is explicit
+        # and the manual-rename-sticks invariant is enforced even if a
+        # future code path renames the row before this call lands.
+        if first_prompt is not None:
+            await self._auto_fill_session_name(session_id, first_prompt)
+
+    async def _auto_fill_session_name(
+        self,
+        session_id: uuid.UUID,
+        prompt: str,
+    ) -> None:
+        """Set ``Session.name`` from ``prompt`` iff it is currently ``NULL``.
+
+        Truncates via :func:`_truncate_session_name`; an empty result
+        (whitespace-only prompt) is treated as a no-op so the row keeps a
+        ``NULL`` name and the ``/sessions`` listing renders ``(unnamed)``.
+        Failures are logged via :func:`log.exception` and never re-raised
+        — losing this write is non-fatal (the row simply renders as
+        ``(unnamed)`` until ``/rename`` overwrites it).
+        """
+        derived = _truncate_session_name(prompt)
+        if not derived:
+            return
+        try:
+            async with self._db_factory() as db:
+                row = await db.scalar(select(Session).where(Session.id == session_id))
+                if row is None:
+                    return
+                if row.name is not None:
+                    # Manual rename or another writer landed first; the
+                    # auto-fill-only-when-null invariant means we MUST
+                    # not overwrite it.
+                    return
+                row.name = derived
+                await db.commit()
+        except Exception:
+            log.exception(
+                "session_manager.session_name_autofill_failed",
                 session_id=str(session_id),
             )
 

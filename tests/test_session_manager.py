@@ -342,6 +342,142 @@ async def test_first_prompt_recorded_truncated_to_500(
     assert len(row.first_prompt) == 500
 
 
+async def test_session_name_autofilled_from_first_prompt_truncated_to_40(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CCR-037: auto-fill ``Session.name`` from the first user prompt.
+
+    The auto-fill cap is 40 chars; longer prompts are hard-cut and an
+    ellipsis is appended so the listing alignment stays predictable.
+    """
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    short_prompt = "Refactor pairing flow"
+    session_id = await manager.new_session(prompt=short_prompt, started_by_tg_user_id=None)
+    await _drain_status(bus, SessionStatus.COMPLETED, timeout=5.0)
+
+    async with session_factory() as db:
+        row = await db.scalar(select(Session).where(Session.id == session_id))
+    assert row is not None
+    assert row.name == short_prompt
+
+
+async def test_session_name_autofill_truncates_long_prompt_to_40(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    long_prompt = "x" * 200
+    session_id = await manager.new_session(prompt=long_prompt, started_by_tg_user_id=None)
+    await _drain_status(bus, SessionStatus.COMPLETED, timeout=5.0)
+
+    async with session_factory() as db:
+        row = await db.scalar(select(Session).where(Session.id == session_id))
+    assert row is not None
+    assert row.name is not None
+    assert len(row.name) <= 40
+    # Hard-cut path appends an ellipsis.
+    assert row.name.endswith("…")
+
+
+async def test_session_name_autofill_left_null_for_no_prompt(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``new_session(prompt=None)`` (e.g. ``/new`` with no args) leaves ``name`` NULL."""
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    session_id = await manager.new_session(prompt=None, started_by_tg_user_id=None)
+    await _drain_status(bus, SessionStatus.COMPLETED, timeout=5.0)
+
+    async with session_factory() as db:
+        row = await db.scalar(select(Session).where(Session.id == session_id))
+    assert row is not None
+    assert row.name is None
+
+
+async def test_session_name_autofill_does_not_overwrite_manually_set_name(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The auto-fill UPDATE is gated on ``name IS NULL`` — manual rename always wins.
+
+    Drives the helper directly because the natural flow always inserts
+    a fresh row with NULL name first; here we pre-set the name on the
+    just-inserted row and then assert the auto-fill helper observes the
+    ``WHERE name IS NULL`` guard and does not stomp it.
+    """
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    session_id = await manager.new_session(
+        prompt="initial prompt",
+        started_by_tg_user_id=None,
+    )
+    await _drain_status(bus, SessionStatus.COMPLETED, timeout=5.0)
+
+    # Pretend a manual ``/rename`` just landed before a re-trigger of the
+    # auto-fill helper.
+    async with session_factory() as db:
+        row = await db.scalar(select(Session).where(Session.id == session_id))
+        assert row is not None
+        row.name = "manual override"
+        await db.commit()
+
+    # Re-call the auto-fill helper with a new prompt; the WHERE-NULL guard
+    # must keep ``manual override`` intact.
+    await manager._auto_fill_session_name(  # noqa: SLF001 — invariant test
+        session_id,
+        "a much later prompt that should not stomp the rename",
+    )
+
+    async with session_factory() as db:
+        row = await db.scalar(select(Session).where(Session.id == session_id))
+    assert row is not None
+    assert row.name == "manual override"
+
+
 async def test_last_event_at_is_updated_with_debounce(
     settings: Settings,
     session_factory: async_sessionmaker[AsyncSession],

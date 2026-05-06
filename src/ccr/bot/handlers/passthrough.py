@@ -62,7 +62,7 @@ BLOCKED_INTERACTIVE: frozenset[str] = frozenset({"mcp", "init"})
 
 _UNKNOWN_USAGE_HINT = (
     "Unknown command. Whitelisted: /new /stop /clear /view /last /preview "
-    "/cost /usage /model /compact /who /agents /skills /config."
+    "/cost /usage /model /compact /who /agents /skills /config /rename."
 )
 
 _AGENTS_LIBRARY_GLOB_REL = ".claude/agents"

@@ -1119,3 +1119,61 @@ Notes:
   - 2026-05-05 team-lead: rejected — F3 path traversal (import_session.py:116, unvalidated user-supplied claude_session_id interpolated into filesystem path) is a real security finding; F2 stale docstring (manager.py:721) also needs fix; F1 (missing BRIEF note) was procedural — note was present in dev report but not relayed to reviewer
   - 2026-05-06 team-lead: approved
   - 2026-05-05 main: format respec by user pre-publish — `full` → `HH:MM - DD/MM/YYYY`; `short` → `HH:MM - D Mon` (locale-independent English month abbr., no leading zero on day); `time` unchanged. Helper, tests (now 13 in test_utils_datetime.py), bot regression tests, BRIEF, CONTEXT, and the spec/acceptance lines in this ticket all updated to match.
+
+---
+
+## CCR-037: Session human name + standardised `/sessions` listing format [done]
+Phase: n/a (post-CCR-036 — finalised listing format)
+Feature: chat-bot
+Files:
+  - `alembic/versions/000X_add_sessions_name.py` (new migration) — add nullable `name TEXT` column to `sessions`. Additive. Hand-written.
+  - `src/ccr/db/models.py` — add `name: Mapped[str | None]` field on `Session`.
+  - `src/ccr/claude/manager.py` — when the first user prompt of a session arrives, auto-fill `sessions.name` ONLY when `name IS NULL` (so a manual rename sticks). Truncate to ~40 chars (developer's call: at word boundary or hard cut + ellipsis). No `name_is_custom` flag — the auto-fill-only-when-null rule covers it.
+  - `src/ccr/bot/handlers/session.py` — extend `cmd_sessions` so each row renders as:
+    ```
+    <claude_session_id> · <status> · <name> · HH:MM DD-MM · by @<username>
+    ```
+    where:
+    - `<claude_session_id>` is the column from CCR-036; for legacy rows where it is NULL, fall back to our UUID prefix (today's behaviour).
+    - `<status>` unchanged.
+    - `<name>` from this ticket; if NULL, render a placeholder (e.g. `(unnamed)` — developer's call) or omit the field cleanly.
+    - Datetime via `format_user_datetime(started_at, user, "short")` from CCR-035.
+    - "by" rule: join on `paired_users.username` (already captured at pairing time) and render `by @<username>`. Fallback when username is missing: `by <tg_user_id>` (no first_name; user explicitly excluded that).
+  - `src/ccr/bot/handlers/session.py` (or a sibling handler module — developer's call) — new `/rename` command for the manual rename path. Suggested shape: `/rename <session_id_prefix> <name>` writes to `sessions.name`. Alternative: an inline `Rename` button on each session row (developer's call between command vs. button — pick the cleaner UX). One path, not both.
+  - `src/ccr/bot/handlers/passthrough.py` — update `_UNKNOWN_USAGE_HINT` to include `/rename` if a command path is chosen.
+  - `tests/test_bot_session.py` — extend with: name auto-fill on first user prompt; auto-fill is suppressed when `name` already set; manual rename writes to the column; `/sessions` listing renders the new format with all five fields; `claude_session_id` fallback to UUID prefix for legacy NULL rows; missing-username falls back to `by <tg_user_id>`.
+Out of scope:
+  - Sourcing the rename target via anything other than session-id prefix or button-tap (no fuzzy match).
+  - Renaming a session via web viewer.
+  - Persisting `name_is_custom` — explicitly out per the user's "one column only" steer.
+  - Backfilling `name` for legacy rows — leave NULL; the listing renders the placeholder.
+  - Display name fallback via `paired_users` (the user excluded `first_name`).
+Acceptance:
+  - [x] Alembic migration adds nullable `name` column to `sessions`; `alembic downgrade base && alembic upgrade head` round-trips clean.
+  - [x] On a fresh session, the first user prompt seeds `sessions.name` truncated to ~40 chars; subsequent prompts do NOT overwrite it.
+  - [x] A row with `name` already set is not auto-overwritten on the next session start (manual-rename-sticks rule).
+  - [x] Manual rename path (`/rename <prefix> <name>` or inline button — developer's call) writes the new value to `sessions.name`.
+  - [x] `/sessions` listing renders each row in the format `<claude_session_id> · <status> · <name> · HH:MM DD-MM · by @<username>`, using `format_user_datetime(..., "short")` from CCR-035.
+  - [x] Rows where `claude_session_id IS NULL` (legacy) fall back to our UUID prefix in that slot.
+  - [x] Rows where `paired_users.username` is missing fall back to `by <tg_user_id>` (no `first_name`).
+  - [x] All interpolated values are HTML-escaped (consistent with `formatting.py` conventions used in CCR-008/CCR-018).
+  - [x] `pytest tests/test_bot_session.py` passes.
+  - [x] `pytest --cov=ccr --cov-fail-under=80` passes.
+Depends on: CCR-035, CCR-036
+Notes:
+  Phase n/a — post-CCR-036 finalised listing format. Combines findings 2 (`@username` rule), 3 (human name + manual rename), and 5b (final listing template) into a single ticket because they all converge on the same render path.
+  The user's design steers to keep here:
+    - Format: `by @<username>` with fallback `by <tg_user_id>`. **Do not include `first_name`.**
+    - Auto-fill name only when `name IS NULL`; no separate `name_is_custom` flag.
+    - Manual rename path: command OR button — developer's call between the two; one path, not both.
+  Mode 1A note for team-lead: probably skip the architect — additive UX (one column, one migration, listing render extension, one new command/button). The only mildly load-bearing call is command vs. button for rename; developer's call inside the ticket scope.
+  This ticket depends on CCR-035 (the `format_user_datetime` helper for the `short` mode) and CCR-036 (the `claude_session_id` column). Order matters; do not pick this up until both are landed.
+
+### Review log
+  - 2026-05-06 main: branch ccr-037-session-name-listing created, dispatching team-lead
+  - 2026-05-06 team-lead: scope brief issued (no architect), dispatching python-developer
+  - 2026-05-06 team-lead: scope brief reissued (developer dispatch resumed after mid-flight break)
+  - 2026-05-06 team-lead: BRIEF/CONTEXT refreshed, dispatching reviewer
+  - 2026-05-06 team-lead: REVIEW FAIL — _RENAME_USAGE_HINT unescaped HTML angle brackets crash /rename hint reply (F1 HIGH); BRIEF wording overstatement (F2 LOW). Re-dispatching python-developer with fix scope.
+  - 2026-05-06 team-lead: BRIEF/CONTEXT re-refreshed (fix-loop pass), dispatching reviewer
+  - 2026-05-06 team-lead: approved
