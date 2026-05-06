@@ -295,40 +295,6 @@ Notes:
   - 2026-05-01 main: marked [blocked] — schema reconciliation work in this ticket is moot (no schema to reconcile to); supersedes filed as CCR-024 (remove dead permission code from CCR-009) and CCR-025 (MCP permission-prompt-tool integration). This ticket stays open as a tracking pin until CCR-025 lands; revisit if upstream Claude `-p` ever exposes a stdout permission channel.
 ---
 
-## CCR-042: address chat sessions by `claude_session_id` prefix in `/sessions` and `/continue` [todo]
-Phase: n/a (post-CCR-041 chat-bot UX follow-up)
-Feature: chat-bot
-Files:
-  - `src/ccr/bot/handlers/session.py` — `/sessions` listing (`_format_session_row` around lines 320-333): render `claude_session_id[:8]` (8-hex prefix of the stored UUID-formatted string) for rows where `claude_session_id` is set; keep the existing `Session.id[:8]` fallback for rows where `claude_session_id IS NULL` (legacy / pre-CCR-036 / failed-init). Resume-chain rows (multiple rows sharing one `claude_session_id` after CCR-041) all render the same 8-hex prefix — that is intended; users re-use the prefix for `/continue`.
-  - `src/ccr/bot/handlers/session.py` — update the `cmd_sessions` docstring around lines 268-283 (and any user-facing help text) to reflect the new format: 8-hex prefix of `claude_session_id`, full UUID no longer rendered.
-  - `src/ccr/claude/manager.py` — `_db_lookup_resumable_claude_session_id` around lines 1243-1284: change the prefix-match arm to compare against the first 8 hex of the stored `claude_session_id` string (i.e. `value[:8]`, since CCR-036 stores the column as a Python `str`, not a `uuid.UUID`) instead of `row.id.hex[:8]`. When multiple rows match (resume chain), apply the same `started_at desc → first` rule already used on the no-prefix path. Rows with `claude_session_id IS NULL` continue to be skipped from prefix matching (they cannot be resumed by Claude id since they don't have one).
-  - `tests/test_bot_session_handlers.py` (or wherever `/sessions` and `/continue` are exercised — locate by grepping for `cmd_sessions` and `continue_session`) — add cases for: (a) row with `claude_session_id` renders its 8-hex prefix; (b) row with `claude_session_id IS NULL` renders the local-id 8-hex fallback; (c) `/continue <claude-id-prefix>` resolves to the most-recent resumable row sharing that `claude_session_id`; (d) prefix that matches no row raises `SessionNotFoundError`; (e) prefix that only matches a NULL-`claude_session_id` row raises `NoPriorSessionError` (mirrors current behaviour).
-Out of scope:
-  - Renaming behaviour — covered by CCR-043.
-  - Changes to `import_claude_session` or the partial index — handled by CCR-041.
-  - Backfilling NULL `claude_session_id` rows.
-Acceptance:
-  - [ ] `/sessions` renders `claude_session_id[:8]` for rows where it is set, and `Session.id[:8]` for rows where it is NULL.
-  - [ ] `/continue <claude-id-prefix>` resumes the most-recent resumable row sharing that `claude_session_id`.
-  - [ ] After CCR-036's `ccr session save <claude-id>` and a bot restart, `/continue <prefix-of-saved-claude-id>` resumes that conversation from chat without the user needing to learn the local row UUID.
-  - [ ] `/continue` with no prefix is unchanged (most recent finished row with non-NULL `claude_session_id`).
-  - [ ] Resume chains (multiple rows sharing `claude_session_id` after CCR-041) all show the same 8-hex prefix in `/sessions` and resolve via that prefix in `/continue`.
-  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
-  - [ ] `ruff check src tests` passes.
-  - [ ] `ruff format --check` passes.
-  - [ ] `mypy src` passes.
-Depends on: CCR-041
-Notes:
-  Rekeys the chat surface from the local `Session.id` UUID onto `claude_session_id`, which is the more meaningful identifier now that resume chains (CCR-041) and `ccr session save <claude-id>` (CCR-036) make the Claude session id the user-facing handle. Without CCR-041 first, resumed rows still write NULL into `claude_session_id`, and the new prefix lookup would not find them — hence the hard dep.
-  Prior bot listing rendered the FULL `claude_session_id` UUID where set; the user explicitly wants the 8-hex prefix to keep `/sessions` lines compact and to mirror how `/continue` accepts prefixes.
-  `claude_session_id` is stored as a Python `str` (UUID-formatted) per CCR-036, so prefix slicing is `value[:8]`, NOT `.hex[:8]` (the latter is only valid for the local `uuid.UUID` `Session.id`).
-  After this ticket lands, the existing `started_at desc → first` rule in `_db_lookup_resumable_claude_session_id` handles the resume-chain case naturally; no extra ordering work needed.
-  Mode 1A note for team-lead: skip the architect — small, surgical change in two files plus tests; no new abstraction.
-
-### Review log
-  - 2026-05-06 project-manager: filed as CCR-041 follow-up — chat addressing rekeyed onto claude_session_id
----
-
 ## CCR-043: `/rename` becomes active-session-only; add `/setname <prefix> <name>` for arbitrary rename [todo]
 Phase: n/a (post-CCR-041 chat-bot UX follow-up)
 Feature: chat-bot

@@ -768,7 +768,11 @@ async def test_continue_session_with_prefix_resumes_matched_row(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A valid prefix selects the matching resumable row even when newer rows exist."""
+    """A valid prefix selects the resumable row whose ``claude_session_id[:8]`` matches.
+
+    CCR-042: the prefix is matched against the first 8 chars of the stored
+    ``claude_session_id`` string (NOT the local row UUID).
+    """
     import uuid as _uuid_mod
     from datetime import UTC as _UTC
     from datetime import datetime as _dt_mod
@@ -777,19 +781,21 @@ async def test_continue_session_with_prefix_resumes_matched_row(
     base = _dt_mod(2026, 4, 30, 10, 0, 0, tzinfo=_UTC)
     older_id = _uuid_mod.UUID("76581b99-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
     newer_id = _uuid_mod.UUID("ffffffff-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+    older_claude_id = "ab12cd34-5566-7788-99aa-bbccddeeff00"
+    newer_claude_id = "ff998877-6655-4433-2211-aabbccddeeff"
     await _seed_finished_session(
         session_factory,
         session_id=older_id,
         started_at=base,
         status="completed",
-        claude_session_id="claude-older",
+        claude_session_id=older_claude_id,
     )
     await _seed_finished_session(
         session_factory,
         session_id=newer_id,
         started_at=base + _td(seconds=30),
         status="completed",
-        claude_session_id="claude-newer",
+        claude_session_id=newer_claude_id,
     )
 
     events = [
@@ -806,17 +812,17 @@ async def test_continue_session_with_prefix_resumes_matched_row(
 
     new_id = await manager.continue_session(
         started_by_tg_user_id=42,
-        session_id_prefix="76581b99",
+        session_id_prefix=older_claude_id[:8],
     )
     assert new_id not in {older_id, newer_id}
     await _drain_status(bus, SessionStatus.COMPLETED, timeout=5.0)
 
     # The older row's ``claude_session_id`` is the resume target — not the
-    # newer row's — because the prefix matched the older row.
+    # newer row's — because the prefix matched the older row's claude id.
     assert argv_file.exists()
     argv_lines = argv_file.read_text(encoding="utf-8").splitlines()
     resume_idx = argv_lines.index("--resume")
-    assert argv_lines[resume_idx + 1] == "claude-older"
+    assert argv_lines[resume_idx + 1] == older_claude_id
 
     async with session_factory() as db:
         older_row = await db.scalar(select(Session).where(Session.id == older_id))
@@ -858,17 +864,24 @@ async def test_continue_session_lookup_by_prefix_excludes_crashed(
     settings: Settings,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Crashed rows are excluded from the prefix lookup, mirroring the no-arg path."""
+    """Crashed rows are excluded from the prefix lookup, mirroring the no-arg path.
+
+    CCR-042: prefix is matched against ``claude_session_id[:8]``. A crashed
+    row whose claude id prefix would otherwise match is filtered out by the
+    ``_RESUMABLE_STATUSES`` SQL filter before we ever look at the prefix.
+    """
     import uuid as _uuid_mod
     from datetime import UTC as _UTC
     from datetime import datetime as _dt_mod
 
     crashed_id = _uuid_mod.UUID("deadbeef-cafe-cafe-cafe-cafecafecafe")
+    crashed_claude_id = "deadbeef-1111-2222-3333-444455556666"
     await _seed_finished_session(
         session_factory,
         session_id=crashed_id,
         started_at=_dt_mod(2026, 4, 30, 10, 0, 0, tzinfo=_UTC),
         status="crashed",
+        claude_session_id=crashed_claude_id,
     )
 
     bus = EventBus()
@@ -976,15 +989,17 @@ async def test_continue_session_skips_rows_with_null_claude_session_id(
     assert str(ei.value) == "No prior session to continue."
 
 
-async def test_continue_session_by_prefix_against_null_row_raises_no_prior(
+async def test_continue_session_by_prefix_skips_null_claude_session_id_rows(
     settings: Settings,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Prefix matches a row with ``claude_session_id IS NULL`` -> ``NoPriorSessionError``.
+    """CCR-042: rows with ``claude_session_id IS NULL`` are skipped from prefix matching.
 
-    Critically NOT ``SessionNotFoundError``: the row exists, just isn't
-    resumable. ``SessionNotFoundError``'s "look harder" canned reply would
-    be misleading.
+    Under the new prefix semantics (compare against ``claude_session_id[:8]``)
+    a NULL ``claude_session_id`` cannot match any prefix at all, so we
+    surface :class:`SessionNotFoundError` rather than the legacy
+    :class:`NoPriorSessionError`. The "no prior session" outcome is now
+    reserved for the no-prefix path.
     """
     import uuid as _uuid_mod
     from datetime import UTC as _UTC
@@ -1002,12 +1017,12 @@ async def test_continue_session_by_prefix_against_null_row_raises_no_prior(
     bus = EventBus()
     manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
 
-    with pytest.raises(NoPriorSessionError) as ei:
+    with pytest.raises(SessionNotFoundError) as ei:
         await manager.continue_session(
             started_by_tg_user_id=42,
             session_id_prefix=row_id.hex[:8],
         )
-    assert str(ei.value) == "No prior session to continue."
+    assert str(ei.value) == f"No session found with id {row_id.hex[:8]}."
 
 
 # --------------------------------------------------------------------------- #
@@ -1102,6 +1117,170 @@ async def test_continue_session_resume_chain_shares_claude_session_id(
         session_id_prefix=None,
     )
     assert resumable == prior_claude_id
+
+
+# --------------------------------------------------------------------------- #
+# CCR-042: prefix matching keys on ``claude_session_id[:8]`` (not the local UUID).
+# --------------------------------------------------------------------------- #
+
+
+async def test_lookup_by_prefix_matches_claude_session_id_first_8(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """CCR-042 (c): a prefix equal to the first 8 chars of a stored
+    ``claude_session_id`` resolves to that row's claude id."""
+    import uuid as _uuid_mod
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt_mod
+
+    target_claude_id = "ab12cd34-aaaa-bbbb-cccc-ddddeeeeffff"
+    other_claude_id = "ff998877-1111-2222-3333-444455556666"
+    target_id = _uuid_mod.UUID("99999999-9999-9999-9999-999999999999")
+    other_id = _uuid_mod.UUID("88888888-8888-8888-8888-888888888888")
+
+    await _seed_finished_session(
+        session_factory,
+        session_id=other_id,
+        started_at=_dt_mod(2026, 5, 1, 9, 0, 0, tzinfo=_UTC),
+        status="completed",
+        claude_session_id=other_claude_id,
+    )
+    await _seed_finished_session(
+        session_factory,
+        session_id=target_id,
+        started_at=_dt_mod(2026, 5, 1, 10, 0, 0, tzinfo=_UTC),
+        status="completed",
+        claude_session_id=target_claude_id,
+    )
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    resolved = await manager._db_lookup_resumable_claude_session_id(  # noqa: SLF001
+        session_id_prefix=target_claude_id[:8],
+    )
+    assert resolved == target_claude_id
+
+    # Critically: passing the OTHER row's local-id prefix must NOT match.
+    # Pre-CCR-042 ``other_id.hex[:8] == "88888888"`` would have hit a row;
+    # post-CCR-042 we compare against ``claude_session_id[:8]``, so that
+    # prefix is unmatched.
+    with pytest.raises(SessionNotFoundError):
+        await manager._db_lookup_resumable_claude_session_id(  # noqa: SLF001
+            session_id_prefix=target_id.hex[:8],
+        )
+
+
+async def test_lookup_by_prefix_unknown_raises_session_not_found(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """CCR-042 (d): a prefix matching no row's ``claude_session_id`` raises
+    :class:`SessionNotFoundError`."""
+    import uuid as _uuid_mod
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt_mod
+
+    await _seed_finished_session(
+        session_factory,
+        session_id=_uuid_mod.UUID("55555555-5555-5555-5555-555555555555"),
+        started_at=_dt_mod(2026, 5, 1, 9, 0, 0, tzinfo=_UTC),
+        status="completed",
+        claude_session_id="aabbccdd-eeee-ffff-0000-111122223333",
+    )
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    with pytest.raises(SessionNotFoundError) as ei:
+        await manager._db_lookup_resumable_claude_session_id(  # noqa: SLF001
+            session_id_prefix="00000000",
+        )
+    assert str(ei.value) == "No session found with id 00000000."
+
+
+async def test_lookup_by_prefix_only_null_rows_raises_not_found(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """CCR-042 (e): when the only resumable rows have ``claude_session_id IS
+    NULL``, those rows are skipped from prefix matching and the lookup
+    raises :class:`SessionNotFoundError`.
+
+    Under the new prefix semantics NULL rows have no Claude id to match
+    against, so they are unreachable via ``/continue <prefix>``. The "no
+    prior session" error is reserved for the no-prefix path.
+    """
+    import uuid as _uuid_mod
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt_mod
+
+    await _seed_finished_session(
+        session_factory,
+        session_id=_uuid_mod.UUID("66666666-6666-6666-6666-666666666666"),
+        started_at=_dt_mod(2026, 5, 1, 9, 0, 0, tzinfo=_UTC),
+        status="completed",
+        claude_session_id=None,
+    )
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    with pytest.raises(SessionNotFoundError) as ei:
+        await manager._db_lookup_resumable_claude_session_id(  # noqa: SLF001
+            session_id_prefix="abcdef01",
+        )
+    assert str(ei.value) == "No session found with id abcdef01."
+
+
+async def test_lookup_by_prefix_resume_chain_returns_most_recent(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """CCR-042 (f): when multiple rows share one ``claude_session_id`` (a
+    resume chain after CCR-041), the prefix lookup applies the existing
+    ``started_at desc → first`` tie-break and returns the most recent row's
+    claude id (which is identical across the chain)."""
+    import uuid as _uuid_mod
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt_mod
+
+    shared = "12345678-aaaa-bbbb-cccc-dddddddddddd"
+    older_id = _uuid_mod.UUID("aaaaaaaa-1111-2222-3333-444444444444")
+    newer_id = _uuid_mod.UUID("bbbbbbbb-1111-2222-3333-444444444444")
+
+    await _seed_finished_session(
+        session_factory,
+        session_id=older_id,
+        started_at=_dt_mod(2026, 5, 1, 9, 0, 0, tzinfo=_UTC),
+        status="completed",
+        claude_session_id=shared,
+    )
+    await _seed_finished_session(
+        session_factory,
+        session_id=newer_id,
+        started_at=_dt_mod(2026, 5, 1, 10, 0, 0, tzinfo=_UTC),
+        status="completed",
+        claude_session_id=shared,
+    )
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    resolved = await manager._db_lookup_resumable_claude_session_id(  # noqa: SLF001
+        session_id_prefix=shared[:8],
+    )
+    # Both rows share one claude id; the value resolved is that shared id
+    # (regardless of which row "won" the tie-break — the resume target is
+    # identical). We additionally assert the no-prefix path resolves the
+    # same id, since the most-recent resumable row carries it.
+    assert resolved == shared
+
+    no_prefix = await manager._db_lookup_resumable_claude_session_id(  # noqa: SLF001
+        session_id_prefix=None,
+    )
+    assert no_prefix == shared
 
 
 # --------------------------------------------------------------------------- #

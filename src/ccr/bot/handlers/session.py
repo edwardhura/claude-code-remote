@@ -44,6 +44,12 @@ _SECONDS_PER_MINUTE = 60
 _SESSIONS_LIMIT = 20
 _EMPTY_SESSIONS_REPLY = "(no sessions)"
 _UNNAMED_PLACEHOLDER = "(unnamed)"
+# CCR-042 fix-loop: NULL ``claude_session_id`` rows render this marker in
+# place of an 8-hex prefix so users see immediately that the row is not
+# addressable via ``/continue``. 8 dashes were chosen so the column stays
+# aligned with the 8-hex prefix used for non-NULL rows; the marker is
+# unambiguous (no 8-hex string equals 8 dashes).
+_NULL_CLAUDE_SESSION_ID_MARKER = "--------"
 _HEX8_RE = re.compile(r"^[0-9a-f]{8}$")
 _INVALID_CONTINUE_ARG_REPLY = (
     "Invalid session id. Expected 8 hex characters (e.g. /continue 76581b99)."
@@ -266,21 +272,29 @@ async def cmd_sessions(
     """List the most recent sessions (up to 20), newest first.
 
     Each line is
-    ``<claude_session_id> · <status> · <name> · HH:MM DD-MM · by @<username>``,
-    where the timestamp is rendered via :func:`format_user_datetime` in
-    ``"short"`` mode using the calling user's timezone preference (or UTC when
-    the caller has none / is unpaired). The session-id slot uses
-    ``Session.claude_session_id`` (CCR-036); legacy rows where that column is
-    ``NULL`` fall back to the first 8 hex chars of the row's local UUID
-    ``id``. The name slot uses ``Session.name`` (auto-filled from the first
-    user prompt by :class:`SessionManager`, overwritable via ``/rename``);
-    rows with ``NULL`` name render ``(unnamed)``. The "by" slot is
-    ``by @<username>`` (joined on ``paired_users`` keyed by
-    ``started_by_tg_user_id``); a missing/no-username paired row falls back
-    to ``by <tg_user_id>``. Replies with the stable empty-state string
-    ``"(no sessions)"`` when the DB has no rows. The body is chunked through
-    :func:`chunk_text` so very long listings stay below Telegram's 4096-char
-    limit.
+    ``<id8> · <status> · <name> · HH:MM DD-MM · by @<username>``, where
+    ``<id8>`` is the first 8 hex characters of ``Session.claude_session_id``
+    (CCR-042 — addresses chat sessions by the Claude id rather than the local
+    row UUID). Rows where ``claude_session_id IS NULL`` (legacy /
+    pre-CCR-041 / failed-init) render the literal marker
+    ``--------`` (8 dashes) in the same slot — explicitly NOT a local-UUID
+    prefix. The marker signals "this row is not addressable via
+    ``/continue``": the manager's prefix-match path skips NULL rows, so any
+    8-hex prefix the listing surfaces is guaranteed to be resolvable by
+    ``/continue``. The full UUID is no longer rendered. Resume chains
+    (multiple rows sharing one ``claude_session_id`` after CCR-041) all show
+    the same 8-hex prefix — that is intended; ``/continue <prefix>`` re-uses
+    it. The timestamp is rendered via :func:`format_user_datetime` in
+    ``"short"`` mode using the calling user's timezone preference (or UTC
+    when the caller has none / is unpaired). The name slot uses
+    ``Session.name`` (auto-filled from the first user prompt by
+    :class:`SessionManager`, overwritable via ``/rename``); rows with
+    ``NULL`` name render ``(unnamed)``. The "by" slot is ``by @<username>``
+    (joined on ``paired_users`` keyed by ``started_by_tg_user_id``); a
+    missing/no-username paired row falls back to ``by <tg_user_id>``.
+    Replies with the stable empty-state string ``"(no sessions)"`` when the
+    DB has no rows. The body is chunked through :func:`chunk_text` so very
+    long listings stay below Telegram's 4096-char limit.
     """
     user: PairedUser | None = None
     async with db_factory() as db:
@@ -323,9 +337,22 @@ def _format_session_row(
     usernames: dict[int, str | None],
 ) -> str:
     if row.claude_session_id is not None:
-        session_id_label = html.escape(row.claude_session_id)
+        # CCR-042: render the 8-hex prefix of ``claude_session_id`` so the
+        # listing stays compact and the prefix matches the one ``/continue``
+        # accepts. ``claude_session_id`` is stored as a Python ``str``
+        # (UUID-formatted) per CCR-036 — slice with ``[:8]``, NOT
+        # ``.hex[:8]`` (the latter is only valid for the local
+        # ``uuid.UUID`` ``Session.id``).
+        session_id_label = html.escape(row.claude_session_id[:8])
     else:
-        session_id_label = str(row.id)[:8]
+        # CCR-042 fix-loop: rows with ``claude_session_id IS NULL`` are not
+        # addressable via ``/continue`` (the manager's prefix-match arm
+        # skips NULL rows). Render a marker rather than the local-UUID
+        # prefix so the listing never surfaces a token that ``/continue``
+        # cannot resolve. This is the alignment invariant: every 8-hex
+        # prefix shown is matchable; the marker is the only "non-prefix"
+        # value the slot can hold.
+        session_id_label = _NULL_CLAUDE_SESSION_ID_MARKER
     status = html.escape(row.status)
     name_display = _UNNAMED_PLACEHOLDER if row.name is None else html.escape(row.name)
     started = format_user_datetime(row.started_at, user, "short")
