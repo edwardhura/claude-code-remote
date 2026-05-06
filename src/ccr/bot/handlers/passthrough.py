@@ -85,39 +85,123 @@ _UNKNOWN_USAGE_HINT = (
 
 _AGENTS_LIBRARY_GLOB_REL = ".claude/agents"
 _EMPTY_PLACEHOLDER = "(none)"
+_DEFAULT_MODEL_VALUE = "inherit"
 
 _SESSION_ID_HEX_PREFIX_LEN = 8
 _ONE_MINUTE_MS = 60_000
 _SECONDS_PER_MINUTE = 60
 _SECONDS_PER_HOUR = 3600
 
+# Sourced from Claude Code CLI v2.1.131 — revisit when new built-ins ship.
+BUILTIN_AGENTS: dict[str, str] = {
+    "Explore": "haiku",
+    "Plan": "inherit",
+    "general-purpose": "inherit",
+    "statusline-setup": "sonnet",
+    "claude-code-guide": "haiku",
+}
+
+# Frontmatter is delimited by a literal ``---`` line at the start of the
+# file and a closing ``---`` line. We use a stdlib-only parser (no PyYAML
+# dependency) that pulls a single ``model: <value>`` line out of the block;
+# anything else inside the frontmatter is ignored. Malformed blocks degrade
+# silently to "no model key" — the user sees the inherit fallback rather
+# than an error.
+_FRONTMATTER_DELIM = "---"
+_MODEL_KEY_PATTERN = re.compile(r"^\s*model\s*:\s*(.+?)\s*$")
+
 
 router = Router(name="passthrough")
 
 
-def _list_library_agents(project_root: Path) -> list[str]:
-    """Return alphabetically sorted ``.md`` filenames (without extension) under ``.claude/agents/``.
+def _parse_frontmatter_model(text: str) -> str:
+    """Return the ``model:`` value from a Markdown YAML frontmatter block.
 
+    The frontmatter block is the leading ``---`` … ``---`` segment of the
+    file. If the file does not start with ``---`` (no frontmatter), if the
+    closing ``---`` is missing, or if no ``model:`` key is present, returns
+    :data:`_DEFAULT_MODEL_VALUE` (``"inherit"``). Surrounding whitespace
+    around the value is stripped; surrounding single or double quotes are
+    NOT stripped because Claude Code's own values (``haiku``, ``sonnet``,
+    ``opus``, ``inherit``) are unquoted in practice — adding quote-stripping
+    here would mask a malformed config file rather than help.
+    """
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != _FRONTMATTER_DELIM:
+        return _DEFAULT_MODEL_VALUE
+    closing_idx: int | None = None
+    for idx in range(1, len(lines)):
+        if lines[idx].strip() == _FRONTMATTER_DELIM:
+            closing_idx = idx
+            break
+    if closing_idx is None:
+        return _DEFAULT_MODEL_VALUE
+    for line in lines[1:closing_idx]:
+        match = _MODEL_KEY_PATTERN.match(line)
+        if match:
+            value = match.group(1).strip()
+            if value:
+                return value
+    return _DEFAULT_MODEL_VALUE
+
+
+def _list_library_agents(project_root: Path) -> list[tuple[str, str]]:
+    """Return alphabetically sorted ``(name, model)`` pairs for project agents.
+
+    Walks ``.claude/agents/*.md`` under ``project_root`` and parses each
+    file's YAML frontmatter for a ``model:`` key. Files with no
+    frontmatter, with malformed frontmatter, or with no ``model:`` key
+    fall back to ``"inherit"`` to mirror Claude Code's own behaviour.
     Returns ``[]`` if the directory does not exist. Hidden files (leading
-    ``.``) and non-``.md`` files are skipped. Names are NOT HTML-escaped here;
-    that happens at render time.
+    ``.``) and non-``.md`` files are skipped. Read errors are swallowed
+    and treated as ``"inherit"`` so a permission-denied or transient I/O
+    blip on a single file does not bubble up to the user. Names and
+    model values are NOT HTML-escaped here; that happens at render time.
     """
     agents_dir = project_root / _AGENTS_LIBRARY_GLOB_REL
     if not agents_dir.is_dir():
         return []
-    names = [p.stem for p in agents_dir.glob("*.md") if p.is_file() and not p.name.startswith(".")]
-    return sorted(names)
+    pairs: list[tuple[str, str]] = []
+    for path in agents_dir.glob("*.md"):
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            content = ""
+        model = _parse_frontmatter_model(content)
+        pairs.append((path.stem, model))
+    return sorted(pairs, key=lambda pair: pair[0])
 
 
-def _render_agents_reply(running: list[str], library: list[str]) -> str:
-    def _section(title: str, items: list[str]) -> str:
+def _render_agents_reply(
+    running: list[str],
+    project_agents: list[tuple[str, str]],
+    builtin_agents: dict[str, str],
+) -> str:
+    def _running_section(items: list[str]) -> str:
         if not items:
             body = _EMPTY_PLACEHOLDER
         else:
             body = "\n".join(f"• {html.escape(name)}" for name in items)
+        return f"<b>Running</b>\n{body}"
+
+    def _agents_section(title: str, items: list[tuple[str, str]]) -> str:
+        if not items:
+            body = _EMPTY_PLACEHOLDER
+        else:
+            body = "\n".join(
+                f"• {html.escape(name)} · {html.escape(model)}" for name, model in items
+            )
         return f"<b>{title}</b>\n{body}"
 
-    return f"{_section('Running', running)}\n\n{_section('Library', library)}"
+    return "\n\n".join(
+        [
+            _running_section(running),
+            _agents_section("Project agents", project_agents),
+            _agents_section("Built-in agents", list(builtin_agents.items())),
+        ],
+    )
 
 
 async def _reply_agents(
@@ -126,8 +210,8 @@ async def _reply_agents(
     settings: Settings,
 ) -> None:
     running = session_manager.running_subagents()
-    library = _list_library_agents(settings.data_dir.parent)
-    text = _render_agents_reply(running, library)
+    project_agents = _list_library_agents(settings.data_dir.parent)
+    text = _render_agents_reply(running, project_agents, BUILTIN_AGENTS)
     await msg.answer(text)
 
 
@@ -428,6 +512,7 @@ async def cmd_passthrough(
 
 __all__ = [
     "BLOCKED_INTERACTIVE",
+    "BUILTIN_AGENTS",
     "OVERAGE_REASON_LABELS",
     "RATE_LIMIT_WINDOW_LABELS",
     "WHITELIST",

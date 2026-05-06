@@ -14,6 +14,8 @@ The aiogram-based Telegram bot. This is the user's primary control surface: pair
 - `/clear` broadcasts a divider (`"— — — new session — — —"`) to all paired chats *only* when `prior_status != IDLE` — idle clears stay quiet.
 - `/sessions` body is hard-capped at 3500 chars via `chunk_text`; empty DB returns the stable `"(no sessions)"` string.
 - Slash-command passthrough is a tight whitelist (`{"model", "compact"}`); known-blocked interactives (`{"mcp", "init"}`) return a canned local-terminal redirect. Unknown commands return the pinned usage hint.
+- `/agents` reply section order is fixed at Running → Project agents → Built-in agents; both `Project agents` and `Built-in agents` lines render as `<name> · <model>` with each component HTML-escaped.
+- `BUILTIN_AGENTS` requires a `# Sourced from Claude Code CLI v<VERSION>` comment immediately above the declaration so future maintainers know when to revisit.
 - `/cost`, `/usage`, `/agents`, `/skills`, `/config` are local renders, NOT passthroughs to the upstream `claude` CLI.
 - `cfg:*` callbacks use the calling `tg_user_id` (`cb.from_user.id`) as the DB lookup key — never trust the callback payload for the update target. Callback data carries only an integer index into a server-controlled list.
 - Timezone validation MUST use stdlib `zoneinfo.ZoneInfo(name)` and treat `ZoneInfoNotFoundError` as a user error (no DB write).
@@ -47,7 +49,7 @@ The aiogram-based Telegram bot. This is the user's primary control surface: pair
 - `session.py::_format_started_by` — new helper for the trailing `by …` slot; renders `by @<username>` from `paired_users.tg_username` when available, else `by <tg_user_id>`. Explicitly does NOT consult `first_name`.
 - `permission.py::cb_permission` — callback `perm:{session_id}:{request_id}:{choice}`; validates choice against `_pending_options` frozenset; rejects forged / stale / concurrent / malformed; edits message with `→ {choice} (by @{username})`.
 - `ask_user_question.py` — three reply paths (button tap callback, `/answer <id8> <text>` command, single-outstanding plain-text feed). `_ID8_RE = ^[0-9a-zA-Z_-]{8}$` (broadened for real-world prefixes like `toulu_…`). Stale / unknown ids rejected with canned message. Validates `tool_use_id`, calls `session_manager.send_tool_result`.
-- `passthrough.py` — three-branch dispatch: `WHITELIST = {"model", "compact"}` forwarded via `manager.send_slash`; `BLOCKED_INTERACTIVE = {"mcp", "init"}` returns canned redirect; unknown commands return usage hint. Dedicated branches for `/agents` (Running + Library), `/skills`, `/cost`, `/usage`.
+- `passthrough.py` — three-branch dispatch: `WHITELIST = {"model", "compact"}` forwarded via `manager.send_slash`; `BLOCKED_INTERACTIVE = {"mcp", "init"}` returns canned redirect; unknown commands return usage hint. Dedicated branches for `/agents` (Running + Project agents + Built-in agents), `/skills`, `/cost`, `/usage`.
   - `passthrough.py::RATE_LIMIT_WINDOW_LABELS` — module-level mapping `{snake_case_code: "Humanised label"}` consumed by `/usage`; seeded with `five_hour`, `weekly`. Unknown codes fall back to title-case-with-spaces via `_humanise_code`.
   - `passthrough.py::OVERAGE_REASON_LABELS` — same shape for overage reason codes; seeded with `group_zero_credit_limit`.
   - `passthrough.py::_humanise_code(code, label_map)` — internal helper: returns `label_map[code]` if present, else `code.replace("_", " ").title()`. Used by `_render_usage_reply` for both window-code and overage-reason rendering.
@@ -55,6 +57,10 @@ The aiogram-based Telegram bot. This is the user's primary control surface: pair
   - `passthrough.py::_render_usage_reply(rl, user)` — signature widened: now takes `PairedUser | None`; the "Resets at" line renders in `user.timezone` (UTC fallback when user is None or `timezone IS NULL`).
   - `passthrough.py::_reply_usage(msg, session_manager, db_factory)` — signature widened; resolves the calling `PairedUser` itself via the injected `db_factory`.
   - `passthrough.py::cmd_passthrough(msg, command, session_manager, settings, db_factory=None)` — new optional `db_factory` kwarg; aiogram injects it from `dp["db_factory"]` in production. Default `None` exists for test-harness convenience only.
+  - `passthrough.py::BUILTIN_AGENTS` — module-level `dict[str, str]` of Claude Code built-in agent names → model labels (sourced from CLI v2.1.131); rendered verbatim in the `/agents` Built-in agents section.
+  - `passthrough.py::_parse_frontmatter_model` — stdlib YAML-frontmatter parser; returns the `model:` value or `"inherit"` for missing/malformed frontmatter.
+  - `passthrough.py::_list_library_agents` — signature change: now returns `list[tuple[str, str]]` of `(name, model)` pairs, alphabetically sorted by name. Previously returned `list[str]`.
+  - `passthrough.py::_render_agents_reply` — signature change: now takes `(running, project_agents, builtin_agents)` and emits three sections in the order Running → Project agents → Built-in agents. The "Library" section heading is renamed to "Project agents".
 - `config.py` — `cfg:*` router; `/config` opens an inline-keyboard menu (Timezone + Close); `/config tz <IANA name>` is the free-text fallback that validates via `zoneinfo.ZoneInfo` and persists to `paired_users.timezone` for the caller.
 - `config.py::cmd_config` — `/config` handler; opens menu, or honours `/config tz <IANA name>` free-text fallback.
 - `config.py::cb_open_tz_picker` — `cfg:tz` callback; renders the curated picker (13 zones).
@@ -116,6 +122,8 @@ The aiogram-based Telegram bot. This is the user's primary control surface: pair
 - **`_format_resets_at` now threads the calling `PairedUser` through `format_user_datetime`** — the prior CCR-035 gotcha ("`_format_resets_at` in `passthrough.py` still passes `user=None`") is resolved by CCR-039.
 - **`_humanise_code` runs BEFORE `html.escape`.** A future label string or unmapped code containing `<` / `>` / `&` would still be HTML-safe in the final output, but case-folded by `.title()`. The security invariant (no raw HTML metacharacters in `parse_mode="HTML"` output) is preserved.
 - **`cmd_passthrough` accepts `db_factory: async_sessionmaker[AsyncSession] | None = None`.** The optional default exists only because the existing test suite calls the handler directly; in production, `dp["db_factory"]` is always set by `build_dispatcher`, so the `None` branch is unreachable.
+- **Project-agent frontmatter is parsed with stdlib-only regex (no PyYAML dependency).** Missing frontmatter, missing `model:` key, unterminated `---` blocks, and per-file `OSError`s all silently fall back to `"inherit"` rather than raising.
+- **`BUILTIN_AGENTS` iterates in dict-insertion order (Python 3.7+ guarantee).** Tests pin both the set of entries and their relative order via index comparison, so reordering or adding an entry to the dict will need a coordinated test update.
 - **Telegram's HTML parse mode treats `<word>` as a tag start.** Any user-facing string sent with `parse_mode="HTML"` containing literal `<` or `>` will raise `TelegramBadRequest`. Use `&lt;`/`&gt;` for static placeholder text or `html.escape()` for dynamic content.
 - **`cmd_answer`'s usage-hint send is wrapped in a narrow `try/except TelegramBadRequest`** (with structlog warning) so a future regression in any static `_USAGE_HINT`-shaped string cannot crash the dispatcher silently. The catch is intentionally narrow — broader exceptions still propagate.
 - **The auto-fill cap (40 chars) is duplicated** as `_SESSION_NAME_MAX_LEN` in both `src/ccr/claude/manager.py` and `src/ccr/bot/handlers/session.py`; the bot module does not import manager-internal constants. If the cap changes, both sites must update.
@@ -129,5 +137,5 @@ The aiogram-based Telegram bot. This is the user's primary control surface: pair
 
 ## Status
 - State: IN PROGRESS
-- Tickets: CCR-006, CCR-008, CCR-009 (gating later removed in CCR-024), CCR-010, CCR-014 (planned), CCR-018, CCR-019, CCR-020, CCR-022, CCR-023, CCR-024, CCR-026, CCR-027 (deferred), CCR-028 (AUQ collision), CCR-030, CCR-031, CCR-032, CCR-033, CCR-034, CCR-035, CCR-036, CCR-037, CCR-038, CCR-039 (planned), CCR-040 (planned)
-- Last updated: CCR-039 (2026-05-06)
+- Tickets: CCR-006, CCR-008, CCR-009 (gating later removed in CCR-024), CCR-010, CCR-014 (planned), CCR-018, CCR-019, CCR-020, CCR-022, CCR-023, CCR-024, CCR-026, CCR-027 (deferred), CCR-028 (AUQ collision), CCR-030, CCR-031, CCR-032, CCR-033, CCR-034, CCR-035, CCR-036, CCR-037, CCR-038, CCR-039, CCR-040
+- Last updated: CCR-040 (2026-05-06)

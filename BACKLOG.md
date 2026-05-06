@@ -295,43 +295,6 @@ Notes:
   - 2026-05-01 main: marked [blocked] — schema reconciliation work in this ticket is moot (no schema to reconcile to); supersedes filed as CCR-024 (remove dead permission code from CCR-009) and CCR-025 (MCP permission-prompt-tool integration). This ticket stays open as a tracking pin until CCR-025 lands; revisit if upstream Claude `-p` ever exposes a stdout permission channel.
 ---
 
-## CCR-040: `/agents` reply mirrors Claude Code CLI library view [todo]
-Phase: n/a (post-CCR-022 polish)
-Feature: chat-bot
-Files:
-  - `src/ccr/bot/handlers/passthrough.py` — extend `_render_agents_reply` and `_list_library_agents` (around lines 79 and 93). Per line in Project agents and Built-in agents: `<name> · <model>`.
-    - Project agents: parse `model:` from each `.claude/agents/*.md` YAML frontmatter. If absent → render `inherit` (matches Claude Code CLI fallback).
-    - Built-in agents: built-ins are NOT on disk. Use a constant map `BUILTIN_AGENTS = {"Explore": "haiku", "Plan": "inherit", "general-purpose": "inherit", "statusline-setup": "sonnet", "claude-code-guide": "haiku"}`. Add a comment noting the Claude Code version this was sourced from so we know to revisit.
-    - Final section order: Running (existing) → Project agents → Built-in agents.
-  - `tests/test_bot_passthrough.py` — extend `/agents` tests:
-    - Project agent with `model: opus` in frontmatter renders `<name> · opus`.
-    - Project agent without `model:` field renders `<name> · inherit`.
-    - Built-in agents section is present in the reply, in the order specified by `BUILTIN_AGENTS`.
-    - Final section order in the rendered reply is Running → Project agents → Built-in agents.
-    - HTML escaping of agent names containing `<`, `>`, `&` (regression — CCR-022 pattern).
-  - `tests/fakes/` — no changes expected; the existing project-agent fixture in `tests/` is the source for the project-section test. Add fixture frontmatter as needed.
-Out of scope:
-  - Discovering built-in agents from a Claude Code introspection API (the CLI does not expose one) — the constant map is the agreed substitute.
-  - Editing or creating agent definitions from Telegram (read-only listing).
-  - Per-subagent model configuration in any format other than YAML frontmatter.
-  - Cross-referencing the running subagents (CCR-022 surface) with model info — out of scope, model info comes from project files only.
-Acceptance:
-  - [ ] Each project-agent line renders as `<name> · <model>`; missing `model:` frontmatter renders `inherit`.
-  - [ ] A `Built-in agents` section is present, listing every entry in the constant `BUILTIN_AGENTS` map as `<name> · <model>`.
-  - [ ] `BUILTIN_AGENTS` has a comment noting the Claude Code version it was sourced from (so future maintainers know to revisit).
-  - [ ] Final section order in the `/agents` reply is Running → Project agents → Built-in agents.
-  - [ ] HTML escaping is preserved for agent names containing `<`, `>`, `&` (regression vs. CCR-022).
-  - [ ] `pytest tests/test_bot_passthrough.py` passes.
-  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
-Depends on: CCR-022
-Notes:
-  Phase n/a — cosmetic polish of CCR-022's `/agents` output to mirror the Claude Code CLI library view. Source: `_render_agents_reply` and `_list_library_agents` in `src/ccr/bot/handlers/passthrough.py:79,93`.
-  Built-ins are NOT on disk; the constant map is the only source. Treat the version comment as documentation debt — a future ticket may want to refresh the list when Claude Code ships new built-ins.
-  Mode 1A note for team-lead: skip the architect — additive UX (constant map + frontmatter parser + section ordering). No new abstraction, no schema, no cross-cutting design call.
-
-### Review log
----
-
 ## CCR-041: `/continue` UNIQUE-constraint regression — drop unique flag on `claude_session_id`, programmatic duplicate guard [todo]
 Phase: n/a (post-CCR-036 bugfix)
 Feature: claude-runtime
