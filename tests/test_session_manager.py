@@ -1011,6 +1011,100 @@ async def test_continue_session_by_prefix_against_null_row_raises_no_prior(
 
 
 # --------------------------------------------------------------------------- #
+# CCR-041: ``--resume`` chains share ``claude_session_id`` across rows.
+# --------------------------------------------------------------------------- #
+
+
+async def test_continue_session_resume_chain_shares_claude_session_id(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Regression: ``/continue`` writing the prior row's claude id to the new row succeeds.
+
+    Pre-CCR-041 the partial UNIQUE index on ``claude_session_id`` rejected
+    this UPDATE, the fire-and-forget ``_update_claude_session_id`` swallowed
+    the :class:`~sqlalchemy.exc.IntegrityError`, and the new row kept
+    ``claude_session_id IS NULL``. After CCR-041:
+
+    - The UPDATE succeeds (no UNIQUE conflict).
+    - No ``session_manager.claude_session_id_update_failed`` log entry fires.
+    - Both rows share the same ``claude_session_id``.
+    - :meth:`SessionManager._db_lookup_resumable_claude_session_id` (no-prefix
+      path) still returns the shared id from the most-recent row, since the
+      ``started_at desc → first non-null`` rule is unchanged.
+    """
+    import uuid as _uuid_mod
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt_mod
+
+    from structlog.testing import capture_logs
+
+    prior_id = _uuid_mod.UUID("55555555-5555-5555-5555-555555555555")
+    prior_claude_id = "7aa3069d-8b1f-4b98-b6f3-3c6fa1e3a0f7"
+    await _seed_finished_session(
+        session_factory,
+        session_id=prior_id,
+        started_at=_dt_mod(2026, 5, 1, 9, 0, 0, tzinfo=_UTC),
+        status="completed",
+        claude_session_id=prior_claude_id,
+    )
+
+    # Seed the resumed row with claude_session_id IS NULL — this models the
+    # state right after ``continue_session`` inserts the new row but before
+    # ``_consume_events`` fires ``_update_claude_session_id`` on SystemInit.
+    resumed_id = _uuid_mod.UUID("66666666-6666-6666-6666-666666666666")
+    await _seed_finished_session(
+        session_factory,
+        session_id=resumed_id,
+        started_at=_dt_mod(2026, 5, 1, 10, 0, 0, tzinfo=_UTC),
+        status="running",
+        claude_session_id=None,
+    )
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    with capture_logs() as logs:
+        await manager._update_claude_session_id(  # noqa: SLF001 — direct internal probe
+            resumed_id, prior_claude_id
+        )
+
+    # The UPDATE must have succeeded silently. No failure log entry.
+    failure_logs = [e for e in logs if "claude_session_id_update_failed" in str(e.get("event", ""))]
+    assert failure_logs == [], f"Unexpected failure log entries: {failure_logs}"
+
+    async with session_factory() as db:
+        prior_row = await db.scalar(select(Session).where(Session.id == prior_id))
+        resumed_row = await db.scalar(select(Session).where(Session.id == resumed_id))
+        all_rows = list(
+            (
+                await db.scalars(
+                    select(Session).where(Session.claude_session_id == prior_claude_id),
+                )
+            ).all()
+        )
+    assert prior_row is not None
+    assert resumed_row is not None
+    assert prior_row.claude_session_id == prior_claude_id
+    assert resumed_row.claude_session_id == prior_claude_id
+    assert len(all_rows) == 2
+
+    # ``started_at desc → first non-null`` still resolves correctly when
+    # multiple rows share ``claude_session_id``. The newer (resumed) row is
+    # ``status="running"`` — change it to a resumable status before lookup.
+    async with session_factory() as db:
+        row = await db.scalar(select(Session).where(Session.id == resumed_id))
+        assert row is not None
+        row.status = "completed"
+        await db.commit()
+
+    resumable = await manager._db_lookup_resumable_claude_session_id(  # noqa: SLF001
+        session_id_prefix=None,
+    )
+    assert resumable == prior_claude_id
+
+
+# --------------------------------------------------------------------------- #
 # CCR-025: MCP permission gate plumbing.
 # --------------------------------------------------------------------------- #
 

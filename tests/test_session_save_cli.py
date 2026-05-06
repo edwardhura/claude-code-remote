@@ -380,6 +380,16 @@ def test_import_claude_session_raises_no_owner_when_unowned(
 def test_import_claude_session_raises_duplicate_on_second_import(
     tmp_path: Path,
 ) -> None:
+    """CCR-041: programmatic SELECT-before-INSERT raises ``DuplicateClaudeSessionError``.
+
+    The DB-side UNIQUE flag on ``ix_sessions_claude_session_id_not_null`` was
+    dropped (CCR-041); the import-time double-write guard now lives as a
+    SELECT-before-INSERT inside :func:`import_claude_session`. The exception
+    must be raised directly, NOT chained from a SQLAlchemy
+    :class:`~sqlalchemy.exc.IntegrityError`.
+    """
+    from sqlalchemy.exc import IntegrityError
+
     settings = _make_settings(tmp_path)
     asyncio.run(_create_schema(settings))
     _seed_owner(settings, tg_user_id=42)
@@ -389,8 +399,16 @@ def test_import_claude_session_raises_duplicate_on_second_import(
     _make_claude_session_file(projects_root, cs_id)
 
     asyncio.run(_run_import(settings, cs_id, projects_root=projects_root))
-    with pytest.raises(DuplicateClaudeSessionError):
+    with pytest.raises(DuplicateClaudeSessionError) as ei:
         asyncio.run(_run_import(settings, cs_id, projects_root=projects_root))
+    # Programmatic guard fires before the INSERT, so there is no IntegrityError
+    # in the cause chain.
+    chain: list[BaseException] = []
+    cur: BaseException | None = ei.value.__cause__
+    while cur is not None:
+        chain.append(cur)
+        cur = cur.__cause__
+    assert not any(isinstance(e, IntegrityError) for e in chain)
 
 
 # --------------------------------------------------------------------------- #

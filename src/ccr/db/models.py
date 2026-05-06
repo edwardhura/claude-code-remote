@@ -121,7 +121,7 @@ class Session(Base):
         Index(
             "ix_sessions_claude_session_id_not_null",
             "claude_session_id",
-            unique=True,
+            unique=False,
             sqlite_where=claude_session_id.is_not(None),
         ),
     )
