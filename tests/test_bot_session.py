@@ -550,12 +550,19 @@ async def test_cmd_sessions_three_rows_returns_three_lines_in_desc_order(
     sid_oldest = uuid.UUID("aaaaaaaa-0000-0000-0000-000000000001")
     sid_middle = uuid.UUID("bbbbbbbb-0000-0000-0000-000000000002")
     sid_newest = uuid.UUID("cccccccc-0000-0000-0000-000000000003")
+    # CCR-042: ``/sessions`` renders ``claude_session_id[:8]`` (not the
+    # local UUID), so seed each row with a distinguishing Claude id whose
+    # prefix matches the local UUID's prefix for assertion convenience.
+    cid_oldest = "aaaaaaaa-1111-2222-3333-444444440001"
+    cid_middle = "bbbbbbbb-1111-2222-3333-444444440002"
+    cid_newest = "cccccccc-1111-2222-3333-444444440003"
     await _seed_session(
         session_factory,
         session_id=sid_oldest,
         started_at=base,
         status="completed",
         first_prompt="oldest",
+        claude_session_id=cid_oldest,
     )
     await _seed_session(
         session_factory,
@@ -563,6 +570,7 @@ async def test_cmd_sessions_three_rows_returns_three_lines_in_desc_order(
         started_at=base + timedelta(seconds=10),
         status="stopped",
         first_prompt="middle",
+        claude_session_id=cid_middle,
     )
     await _seed_session(
         session_factory,
@@ -570,6 +578,7 @@ async def test_cmd_sessions_three_rows_returns_three_lines_in_desc_order(
         started_at=base + timedelta(seconds=20),
         status="crashed",
         first_prompt="newest",
+        claude_session_id=cid_newest,
     )
 
     msg = _make_message(text="/sessions")
@@ -703,7 +712,10 @@ async def test_cmd_sessions_renders_five_field_format_with_claude_session_id_and
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """Fully-populated row renders as
-    ``<claude_session_id> · <status> · <name> · HH:MM - D Mon · by @<username>``.
+    ``<claude_id_8> · <status> · <name> · HH:MM - D Mon · by @<username>``.
+
+    CCR-042: the session-id slot is the first 8 chars of
+    ``claude_session_id`` (NOT the full UUID, NOT the local row UUID).
     """
     await _seed_paired_user(
         session_factory,
@@ -712,6 +724,7 @@ async def test_cmd_sessions_renders_five_field_format_with_claude_session_id_and
         is_owner=False,
     )
     sid = uuid.UUID("12345678-aaaa-bbbb-cccc-000000000001")
+    claude_id = "deadbeef-1111-2222-3333-444455556666"
     await _seed_session(
         session_factory,
         session_id=sid,
@@ -720,7 +733,7 @@ async def test_cmd_sessions_renders_five_field_format_with_claude_session_id_and
         started_by_tg_user_id=77,
         first_prompt="kicked off",
         name="Refactor pairing flow",
-        claude_session_id="claude-session-deadbeef",
+        claude_session_id=claude_id,
     )
 
     msg = _make_message(text="/sessions", user_id=77, username="u77")
@@ -729,17 +742,26 @@ async def test_cmd_sessions_renders_five_field_format_with_claude_session_id_and
     reply = msg.answer.await_args.args[0]
     # CCR-035 short format is "HH:MM - D Mon"; the ticket-spec shorthand
     # "HH:MM DD-MM" maps to that helper output via mode="short".
-    expected = (
-        "<code>claude-session-deadbeef</code> · completed · Refactor pairing flow · "
-        "10:15 - 6 May · by @u77"
-    )
+    expected = "<code>deadbeef</code> · completed · Refactor pairing flow · 10:15 - 6 May · by @u77"
     assert expected in reply
+    # The full UUID must NOT appear — CCR-042 renders only the 8-char prefix.
+    assert claude_id not in reply
 
 
-async def test_cmd_sessions_falls_back_to_uuid_prefix_when_claude_session_id_is_null(
+async def test_cmd_sessions_renders_marker_for_null_claude_session_id(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Legacy rows with ``claude_session_id IS NULL`` show the 8-hex UUID prefix."""
+    """CCR-042 fix-loop: rows with ``claude_session_id IS NULL`` render the
+    literal marker ``--------`` (8 dashes) — explicitly NOT the local-UUID
+    prefix.
+
+    The previous CCR-042 pass used the local UUID's first 8 hex chars as a
+    fallback, which the user-gate caught: those prefixes were unmatchable
+    by ``/continue`` (the manager's prefix-match arm skips NULL rows), so
+    the listing surfaced a token that ``/continue`` then rejected. The
+    marker disambiguates the "this row isn't /continue-able" case from a
+    real prefix.
+    """
     sid = uuid.UUID("abcdef01-1111-2222-3333-444444444444")
     await _seed_session(
         session_factory,
@@ -756,7 +778,108 @@ async def test_cmd_sessions_falls_back_to_uuid_prefix_when_claude_session_id_is_
     await cmd_sessions(msg, db_factory=session_factory)
 
     reply = msg.answer.await_args.args[0]
-    assert "<code>abcdef01</code>" in reply
+    assert "<code>--------</code>" in reply
+    # The local-UUID prefix MUST NOT be rendered: that was the previous
+    # fallback that misled users into typing it as a /continue argument.
+    assert "<code>abcdef01</code>" not in reply
+    assert "abcdef01" not in reply
+
+
+async def test_cmd_sessions_alignment_invariant_marker_only_for_null_rows(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """CCR-042 fix-loop alignment invariant: every 8-char ``<code>...</code>``
+    slot in ``/sessions`` is either the documented marker (``--------``) or
+    the first 8 chars of a row's ``claude_session_id``.
+
+    The prefix surface in ``/sessions`` and the resolution path in
+    ``/continue`` (via :meth:`SessionManager._db_lookup_resumable_claude_session_id`)
+    are aligned by construction: NULL rows render the marker (not a local
+    UUID prefix), so any 8-hex token in the listing matches a non-NULL
+    ``claude_session_id`` and is therefore resolvable.
+    """
+    null_local_id = uuid.UUID("aabbccdd-1111-2222-3333-444444444444")
+    set_local_id = uuid.UUID("ffffeeee-1111-2222-3333-555555555555")
+    set_claude_id = "12345678-9999-aaaa-bbbb-cccccccccccc"
+
+    await _seed_session(
+        session_factory,
+        session_id=null_local_id,
+        started_at=datetime(2026, 5, 6, 9, 0, 0, tzinfo=UTC),
+        status="completed",
+        started_by_tg_user_id=42,
+        first_prompt="legacy",
+        name="legacy",
+        claude_session_id=None,
+    )
+    await _seed_session(
+        session_factory,
+        session_id=set_local_id,
+        started_at=datetime(2026, 5, 6, 10, 0, 0, tzinfo=UTC),
+        status="completed",
+        started_by_tg_user_id=42,
+        first_prompt="modern",
+        name="modern",
+        claude_session_id=set_claude_id,
+    )
+
+    msg = _make_message(text="/sessions", user_id=42)
+    await cmd_sessions(msg, db_factory=session_factory)
+
+    reply = msg.answer.await_args.args[0]
+    # NULL row line surfaces the marker, NOT the local UUID prefix.
+    assert "<code>--------</code>" in reply
+    assert str(null_local_id)[:8] not in reply
+    # Non-NULL row line surfaces the claude_session_id 8-hex prefix.
+    assert f"<code>{set_claude_id[:8]}</code>" in reply
+    # The local UUID of the non-NULL row also must not leak (the listing
+    # never renders the local UUID, set or NULL).
+    assert str(set_local_id)[:8] not in reply
+
+
+async def test_cmd_sessions_resume_chain_rows_render_same_claude_id_prefix(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """CCR-042: rows in a resume chain (sharing one ``claude_session_id``) all
+    render the same 8-hex prefix in ``/sessions``.
+
+    Mirrors the post-CCR-041 invariant that a ``--resume`` chain shares one
+    Claude id across multiple ``Session`` rows; the listing surfaces that
+    sharing visually so users can re-use the prefix with ``/continue``.
+    """
+    shared_claude_id = "fedcba98-7777-8888-9999-aaaabbbbcccc"
+    older_id = uuid.UUID("11110000-0000-0000-0000-000000000001")
+    newer_id = uuid.UUID("22220000-0000-0000-0000-000000000002")
+    await _seed_session(
+        session_factory,
+        session_id=older_id,
+        started_at=datetime(2026, 5, 6, 9, 0, 0, tzinfo=UTC),
+        status="completed",
+        started_by_tg_user_id=42,
+        first_prompt="first",
+        name="first",
+        claude_session_id=shared_claude_id,
+    )
+    await _seed_session(
+        session_factory,
+        session_id=newer_id,
+        started_at=datetime(2026, 5, 6, 10, 0, 0, tzinfo=UTC),
+        status="completed",
+        started_by_tg_user_id=42,
+        first_prompt="resumed",
+        name="resumed",
+        claude_session_id=shared_claude_id,
+    )
+
+    msg = _make_message(text="/sessions", user_id=42)
+    await cmd_sessions(msg, db_factory=session_factory)
+
+    reply = msg.answer.await_args.args[0]
+    # Both rows show the same 8-char prefix — count occurrences of the
+    # specific ``<code>fedcba98</code>`` rendering.
+    assert reply.count("<code>fedcba98</code>") == 2
+    # The full id MUST NOT leak.
+    assert shared_claude_id not in reply
 
 
 async def test_cmd_sessions_falls_back_to_tg_user_id_when_username_missing(

@@ -1357,3 +1357,46 @@ Notes:
   - 2026-05-06 team-lead: BRIEF/CONTEXT refreshed, dispatching reviewer
   - 2026-05-06 team-lead: approved
   - 2026-05-06 team-lead: approved
+
+---
+
+## CCR-042: address chat sessions by `claude_session_id` prefix in `/sessions` and `/continue` [done]
+Phase: n/a (post-CCR-041 chat-bot UX follow-up)
+Feature: chat-bot
+Files:
+  - `src/ccr/bot/handlers/session.py` — `/sessions` listing (`_format_session_row` around lines 320-333): render `claude_session_id[:8]` (8-hex prefix of the stored UUID-formatted string) for rows where `claude_session_id` is set. For rows where `claude_session_id IS NULL` (legacy / pre-CCR-036 / failed-init), render a non-prefix marker that signals "not addressable via `/continue`" rather than the local `Session.id[:8]` (which silently misleads — see fix-loop note below). Resume-chain rows (multiple rows sharing one `claude_session_id` after CCR-041) all render the same 8-hex prefix — that is intended; users re-use the prefix for `/continue`.
+  - `src/ccr/bot/handlers/session.py` — update the `cmd_sessions` docstring around lines 268-283 (and any user-facing help text) to reflect the new format: 8-hex prefix of `claude_session_id`, full UUID no longer rendered, NULL rows render a non-prefix marker.
+  - `src/ccr/claude/manager.py` — `_db_lookup_resumable_claude_session_id` around lines 1243-1284: change the prefix-match arm to compare against the first 8 hex of the stored `claude_session_id` string (i.e. `value[:8]`, since CCR-036 stores the column as a Python `str`, not a `uuid.UUID`) instead of `row.id.hex[:8]`. When multiple rows match (resume chain), apply the same `started_at desc → first` rule already used on the no-prefix path. Rows with `claude_session_id IS NULL` continue to be skipped from prefix matching (they cannot be resumed by Claude id since they don't have one).
+  - `tests/test_bot_session_handlers.py` (or wherever `/sessions` and `/continue` are exercised — locate by grepping for `cmd_sessions` and `continue_session`) — add cases for: (a) row with `claude_session_id` renders its 8-hex prefix; (b) row with `claude_session_id IS NULL` renders the non-prefix marker (NOT the local-id 8-hex fallback); (c) `/continue <claude-id-prefix>` resolves to the most-recent resumable row sharing that `claude_session_id`; (d) prefix that matches no row raises `SessionNotFoundError`; (e) prefix that only matches a NULL-`claude_session_id` row raises `SessionNotFoundError` (NULL rows are skipped from prefix matching — the non-prefix marker means users should not be passing such a prefix in the first place).
+Out of scope:
+  - Renaming behaviour — covered by CCR-043.
+  - Changes to `import_claude_session` or the partial index — handled by CCR-041.
+  - Backfilling NULL `claude_session_id` rows.
+Acceptance:
+  - [x] `/sessions` renders `claude_session_id[:8]` for rows where it is set, and a non-prefix marker (e.g. `--------` or developer-chosen equivalent surfaced in BRIEF) for rows where it is NULL — never a prefix that `/continue` cannot resolve.
+  - [x] `/continue <claude-id-prefix>` resumes the most-recent resumable row sharing that `claude_session_id`.
+  - [x] After CCR-036's `ccr session save <claude-id>` and a bot restart, `/continue <prefix-of-saved-claude-id>` resumes that conversation from chat without the user needing to learn the local row UUID.
+  - [x] `/continue` with no prefix is unchanged (most recent finished row with non-NULL `claude_session_id`).
+  - [x] Resume chains (multiple rows sharing `claude_session_id` after CCR-041) all show the same 8-hex prefix in `/sessions` and resolve via that prefix in `/continue`.
+  - [x] Every prefix shown in `/sessions` is resolvable via `/continue` (alignment invariant — the listing must not surface a token that `/continue` cannot match).
+  - [x] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [x] `ruff check src tests` passes.
+  - [x] `ruff format --check` passes.
+  - [x] `mypy src` passes.
+Depends on: CCR-041
+Notes:
+  Rekeys the chat surface from the local `Session.id` UUID onto `claude_session_id`, which is the more meaningful identifier now that resume chains (CCR-041) and `ccr session save <claude-id>` (CCR-036) make the Claude session id the user-facing handle. Without CCR-041 first, resumed rows still write NULL into `claude_session_id`, and the new prefix lookup would not find them — hence the hard dep.
+  Prior bot listing rendered the FULL `claude_session_id` UUID where set; the user explicitly wants the 8-hex prefix to keep `/sessions` lines compact and to mirror how `/continue` accepts prefixes.
+  `claude_session_id` is stored as a Python `str` (UUID-formatted) per CCR-036, so prefix slicing is `value[:8]`, NOT `.hex[:8]` (the latter is only valid for the local `uuid.UUID` `Session.id`).
+  After this ticket lands, the existing `started_at desc → first` rule in `_db_lookup_resumable_claude_session_id` handles the resume-chain case naturally; no extra ordering work needed.
+  Mode 1A note for team-lead: skip the architect — small, surgical change in two files plus tests; no new abstraction.
+  **Fix-loop note (2026-05-07):** the first pass kept the legacy `Session.id[:8]` fallback for NULL rows in `/sessions` rendering. User-gate testing on a real DB surfaced 5 stopped sessions with `claude_session_id IS NULL` (legacy / pre-CCR-041) where the listing displayed a local-UUID prefix that `/continue` then rejected with `SessionNotFoundError`. The two surfaces were misaligned exactly for the NULL case. Fix scope (option 1 of three the user reviewed): render a non-prefix marker for NULL rows so users immediately see those rows aren't `/continue`-able. The new acceptance line above ("every prefix shown in `/sessions` is resolvable") encodes the invariant the original acceptance missed.
+
+### Review log
+  - 2026-05-06 project-manager: filed as CCR-041 follow-up — chat addressing rekeyed onto claude_session_id
+  - 2026-05-06 main: branch ccr-042-claude-prefix-addressing created, dispatching team-lead
+  - 2026-05-06 team-lead: BRIEF/CONTEXT refreshed, dispatching reviewer
+  - 2026-05-06 team-lead: approved
+  - 2026-05-07 main: reopened from DONE.md — user-gate testing surfaced that NULL-`claude_session_id` rows render a local-UUID prefix in `/sessions` that `/continue` cannot match; acceptance unticked, marker-render fix scoped, dispatching python-developer for fix-loop pass
+  - 2026-05-07 team-lead: BRIEF/CONTEXT re-refreshed (fix loop), dispatching reviewer
+  - 2026-05-07 team-lead: approved (fix loop)

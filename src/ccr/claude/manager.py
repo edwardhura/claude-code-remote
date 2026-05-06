@@ -1249,15 +1249,21 @@ class SessionManager:
 
         No prefix -> the most recent finished row whose ``claude_session_id IS
         NOT NULL``; rows with ``claude_session_id IS NULL`` are skipped (legacy
-        / pre-CCR-036). With a prefix -> the row whose ``id.hex[:8] == prefix``
-        from the resumable set; if that row's ``claude_session_id IS NULL``,
-        :class:`NoPriorSessionError` is raised (the row exists but is NOT
-        resumable — :class:`SessionNotFoundError`'s "look harder" wording
-        would be misleading). If no row matches the prefix at all,
-        :class:`SessionNotFoundError` is raised.
+        / pre-CCR-036). With a prefix (CCR-042) -> the most recent finished
+        row whose ``claude_session_id[:8] == prefix``; rows with
+        ``claude_session_id IS NULL`` are skipped from prefix matching (they
+        have no Claude id to match against). When multiple rows share the
+        same ``claude_session_id`` (resume chain after CCR-041), the
+        ``started_at desc`` ordering picks the most recent one — same
+        tie-break rule the no-prefix path uses. If no row matches the
+        prefix at all, :class:`SessionNotFoundError` is raised.
 
         Returns ``None`` only on the no-prefix path when there is genuinely
         no resumable row; the caller maps that to :class:`NoPriorSessionError`.
+
+        ``claude_session_id`` is stored as a Python ``str`` (UUID-formatted)
+        per CCR-036, so the slice is ``value[:8]`` — do NOT call ``.hex[:8]``
+        (that is only valid for the local ``uuid.UUID`` ``Session.id``).
         """
         async with self._db_factory() as db:
             rows = (
@@ -1275,10 +1281,9 @@ class SessionManager:
             return None
 
         for row in rows:
-            if row.id.hex[:8] == session_id_prefix:
-                if row.claude_session_id is None:
-                    message = "No prior session to continue."
-                    raise NoPriorSessionError(message)
+            if row.claude_session_id is None:
+                continue
+            if row.claude_session_id[:8] == session_id_prefix:
                 return row.claude_session_id
         message = f"No session found with id {session_id_prefix}."
         raise SessionNotFoundError(message)
