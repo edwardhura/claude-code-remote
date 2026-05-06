@@ -371,3 +371,59 @@ Notes:
 
 ### Review log
 ---
+
+## CCR-041: `/continue` UNIQUE-constraint regression — drop unique flag on `claude_session_id`, programmatic duplicate guard [todo]
+Phase: n/a (post-CCR-036 bugfix)
+Feature: claude-runtime
+Files:
+  - `alembic/versions/` — new migration that drops the unique-ness from the partial index `ix_sessions_claude_session_id_not_null` (either by dropping the index and recreating it as a non-unique partial index for query speed, or by replacing the unique index with a non-unique equivalent — developer's call). Original index added in CCR-036's migration `alembic/versions/0003_add_sessions_claude_session_id.py`.
+  - `src/ccr/db/models.py` — flip `unique=True` → `unique=False` on the partial index declaration around lines 118-126 (the `Index(...)` call backing `ix_sessions_claude_session_id_not_null`). Keep the partial-index `WHERE claude_session_id IS NOT NULL` clause so the index stays useful for lookups.
+  - `src/ccr/claude/import_session.py` — add a programmatic SELECT-before-INSERT duplicate check in `import_claude_session` (around lines 175-232): look up by `claude_session_id`; raise `DuplicateClaudeSessionError(claude_session_id)` if a row already exists. Keep the existing IntegrityError except branch as a defensive fallback or remove it once the pre-check is in place — developer's call.
+  - `src/ccr/claude/manager.py` — no scoped behaviour change required; the existing `_update_claude_session_id` write at lines 871-876 will simply succeed instead of raising. Confirm the lookup logic in `_db_lookup_resumable_claude_session_id` (lines 1271-1284, "started_at desc → first non-null") continues to work unchanged when multiple rows share the same `claude_session_id`.
+  - `tests/test_db_models.py` — remove or rewrite `test_session_partial_unique_index_on_claude_session_id` (around line 251); the constraint no longer enforces uniqueness so the existing assertion is obsolete. Replace with a test that asserts the partial index is still present (non-unique) if a query-plan/index-presence check is desired.
+  - `tests/test_claude_import_session.py` (or wherever `import_claude_session` is currently tested — locate by grepping for `import_claude_session`) — keep the duplicate-import test green via the new programmatic check; assert `DuplicateClaudeSessionError` is raised on the second call rather than relying on `IntegrityError`.
+  - `tests/test_session_manager.py` — add a regression test for the `/continue` chain: spawn a fresh session, end it, call `continue_session`, drive the `SystemInit` event through `_consume_events`, assert no `claude_session_id_update_failed` log entry / no `IntegrityError` is raised AND the new row's `claude_session_id` is set to the resumed value (multiple rows now share the same `claude_session_id`).
+Out of scope:
+  - Changing the lookup ordering logic in `_db_lookup_resumable_claude_session_id` — already correct.
+  - Reworking `import_claude_session` semantics beyond moving the duplicate guard from the DB index to a programmatic check.
+  - Backfilling existing NULL `claude_session_id` rows from prior failed resumes.
+Acceptance:
+  - [ ] Fresh session followed by `/continue` no-prefix produces no `claude_session_id_update_failed` log entry; the resumed row's `claude_session_id` equals the prior row's value.
+  - [ ] `/continue <8-hex-prefix>` against the resumed row succeeds (does not raise `NoPriorSessionError`).
+  - [ ] `import_claude_session` still raises `DuplicateClaudeSessionError` when called twice for the same `claude_session_id` (programmatic guard intact).
+  - [ ] Multiple rows can share the same `claude_session_id` without `IntegrityError` (regression test in `tests/test_session_manager.py`).
+  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [ ] `ruff check src tests` passes.
+  - [ ] `ruff format --check` passes.
+  - [ ] `mypy src` passes.
+Depends on: CCR-036
+Notes:
+  Bug report: when a user runs `/continue` (no prefix), the bot replies "Session 73725407 resumed (pid 30666)" — the session works — but the logs contain a fire-and-forget `IntegrityError`:
+
+  ```
+  session_manager.claude_session_id_update_failed
+  claude_session_id=7aa3069d-8b1f-4b98-b6f3-3c6fa1e3a0f7
+  session_id=73725407-1cea-40f7-95cc-1469c2be623a
+  sqlite3.IntegrityError: UNIQUE constraint failed: sessions.claude_session_id
+  [SQL: UPDATE sessions SET claude_session_id=? WHERE sessions.id = ?]
+  ```
+
+  Future implementers can grep on `claude_session_id_update_failed` or `UNIQUE constraint failed: sessions.claude_session_id` to recognise the same bug.
+
+  Root cause: `continue_session()` in `src/ccr/claude/manager.py:425-499` mints a NEW local `Session` row with a fresh `uuid4` and spawns claude with `--resume <prior_claude_session_id>`. When claude resumes, its `SystemInit` emits the *same* `session_id` as the prior conversation (because `--resume` continues that conversation). `_consume_events` at `src/ccr/claude/manager.py:871-876` then fires `_update_claude_session_id(new_local_id, event.session_id)` which tries to UPDATE the new row's `claude_session_id` to the prior row's value — colliding with the partial UNIQUE index `ix_sessions_claude_session_id_not_null` declared in `src/ccr/db/models.py:118-126` and added in CCR-036's migration. The unique index was added to prevent double-import of the same Claude session via `import_claude_session` (the `session save` console command); it did not anticipate `--resume` chains, which semantically *do* produce multiple rows pointing at the same Claude conversation.
+
+  Visible side effects of the current bug:
+  - The bot reply is correct ("Session … resumed"); the session itself works because lock + spawn + status flip happen before the failing DB write.
+  - The `_update_claude_session_id` write is wrapped in `try/except` with `log.exception` (fire-and-forget) so it does not crash the session.
+  - The new resumed row keeps `claude_session_id = NULL` instead of the prior row's id.
+  - `/continue` no-prefix still works (`_db_lookup_resumable_claude_session_id` walks `started_at desc` and picks the first non-null — finds the prior row, resumes correctly).
+  - `/continue 73725407` (the new resumed row's prefix) **fails** with `NoPriorSessionError` because the new row's `claude_session_id IS NULL` — see `src/ccr/claude/manager.py:1277-1284`.
+  - Every subsequent `/continue` repeats the IntegrityError in the logs.
+
+  Suggested direction (not part of acceptance — architect/developer free to choose option 2 if a strong reason emerges): **Option 1 — drop the unique constraint, add programmatic duplicate check.** Rationale: resume chains semantically *do* produce multiple rows pointing at the same Claude conversation; the lookup logic (`started_at desc → first non-null`) already handles this correctly. The "don't import the same Claude session twice" guard belongs at the `import_claude_session` callsite (CCR-036's `session save` console command), not as a DB-wide invariant. Move it to a SELECT-before-INSERT in `src/ccr/claude/import_session.py` and let the resume-chain rows share `claude_session_id` freely.
+
+  Mode 1A note for team-lead: skip the architect — small, additive, single-feature; scope is "drop unique flag + programmatic duplicate check + regression test". No new abstraction, no schema beyond the index flip, no cross-cutting design call.
+
+### Review log
+  - 2026-05-06 project-manager: filed from /continue UNIQUE-constraint bug report
+---
