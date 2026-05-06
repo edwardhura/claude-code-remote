@@ -5,17 +5,34 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
 from aiogram.filters import CommandObject
 from aiogram.types import Chat, Message, User
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
-from ccr.bot.handlers.passthrough import cmd_passthrough
+from ccr.bot.handlers.passthrough import (
+    OVERAGE_REASON_LABELS,
+    RATE_LIMIT_WINDOW_LABELS,
+    cmd_passthrough,
+)
 from ccr.claude.events import RateLimitEvent, RateLimitInfo
 from ccr.claude.manager import NoActiveSessionError
 from ccr.claude.usage import SessionUsage
 from ccr.config import Settings
+from ccr.db.engine import AsyncSessionMaker
+from ccr.db.models import Base, PairedUser
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 # --------------------------------------------------------------------------- #
 # Helpers / stubs.
@@ -786,11 +803,14 @@ async def test_usage_active_session_with_rate_limit_renders_html(tmp_path: Path)
     # /usage is locally rendered — the canned claude reply is degenerate.
     manager.send_slash.assert_not_awaited()
     text = _captured_text(msg)
-    assert "<b>Rate-limit window:</b> five_hour" in text
+    # CCR-039: window code rendered via the humanised label, not raw snake_case.
+    assert "<b>Rate-limit window:</b> Five hour" in text
+    assert "five_hour" not in text
     assert "<b>Status:</b> allowed" in text
     assert "<b>Overage:</b> rejected" in text
-    # group_zero_credit_limit appears as a suffix on the overage line.
-    assert "group_zero_credit_limit" in text
+    # CCR-039: overage reason rendered via the humanised label, not raw snake_case.
+    assert "Group zero credit limit" in text
+    assert "group_zero_credit_limit" not in text
     assert "<b>Using overage:</b> no" in text
 
 
@@ -836,7 +856,14 @@ async def test_usage_active_session_no_rate_limit_yet_returns_distinct_string(
 
 @pytest.mark.asyncio
 async def test_usage_html_escapes_interpolated_values(tmp_path: Path) -> None:
-    """Interpolated string fields are HTML-escaped — no raw markup leaks."""
+    """Interpolated string fields are HTML-escaped — no raw markup leaks.
+
+    CCR-039: an unknown ``rate_limit_type`` / ``overage_disabled_reason``
+    code passes through :func:`_humanise_code` (snake_case → Title Case)
+    BEFORE the HTML escape, so ``"<script>"`` becomes ``"<Script>"`` and
+    is then escaped to ``"&lt;Script&gt;"``. The security invariant —
+    no raw metacharacters in the final output — is preserved.
+    """
     rl = _probe_rate_limit_event(
         rate_limit_type="<script>",
         overage_disabled_reason="a&b<c",
@@ -853,11 +880,14 @@ async def test_usage_html_escapes_interpolated_values(tmp_path: Path) -> None:
     )
 
     text = _captured_text(msg)
-    assert "&lt;script&gt;" in text
-    assert "a&amp;b&lt;c" in text
+    # Title-cased + HTML-escaped — `<` becomes `&lt;`, etc.
+    assert "&lt;Script&gt;" in text
+    assert "A&amp;B&lt;C" in text
     # Raw metacharacters must not leak.
     assert "<script>" not in text
     assert "a&b<c" not in text
+    assert "<Script>" not in text
+    assert "A&B<C" not in text
 
 
 @pytest.mark.asyncio
@@ -992,3 +1022,280 @@ async def test_usage_rate_limit_info_none_returns_unavailable(tmp_path: Path) ->
     )
 
     msg.answer.assert_awaited_once_with("Rate-limit info unavailable.")
+
+
+# --------------------------------------------------------------------------- #
+# CCR-039: humanised window / overage labels + helper-driven datetime.
+# --------------------------------------------------------------------------- #
+
+
+@pytest_asyncio.fixture
+async def usage_engine() -> AsyncIterator[AsyncEngine]:
+    """In-memory SQLite for tests that need a real :class:`PairedUser` row.
+
+    Mirrors the fixture in ``tests/test_bot_config.py``; replicated here
+    to keep this test module self-contained without a shared conftest.
+    """
+    eng = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    async with eng.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    try:
+        yield eng
+    finally:
+        await eng.dispose()
+
+
+@pytest_asyncio.fixture
+async def usage_session_factory(
+    usage_engine: AsyncEngine,
+) -> async_sessionmaker[AsyncSession]:
+    return AsyncSessionMaker(usage_engine)
+
+
+async def _seed_paired_user(
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    tg_user_id: int,
+    timezone: str | None,
+) -> None:
+    """Insert a paired_users row for /usage timezone tests."""
+    async with factory() as db:
+        db.add(
+            PairedUser(
+                tg_user_id=tg_user_id,
+                tg_username="alice",
+                is_owner=True,
+                approved_at=datetime.now(UTC),
+                timezone=timezone,
+            ),
+        )
+        await db.commit()
+
+
+@pytest.mark.parametrize(
+    ("code", "label"),
+    list(RATE_LIMIT_WINDOW_LABELS.items()),
+)
+@pytest.mark.asyncio
+async def test_usage_window_code_renders_humanised_label(
+    code: str,
+    label: str,
+    tmp_path: Path,
+) -> None:
+    """Every window code seeded in ``RATE_LIMIT_WINDOW_LABELS`` renders mapped."""
+    rl = _probe_rate_limit_event(rate_limit_type=code)
+    manager = FakeManager(active=True, rate_limit=rl)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/usage")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("usage"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    text = _captured_text(msg)
+    assert f"<b>Rate-limit window:</b> {label}" in text
+    # The raw snake_case must NOT leak.
+    assert code not in text
+
+
+@pytest.mark.parametrize(
+    ("code", "label"),
+    list(OVERAGE_REASON_LABELS.items()),
+)
+@pytest.mark.asyncio
+async def test_usage_overage_reason_renders_humanised_label(
+    code: str,
+    label: str,
+    tmp_path: Path,
+) -> None:
+    """Every overage reason seeded in ``OVERAGE_REASON_LABELS`` renders mapped."""
+    rl = _probe_rate_limit_event(overage_disabled_reason=code)
+    manager = FakeManager(active=True, rate_limit=rl)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/usage")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("usage"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    text = _captured_text(msg)
+    assert label in text
+    # The raw snake_case must NOT leak.
+    assert code not in text
+
+
+@pytest.mark.asyncio
+async def test_usage_unknown_window_code_falls_back_to_title_case(
+    tmp_path: Path,
+) -> None:
+    """An unmapped window code degrades to a title-case-with-spaces transform.
+
+    Exact rendering: ``"new_unknown_window"`` → ``"New Unknown Window"``.
+    """
+    rl = _probe_rate_limit_event(rate_limit_type="new_unknown_window")
+    manager = FakeManager(active=True, rate_limit=rl)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/usage")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("usage"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    text = _captured_text(msg)
+    assert "<b>Rate-limit window:</b> New Unknown Window" in text
+    # The raw snake_case must NOT leak.
+    assert "new_unknown_window" not in text
+
+
+@pytest.mark.asyncio
+async def test_usage_unknown_overage_reason_falls_back_to_title_case(
+    tmp_path: Path,
+) -> None:
+    """An unmapped overage reason degrades to a title-case-with-spaces transform."""
+    rl = _probe_rate_limit_event(overage_disabled_reason="brand_new_reason")
+    manager = FakeManager(active=True, rate_limit=rl)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/usage")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("usage"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    text = _captured_text(msg)
+    assert "Brand New Reason" in text
+    assert "brand_new_reason" not in text
+
+
+@pytest.mark.asyncio
+async def test_usage_resets_at_uses_user_timezone(
+    usage_session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """Non-UTC timezone shifts the ``Resets at`` timestamp before formatting.
+
+    ``2025-01-15 18:00:00 UTC`` + ``America/New_York`` (UTC-5 in January)
+    must render as ``13:00 - 15/01/2025``. Past-epoch tail follows
+    (``in the past``); the absolute datetime is what this test pins.
+    """
+    user_id = 9001
+    await _seed_paired_user(
+        usage_session_factory,
+        tg_user_id=user_id,
+        timezone="America/New_York",
+    )
+    # 2025-01-15T18:00:00Z = epoch 1736964000.
+    rl = _probe_rate_limit_event(
+        resets_at=1736964000,
+        # Trim other fields so the assertion focuses on "Resets at".
+        status=None,
+        rate_limit_type=None,
+        overage_status=None,
+        overage_disabled_reason=None,
+        is_using_overage=None,
+    )
+    manager = FakeManager(active=True, rate_limit=rl)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/usage", user_id=user_id)
+
+    await cmd_passthrough(
+        msg,
+        command=_command("usage"),
+        session_manager=manager,
+        settings=settings,
+        db_factory=usage_session_factory,
+    )
+
+    text = _captured_text(msg)
+    # UTC-5 shifts 18:00 UTC → 13:00 local. Format is HH:MM - DD/MM/YYYY.
+    assert "13:00 - 15/01/2025" in text
+    # The unshifted UTC variant must NOT leak.
+    assert "18:00 - 15/01/2025" not in text
+
+
+@pytest.mark.asyncio
+async def test_usage_resets_at_falls_back_to_utc_for_user_without_timezone(
+    usage_session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """A paired user with ``timezone IS NULL`` renders the timestamp in UTC."""
+    user_id = 9002
+    await _seed_paired_user(
+        usage_session_factory,
+        tg_user_id=user_id,
+        timezone=None,
+    )
+    rl = _probe_rate_limit_event(
+        resets_at=1736964000,  # 2025-01-15T18:00:00Z
+        status=None,
+        rate_limit_type=None,
+        overage_status=None,
+        overage_disabled_reason=None,
+        is_using_overage=None,
+    )
+    manager = FakeManager(active=True, rate_limit=rl)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/usage", user_id=user_id)
+
+    await cmd_passthrough(
+        msg,
+        command=_command("usage"),
+        session_manager=manager,
+        settings=settings,
+        db_factory=usage_session_factory,
+    )
+
+    text = _captured_text(msg)
+    assert "18:00 - 15/01/2025" in text
+
+
+@pytest.mark.asyncio
+async def test_usage_resets_at_relative_delta_tail_present_for_future_epoch(
+    tmp_path: Path,
+) -> None:
+    """Regression: the ``(in {delta})`` tail still follows the formatted datetime.
+
+    Uses a far-future epoch (year 2099) so the assertion holds regardless
+    of when the test suite runs — :func:`_format_resets_at` computes the
+    delta against ``datetime.now(UTC)``.
+    """
+    # 2099-01-01T00:00:00Z = epoch 4070908800.
+    rl = _probe_rate_limit_event(
+        resets_at=4070908800,
+        status=None,
+        rate_limit_type=None,
+        overage_status=None,
+        overage_disabled_reason=None,
+        is_using_overage=None,
+    )
+    manager = FakeManager(active=True, rate_limit=rl)
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/usage")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("usage"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    text = _captured_text(msg)
+    # Relative tail format is "(in Xh Ym)" or "(in Xm Ys)". Either is fine —
+    # the regression is "any '(in …)' segment is present after the datetime".
+    import re as _re
+
+    paren_segment = _re.search(r"\(in [^)]+\)", text)
+    assert paren_segment is not None
+    # And it must NOT be "in the past" (we're targeting a future epoch).
+    assert "in the past" not in text

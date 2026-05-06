@@ -21,6 +21,8 @@ The aiogram-based Telegram bot. This is the user's primary control surface: pair
 - Every datetime rendered in `src/ccr/bot/` goes through `ccr.utils.format_user_datetime`. Inline `strftime` in `src/ccr/bot/` is forbidden — enforced by the grep canary `grep -rnE "strftime\(" src/ccr/bot/`.
 - `format_user_datetime` never raises: an unresolvable `user.timezone` logs a structlog warning and falls back to UTC.
 - Naive `datetime` input to the helper is interpreted as UTC (because SQLite drops `tzinfo` on round-trip even with `DateTime(timezone=True)`).
+- `/usage` window codes (`rate_limit_type`) and overage reasons render via `_humanise_code` against `RATE_LIMIT_WINDOW_LABELS` / `OVERAGE_REASON_LABELS` BEFORE HTML-escaping. Unknown codes degrade to a deterministic title-case-with-spaces transform.
+- The "Resets at" line in `/usage` renders in the calling user's `paired_users.timezone` via `format_user_datetime(..., "full")`. The relative `(in {delta})` tail follows the formatted datetime; past epochs produce `"(in the past)"` instead of a negative duration.
 - `Session.name` auto-fill is gated by a Python-side `row.name is not None` guard after SELECT; equivalent to WHERE-NULL under the single-session invariant (at most one session runs at a time). A manual `/rename` always wins. The `_auto_fill_session_name` helper enforces this; `_db_insert_session` defers to it rather than setting `name` on the initial INSERT.
 - `/rename` overwrites `Session.name` unconditionally — manual rename always wins, even over an existing manual name.
 - `/sessions` rows where `Session.name IS NULL` render the literal `(unnamed)` placeholder (not an empty cell).
@@ -46,6 +48,13 @@ The aiogram-based Telegram bot. This is the user's primary control surface: pair
 - `permission.py::cb_permission` — callback `perm:{session_id}:{request_id}:{choice}`; validates choice against `_pending_options` frozenset; rejects forged / stale / concurrent / malformed; edits message with `→ {choice} (by @{username})`.
 - `ask_user_question.py` — three reply paths (button tap callback, `/answer <id8> <text>` command, single-outstanding plain-text feed). `_ID8_RE = ^[0-9a-zA-Z_-]{8}$` (broadened for real-world prefixes like `toulu_…`). Stale / unknown ids rejected with canned message. Validates `tool_use_id`, calls `session_manager.send_tool_result`.
 - `passthrough.py` — three-branch dispatch: `WHITELIST = {"model", "compact"}` forwarded via `manager.send_slash`; `BLOCKED_INTERACTIVE = {"mcp", "init"}` returns canned redirect; unknown commands return usage hint. Dedicated branches for `/agents` (Running + Library), `/skills`, `/cost`, `/usage`.
+  - `passthrough.py::RATE_LIMIT_WINDOW_LABELS` — module-level mapping `{snake_case_code: "Humanised label"}` consumed by `/usage`; seeded with `five_hour`, `weekly`. Unknown codes fall back to title-case-with-spaces via `_humanise_code`.
+  - `passthrough.py::OVERAGE_REASON_LABELS` — same shape for overage reason codes; seeded with `group_zero_credit_limit`.
+  - `passthrough.py::_humanise_code(code, label_map)` — internal helper: returns `label_map[code]` if present, else `code.replace("_", " ").title()`. Used by `_render_usage_reply` for both window-code and overage-reason rendering.
+  - `passthrough.py::_format_resets_at(epoch_seconds, user)` — signature widened: now takes `PairedUser | None` and threads it through `format_user_datetime("full")`. The prior `user=None` UTC-only fallback is resolved.
+  - `passthrough.py::_render_usage_reply(rl, user)` — signature widened: now takes `PairedUser | None`; the "Resets at" line renders in `user.timezone` (UTC fallback when user is None or `timezone IS NULL`).
+  - `passthrough.py::_reply_usage(msg, session_manager, db_factory)` — signature widened; resolves the calling `PairedUser` itself via the injected `db_factory`.
+  - `passthrough.py::cmd_passthrough(msg, command, session_manager, settings, db_factory=None)` — new optional `db_factory` kwarg; aiogram injects it from `dp["db_factory"]` in production. Default `None` exists for test-harness convenience only.
 - `config.py` — `cfg:*` router; `/config` opens an inline-keyboard menu (Timezone + Close); `/config tz <IANA name>` is the free-text fallback that validates via `zoneinfo.ZoneInfo` and persists to `paired_users.timezone` for the caller.
 - `config.py::cmd_config` — `/config` handler; opens menu, or honours `/config tz <IANA name>` free-text fallback.
 - `config.py::cb_open_tz_picker` — `cfg:tz` callback; renders the curated picker (13 zones).
@@ -104,7 +113,9 @@ The aiogram-based Telegram bot. This is the user's primary control surface: pair
 - **`broadcast_paired` swallows per-recipient `TelegramAPIError`.** Don't add a global try/except that hides the per-recipient warning logs.
 - **TypingKeepalive cancel is idempotent.** Calling `cancel` on an already-cancelled task is fine; the broadcast loop relies on this.
 - **SQLite roundtrip strips `tzinfo` from `DateTime(timezone=True)` columns.** Do not assume `Session.started_at.tzinfo is not None` when reading back from the DB. The `format_user_datetime` helper handles this defensively (treats naive input as UTC), but other code paths must remain aware.
-- **`_format_resets_at` in `passthrough.py` still passes `user=None` to `format_user_datetime`** (UTC fallback). Threading the calling `PairedUser` through that path is owned by CCR-039.
+- **`_format_resets_at` now threads the calling `PairedUser` through `format_user_datetime`** — the prior CCR-035 gotcha ("`_format_resets_at` in `passthrough.py` still passes `user=None`") is resolved by CCR-039.
+- **`_humanise_code` runs BEFORE `html.escape`.** A future label string or unmapped code containing `<` / `>` / `&` would still be HTML-safe in the final output, but case-folded by `.title()`. The security invariant (no raw HTML metacharacters in `parse_mode="HTML"` output) is preserved.
+- **`cmd_passthrough` accepts `db_factory: async_sessionmaker[AsyncSession] | None = None`.** The optional default exists only because the existing test suite calls the handler directly; in production, `dp["db_factory"]` is always set by `build_dispatcher`, so the `None` branch is unreachable.
 - **Telegram's HTML parse mode treats `<word>` as a tag start.** Any user-facing string sent with `parse_mode="HTML"` containing literal `<` or `>` will raise `TelegramBadRequest`. Use `&lt;`/`&gt;` for static placeholder text or `html.escape()` for dynamic content.
 - **`cmd_answer`'s usage-hint send is wrapped in a narrow `try/except TelegramBadRequest`** (with structlog warning) so a future regression in any static `_USAGE_HINT`-shaped string cannot crash the dispatcher silently. The catch is intentionally narrow — broader exceptions still propagate.
 - **The auto-fill cap (40 chars) is duplicated** as `_SESSION_NAME_MAX_LEN` in both `src/ccr/claude/manager.py` and `src/ccr/bot/handlers/session.py`; the bot module does not import manager-internal constants. If the cap changes, both sites must update.
@@ -119,4 +130,4 @@ The aiogram-based Telegram bot. This is the user's primary control surface: pair
 ## Status
 - State: IN PROGRESS
 - Tickets: CCR-006, CCR-008, CCR-009 (gating later removed in CCR-024), CCR-010, CCR-014 (planned), CCR-018, CCR-019, CCR-020, CCR-022, CCR-023, CCR-024, CCR-026, CCR-027 (deferred), CCR-028 (AUQ collision), CCR-030, CCR-031, CCR-032, CCR-033, CCR-034, CCR-035, CCR-036, CCR-037, CCR-038, CCR-039 (planned), CCR-040 (planned)
-- Last updated: CCR-038 (2026-05-06)
+- Last updated: CCR-039 (2026-05-06)

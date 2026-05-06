@@ -295,46 +295,6 @@ Notes:
   - 2026-05-01 main: marked [blocked] — schema reconciliation work in this ticket is moot (no schema to reconcile to); supersedes filed as CCR-024 (remove dead permission code from CCR-009) and CCR-025 (MCP permission-prompt-tool integration). This ticket stays open as a tracking pin until CCR-025 lands; revisit if upstream Claude `-p` ever exposes a stdout permission channel.
 ---
 
-## CCR-039: `/usage` cosmetics — humanise codes + helper-driven datetime [todo]
-Phase: n/a (post-CCR-032 polish)
-Feature: chat-bot
-Files:
-  - `src/ccr/bot/handlers/passthrough.py` — extend `_render_usage_reply` and helpers around line 228 with constant maps:
-    - `RATE_LIMIT_WINDOW_LABELS = {"five_hour": "Five hour", ...}` — humanise `rate_limit_event.resets_at` window codes.
-    - `OVERAGE_REASON_LABELS = {"group_zero_credit_limit": "Group zero credit limit", ...}` — humanise overage reason codes.
-    Unknown code → fall back to a humanised form (title-case + spaces from the snake_case key) so a new code from Claude degrades gracefully.
-  - `src/ccr/bot/handlers/passthrough.py` — replace the raw ISO timestamp on the "Resets at" line with `format_user_datetime(resets_at, user, "full")` from CCR-035. Keep the existing relative `(in {delta})` tail as-is.
-  - `src/ccr/bot/handlers/passthrough.py` — light prettifying pass on overall block layout / wording (developer's discretion within the new constants).
-  - `tests/test_bot_passthrough.py` — extend `/usage` tests:
-    - Each known window code renders with its mapped label (one test per known code seeded today).
-    - Each known overage reason renders with its mapped label.
-    - An unknown code falls back to a title-cased humanised form (e.g. `"new_unknown_window"` → `"New unknown window"`).
-    - "Resets at" timestamp renders via the helper in `full` mode (HH:MM DD-MM-YYYY); user with a non-UTC `paired_users.timezone` shifts it; user with no timezone preference falls back to UTC.
-    - Regression: the relative `(in {delta})` tail is still present.
-Out of scope:
-  - Changing the underlying `RateLimitEvent` model or wire format.
-  - Changing how `current_rate_limit_status()` is populated (CCR-032's substrate).
-  - The web-viewer rendering of usage data.
-  - Unifying overage reason labels with any future billing surface.
-Acceptance:
-  - [ ] `/usage` reply uses humanised labels for all window codes seeded in `RATE_LIMIT_WINDOW_LABELS` (no raw `five_hour` etc. visible).
-  - [ ] `/usage` reply uses humanised labels for all overage reason codes seeded in `OVERAGE_REASON_LABELS` (no raw `group_zero_credit_limit` etc. visible).
-  - [ ] Unknown codes degrade gracefully via a title-case + spaces fallback (verified by a test with a synthetic unknown code).
-  - [ ] "Resets at" timestamp uses `format_user_datetime(..., "full")` from CCR-035; user-timezone shift verified by a test with a non-UTC `paired_users.timezone`.
-  - [ ] The relative `(in {delta})` tail remains on the "Resets at" line (regression).
-  - [ ] `grep -nE 'strftime\(' src/ccr/bot/handlers/passthrough.py` returns no matches (confirms no inline strftime regressed in).
-  - [ ] `pytest tests/test_bot_passthrough.py` passes.
-  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
-Depends on: CCR-032, CCR-035
-Notes:
-  Phase n/a — cosmetic polish of CCR-032's `/usage` output. Source: `_render_usage_reply` and helpers around `src/ccr/bot/handlers/passthrough.py:228`.
-  Constant-maps pattern (vs. branching logic) keeps adding new codes a one-line change. The `title-case-fallback` rule is the safety net for unknown codes.
-  Mode 1A note for team-lead: skip the architect — additive cosmetic ticket, scope is two constant maps + helper call + light layout polish.
-  Hard depend on CCR-035 because the "Resets at" timestamp is one of the first sites switching to `format_user_datetime`.
-
-### Review log
----
-
 ## CCR-040: `/agents` reply mirrors Claude Code CLI library view [todo]
 Phase: n/a (post-CCR-022 polish)
 Feature: chat-bot
