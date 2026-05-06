@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from ccr.bot.handlers.passthrough import (
+    BUILTIN_AGENTS,
     OVERAGE_REASON_LABELS,
     RATE_LIMIT_WINDOW_LABELS,
     cmd_passthrough,
@@ -443,12 +444,38 @@ async def test_unknown_command_returns_usage(tmp_path: Path) -> None:
 
 
 def _seed_agents_library(tmp_path: Path, names: list[str]) -> Path:
-    """Create ``tmp_path/.claude/agents/`` with ``<name>.md`` files; return the dir."""
+    """Create ``tmp_path/.claude/agents/`` with ``<name>.md`` files; return the dir.
+
+    The seeded files have no YAML frontmatter so the rendered ``model``
+    column falls back to ``inherit`` (CCR-040). Tests that need a specific
+    ``model:`` value should write the file directly with frontmatter.
+    """
     agents_dir = tmp_path / ".claude" / "agents"
     agents_dir.mkdir(parents=True, exist_ok=True)
     for name in names:
         (agents_dir / f"{name}.md").write_text("body\n", encoding="utf-8")
     return agents_dir
+
+
+def _seed_agent_with_frontmatter(
+    tmp_path: Path,
+    name: str,
+    *,
+    frontmatter: str | None = None,
+    body: str = "body\n",
+) -> Path:
+    """Create one ``<name>.md`` file with optional YAML frontmatter.
+
+    If ``frontmatter`` is ``None`` the file has no ``---`` block (parser
+    falls back to ``inherit``). Otherwise ``frontmatter`` is the body
+    between the two ``---`` delimiters, e.g. ``"model: opus"``.
+    """
+    agents_dir = tmp_path / ".claude" / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    content = body if frontmatter is None else f"---\n{frontmatter}\n---\n{body}"
+    target = agents_dir / f"{name}.md"
+    target.write_text(content, encoding="utf-8")
+    return target
 
 
 def _captured_text(msg: Message) -> str:
@@ -461,7 +488,7 @@ def _captured_text(msg: Message) -> str:
 
 @pytest.mark.asyncio
 async def test_agents_renders_running_and_library_sections(tmp_path: Path) -> None:
-    """Both sections render with their headers and bullet points in alphabetical order."""
+    """All three sections render with headers and bullet points in alphabetical order."""
     manager = FakeManager(running=["python-developer", "architect"])
     _seed_agents_library(tmp_path, ["foo", "bar"])
     settings = _make_fake_settings(tmp_path)
@@ -476,21 +503,28 @@ async def test_agents_renders_running_and_library_sections(tmp_path: Path) -> No
 
     text = _captured_text(msg)
     assert "<b>Running</b>" in text
-    assert "<b>Library</b>" in text
+    assert "<b>Project agents</b>" in text
+    assert "<b>Built-in agents</b>" in text
     assert "• python-developer" in text
     assert "• architect" in text
-    assert "• foo" in text
-    assert "• bar" in text
-    # Alphabetical inside each section.
+    # CCR-040: Project agents render as `<name> · <model>`; missing
+    # frontmatter falls back to ``inherit``.
+    assert "• foo · inherit" in text
+    assert "• bar · inherit" in text
+    # Alphabetical inside the running and project-agents sections.
     assert text.index("• architect") < text.index("• python-developer")
-    assert text.index("• bar") < text.index("• foo")
+    assert text.index("• bar · inherit") < text.index("• foo · inherit")
     # No interactive blocked-string leakage.
     assert "Interactive command" not in text
 
 
 @pytest.mark.asyncio
 async def test_agents_empty_running_and_empty_library(tmp_path: Path) -> None:
-    """Both empty → both sections render the literal ``(none)`` placeholder."""
+    """Empty running + missing project dir → those sections render ``(none)``.
+
+    The Built-in agents section is always populated from the constant
+    :data:`BUILTIN_AGENTS` so it never reaches ``(none)``.
+    """
     manager = FakeManager(running=[])
     # No agents dir at all.
     settings = _make_fake_settings(tmp_path)
@@ -505,12 +539,14 @@ async def test_agents_empty_running_and_empty_library(tmp_path: Path) -> None:
 
     text = _captured_text(msg)
     assert "<b>Running</b>\n(none)" in text
-    assert "<b>Library</b>\n(none)" in text
+    assert "<b>Project agents</b>\n(none)" in text
+    # Built-in agents is sourced from a constant — it never empties.
+    assert "<b>Built-in agents</b>\n(none)" not in text
 
 
 @pytest.mark.asyncio
 async def test_agents_only_library_populated(tmp_path: Path) -> None:
-    """Empty running, populated library → Running shows ``(none)``, Library lists files."""
+    """Empty running, populated project agents → Running shows ``(none)``."""
     manager = FakeManager(running=[])
     _seed_agents_library(tmp_path, ["alpha", "beta"])
     settings = _make_fake_settings(tmp_path)
@@ -525,13 +561,15 @@ async def test_agents_only_library_populated(tmp_path: Path) -> None:
 
     text = _captured_text(msg)
     assert "<b>Running</b>\n(none)" in text
-    assert "• alpha" in text
-    assert "• beta" in text
+    # CCR-040: project agents render with the ``inherit`` fallback when
+    # the file has no frontmatter.
+    assert "• alpha · inherit" in text
+    assert "• beta · inherit" in text
 
 
 @pytest.mark.asyncio
 async def test_agents_only_running_populated(tmp_path: Path) -> None:
-    """Populated running, no library dir → Library shows ``(none)``, Running lists subagent."""
+    """Populated running, no project dir → Project agents shows ``(none)``."""
     manager = FakeManager(running=["python-developer"])
     # Do NOT seed any agents directory.
     settings = _make_fake_settings(tmp_path)
@@ -546,7 +584,7 @@ async def test_agents_only_running_populated(tmp_path: Path) -> None:
 
     text = _captured_text(msg)
     assert "• python-developer" in text
-    assert "<b>Library</b>\n(none)" in text
+    assert "<b>Project agents</b>\n(none)" in text
 
 
 @pytest.mark.asyncio
@@ -641,6 +679,227 @@ async def test_agents_library_skips_non_md_and_hidden(tmp_path: Path) -> None:
     assert "bar" not in text
     assert "hidden" not in text
     assert "subdir" not in text
+
+
+# --------------------------------------------------------------------------- #
+# CCR-040: model column on project agents + Built-in agents section.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_agents_project_agent_with_model_opus_renders_model(tmp_path: Path) -> None:
+    """``model: opus`` in YAML frontmatter renders ``<name> · opus``."""
+    manager = FakeManager(running=[])
+    _seed_agent_with_frontmatter(tmp_path, "deepthink", frontmatter="model: opus")
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/agents")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("agents"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    text = _captured_text(msg)
+    assert "• deepthink · opus" in text
+
+
+@pytest.mark.asyncio
+async def test_agents_project_agent_without_model_field_falls_back_to_inherit(
+    tmp_path: Path,
+) -> None:
+    """No ``model:`` key in frontmatter → ``<name> · inherit`` (Claude Code default)."""
+    manager = FakeManager(running=[])
+    # Frontmatter with another key but no model field.
+    _seed_agent_with_frontmatter(
+        tmp_path,
+        "specialist",
+        frontmatter="description: a helpful agent",
+    )
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/agents")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("agents"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    text = _captured_text(msg)
+    assert "• specialist · inherit" in text
+
+
+@pytest.mark.asyncio
+async def test_agents_project_agent_with_no_frontmatter_falls_back_to_inherit(
+    tmp_path: Path,
+) -> None:
+    """File with no ``---`` block at all → ``<name> · inherit`` (no parse error)."""
+    manager = FakeManager(running=[])
+    _seed_agent_with_frontmatter(tmp_path, "raw", frontmatter=None, body="just markdown\n")
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/agents")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("agents"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    text = _captured_text(msg)
+    assert "• raw · inherit" in text
+
+
+@pytest.mark.asyncio
+async def test_agents_project_agent_with_malformed_frontmatter_falls_back_to_inherit(
+    tmp_path: Path,
+) -> None:
+    """Unterminated ``---`` block → ``<name> · inherit`` (no parse error surfaced)."""
+    manager = FakeManager(running=[])
+    # Opening delimiter but no closing ---: malformed frontmatter.
+    agents_dir = tmp_path / ".claude" / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    (agents_dir / "broken.md").write_text(
+        "---\nmodel: opus\n\nbody-no-close\n",
+        encoding="utf-8",
+    )
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/agents")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("agents"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    text = _captured_text(msg)
+    assert "• broken · inherit" in text
+    # The malformed-but-present "model: opus" line must NOT have leaked.
+    assert "• broken · opus" not in text
+
+
+@pytest.mark.asyncio
+async def test_agents_builtin_section_lists_every_constant_entry(tmp_path: Path) -> None:
+    """``Built-in agents`` section lists every key in :data:`BUILTIN_AGENTS` in dict order."""
+    manager = FakeManager(running=[])
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/agents")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("agents"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    text = _captured_text(msg)
+    assert "<b>Built-in agents</b>" in text
+    # Every key/value pair from BUILTIN_AGENTS surfaces as a bullet.
+    expected_lines = [f"• {name} · {model}" for name, model in BUILTIN_AGENTS.items()]
+    for line in expected_lines:
+        assert line in text
+    # The bullets appear in the order BUILTIN_AGENTS defines.
+    indices = [text.index(line) for line in expected_lines]
+    assert indices == sorted(indices)
+
+
+@pytest.mark.asyncio
+async def test_agents_section_order_is_running_project_builtin(tmp_path: Path) -> None:
+    """Final section order: Running → Project agents → Built-in agents."""
+    manager = FakeManager(running=["python-developer"])
+    _seed_agents_library(tmp_path, ["alpha"])
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/agents")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("agents"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    text = _captured_text(msg)
+    i_running = text.index("<b>Running</b>")
+    i_project = text.index("<b>Project agents</b>")
+    i_builtin = text.index("<b>Built-in agents</b>")
+    assert i_running < i_project < i_builtin
+
+
+@pytest.mark.asyncio
+async def test_agents_html_escapes_project_agent_name_with_metachars(tmp_path: Path) -> None:
+    """Project agent names containing ``<``, ``>``, ``&`` are HTML-escaped (CCR-022 regression)."""
+    manager = FakeManager(running=[])
+    # File whose stem contains an ampersand — survives the *.md glob and
+    # exercises html.escape() on the rendered name. We avoid `<` / `>` in
+    # the filename because some filesystems reject them; the model column
+    # carries the angle-bracket regression instead.
+    _seed_agent_with_frontmatter(
+        tmp_path,
+        "a&b",
+        frontmatter="model: <evil>",
+    )
+    settings = _make_fake_settings(tmp_path)
+    msg = _make_message(text="/agents")
+
+    await cmd_passthrough(
+        msg,
+        command=_command("agents"),
+        session_manager=manager,
+        settings=settings,
+    )
+
+    text = _captured_text(msg)
+    # Both name and model are escaped before rendering.
+    assert "a&amp;b" in text
+    assert "&lt;evil&gt;" in text
+    # Raw metacharacters must not leak.
+    assert "• a&b" not in text
+    assert "<evil>" not in text
+
+
+def test_agents_html_escapes_builtin_agent_value_if_present() -> None:
+    """Even constant-sourced built-in entries are HTML-escaped before rendering.
+
+    Defensive: today every value in :data:`BUILTIN_AGENTS` is a plain
+    identifier, but the renderer must not assume that — a future edit
+    that adds ``<`` / ``>`` / ``&`` to the constant must not produce
+    raw HTML.
+    """
+    from ccr.bot.handlers.passthrough import _render_agents_reply
+
+    text = _render_agents_reply(
+        running=[],
+        project_agents=[],
+        builtin_agents={"safe-name": "<bad>"},
+    )
+    assert "&lt;bad&gt;" in text
+    assert "<bad>" not in text
+
+
+def test_builtin_agents_constant_has_version_comment() -> None:
+    """The constant must carry a version comment (acceptance-criteria item).
+
+    We read the source file directly because constants do not retain
+    their comments at runtime; the comment lives on the line above the
+    declaration. The check is intentionally loose — any
+    ``Claude Code CLI v<digits>`` mention adjacent to ``BUILTIN_AGENTS``
+    counts.
+    """
+    from ccr.bot.handlers import passthrough
+
+    src_path = Path(passthrough.__file__)
+    source = src_path.read_text(encoding="utf-8")
+    # The comment is expected immediately above the BUILTIN_AGENTS line.
+    decl_idx = source.index("BUILTIN_AGENTS: dict[str, str]")
+    preamble = source[:decl_idx]
+    last_lines = preamble.splitlines()[-3:]
+    joined = "\n".join(last_lines).lower()
+    assert "claude code cli" in joined
+    assert "v" in joined
+    assert "." in joined
 
 
 # --------------------------------------------------------------------------- #

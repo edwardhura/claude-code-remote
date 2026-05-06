@@ -295,43 +295,6 @@ Notes:
   - 2026-05-01 main: marked [blocked] — schema reconciliation work in this ticket is moot (no schema to reconcile to); supersedes filed as CCR-024 (remove dead permission code from CCR-009) and CCR-025 (MCP permission-prompt-tool integration). This ticket stays open as a tracking pin until CCR-025 lands; revisit if upstream Claude `-p` ever exposes a stdout permission channel.
 ---
 
-## CCR-040: `/agents` reply mirrors Claude Code CLI library view [todo]
-Phase: n/a (post-CCR-022 polish)
-Feature: chat-bot
-Files:
-  - `src/ccr/bot/handlers/passthrough.py` — extend `_render_agents_reply` and `_list_library_agents` (around lines 79 and 93). Per line in Project agents and Built-in agents: `<name> · <model>`.
-    - Project agents: parse `model:` from each `.claude/agents/*.md` YAML frontmatter. If absent → render `inherit` (matches Claude Code CLI fallback).
-    - Built-in agents: built-ins are NOT on disk. Use a constant map `BUILTIN_AGENTS = {"Explore": "haiku", "Plan": "inherit", "general-purpose": "inherit", "statusline-setup": "sonnet", "claude-code-guide": "haiku"}`. Add a comment noting the Claude Code version this was sourced from so we know to revisit.
-    - Final section order: Running (existing) → Project agents → Built-in agents.
-  - `tests/test_bot_passthrough.py` — extend `/agents` tests:
-    - Project agent with `model: opus` in frontmatter renders `<name> · opus`.
-    - Project agent without `model:` field renders `<name> · inherit`.
-    - Built-in agents section is present in the reply, in the order specified by `BUILTIN_AGENTS`.
-    - Final section order in the rendered reply is Running → Project agents → Built-in agents.
-    - HTML escaping of agent names containing `<`, `>`, `&` (regression — CCR-022 pattern).
-  - `tests/fakes/` — no changes expected; the existing project-agent fixture in `tests/` is the source for the project-section test. Add fixture frontmatter as needed.
-Out of scope:
-  - Discovering built-in agents from a Claude Code introspection API (the CLI does not expose one) — the constant map is the agreed substitute.
-  - Editing or creating agent definitions from Telegram (read-only listing).
-  - Per-subagent model configuration in any format other than YAML frontmatter.
-  - Cross-referencing the running subagents (CCR-022 surface) with model info — out of scope, model info comes from project files only.
-Acceptance:
-  - [ ] Each project-agent line renders as `<name> · <model>`; missing `model:` frontmatter renders `inherit`.
-  - [ ] A `Built-in agents` section is present, listing every entry in the constant `BUILTIN_AGENTS` map as `<name> · <model>`.
-  - [ ] `BUILTIN_AGENTS` has a comment noting the Claude Code version it was sourced from (so future maintainers know to revisit).
-  - [ ] Final section order in the `/agents` reply is Running → Project agents → Built-in agents.
-  - [ ] HTML escaping is preserved for agent names containing `<`, `>`, `&` (regression vs. CCR-022).
-  - [ ] `pytest tests/test_bot_passthrough.py` passes.
-  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
-Depends on: CCR-022
-Notes:
-  Phase n/a — cosmetic polish of CCR-022's `/agents` output to mirror the Claude Code CLI library view. Source: `_render_agents_reply` and `_list_library_agents` in `src/ccr/bot/handlers/passthrough.py:79,93`.
-  Built-ins are NOT on disk; the constant map is the only source. Treat the version comment as documentation debt — a future ticket may want to refresh the list when Claude Code ships new built-ins.
-  Mode 1A note for team-lead: skip the architect — additive UX (constant map + frontmatter parser + section ordering). No new abstraction, no schema, no cross-cutting design call.
-
-### Review log
----
-
 ## CCR-041: `/continue` UNIQUE-constraint regression — drop unique flag on `claude_session_id`, programmatic duplicate guard [todo]
 Phase: n/a (post-CCR-036 bugfix)
 Feature: claude-runtime
@@ -386,4 +349,70 @@ Notes:
 
 ### Review log
   - 2026-05-06 project-manager: filed from /continue UNIQUE-constraint bug report
+---
+
+## CCR-042: address chat sessions by `claude_session_id` prefix in `/sessions` and `/continue` [todo]
+Phase: n/a (post-CCR-041 chat-bot UX follow-up)
+Feature: chat-bot
+Files:
+  - `src/ccr/bot/handlers/session.py` — `/sessions` listing (`_format_session_row` around lines 320-333): render `claude_session_id[:8]` (8-hex prefix of the stored UUID-formatted string) for rows where `claude_session_id` is set; keep the existing `Session.id[:8]` fallback for rows where `claude_session_id IS NULL` (legacy / pre-CCR-036 / failed-init). Resume-chain rows (multiple rows sharing one `claude_session_id` after CCR-041) all render the same 8-hex prefix — that is intended; users re-use the prefix for `/continue`.
+  - `src/ccr/bot/handlers/session.py` — update the `cmd_sessions` docstring around lines 268-283 (and any user-facing help text) to reflect the new format: 8-hex prefix of `claude_session_id`, full UUID no longer rendered.
+  - `src/ccr/claude/manager.py` — `_db_lookup_resumable_claude_session_id` around lines 1243-1284: change the prefix-match arm to compare against the first 8 hex of the stored `claude_session_id` string (i.e. `value[:8]`, since CCR-036 stores the column as a Python `str`, not a `uuid.UUID`) instead of `row.id.hex[:8]`. When multiple rows match (resume chain), apply the same `started_at desc → first` rule already used on the no-prefix path. Rows with `claude_session_id IS NULL` continue to be skipped from prefix matching (they cannot be resumed by Claude id since they don't have one).
+  - `tests/test_bot_session_handlers.py` (or wherever `/sessions` and `/continue` are exercised — locate by grepping for `cmd_sessions` and `continue_session`) — add cases for: (a) row with `claude_session_id` renders its 8-hex prefix; (b) row with `claude_session_id IS NULL` renders the local-id 8-hex fallback; (c) `/continue <claude-id-prefix>` resolves to the most-recent resumable row sharing that `claude_session_id`; (d) prefix that matches no row raises `SessionNotFoundError`; (e) prefix that only matches a NULL-`claude_session_id` row raises `NoPriorSessionError` (mirrors current behaviour).
+Out of scope:
+  - Renaming behaviour — covered by CCR-043.
+  - Changes to `import_claude_session` or the partial index — handled by CCR-041.
+  - Backfilling NULL `claude_session_id` rows.
+Acceptance:
+  - [ ] `/sessions` renders `claude_session_id[:8]` for rows where it is set, and `Session.id[:8]` for rows where it is NULL.
+  - [ ] `/continue <claude-id-prefix>` resumes the most-recent resumable row sharing that `claude_session_id`.
+  - [ ] After CCR-036's `ccr session save <claude-id>` and a bot restart, `/continue <prefix-of-saved-claude-id>` resumes that conversation from chat without the user needing to learn the local row UUID.
+  - [ ] `/continue` with no prefix is unchanged (most recent finished row with non-NULL `claude_session_id`).
+  - [ ] Resume chains (multiple rows sharing `claude_session_id` after CCR-041) all show the same 8-hex prefix in `/sessions` and resolve via that prefix in `/continue`.
+  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [ ] `ruff check src tests` passes.
+  - [ ] `ruff format --check` passes.
+  - [ ] `mypy src` passes.
+Depends on: CCR-041
+Notes:
+  Rekeys the chat surface from the local `Session.id` UUID onto `claude_session_id`, which is the more meaningful identifier now that resume chains (CCR-041) and `ccr session save <claude-id>` (CCR-036) make the Claude session id the user-facing handle. Without CCR-041 first, resumed rows still write NULL into `claude_session_id`, and the new prefix lookup would not find them — hence the hard dep.
+  Prior bot listing rendered the FULL `claude_session_id` UUID where set; the user explicitly wants the 8-hex prefix to keep `/sessions` lines compact and to mirror how `/continue` accepts prefixes.
+  `claude_session_id` is stored as a Python `str` (UUID-formatted) per CCR-036, so prefix slicing is `value[:8]`, NOT `.hex[:8]` (the latter is only valid for the local `uuid.UUID` `Session.id`).
+  After this ticket lands, the existing `started_at desc → first` rule in `_db_lookup_resumable_claude_session_id` handles the resume-chain case naturally; no extra ordering work needed.
+  Mode 1A note for team-lead: skip the architect — small, surgical change in two files plus tests; no new abstraction.
+
+### Review log
+  - 2026-05-06 project-manager: filed as CCR-041 follow-up — chat addressing rekeyed onto claude_session_id
+---
+
+## CCR-043: `/rename` becomes active-session-only; add `/setname <prefix> <name>` for arbitrary rename [todo]
+Phase: n/a (post-CCR-041 chat-bot UX follow-up)
+Feature: chat-bot
+Files:
+  - `src/ccr/bot/handlers/session.py` — rework `/rename` (around lines 357- and the `_parse_rename_args` helper): drop the `<8-hex-prefix>` argument. New shape is `/rename <new-name>` and it renames whatever session is currently running (the `SessionManager`'s active session). If no session is running, reply with a stable error like `"No active session to rename."` and do not mutate. `/rename` with no args (or only whitespace) replies with the usage hint and does not mutate.
+  - `src/ccr/bot/handlers/session.py` — add new handler `cmd_setname` for `/setname <prefix> <name>` in the same file: takes an 8-hex prefix matched against `claude_session_id` (mirroring the new `/continue` addressing from CCR-042). Renames `Session.name` on every row sharing that `claude_session_id` so the chain stays visually consistent (developer's call: alternative is "most recent row only" — flag the choice in the BRIEF). Works whether or not a session is active. NULL `claude_session_id` rows are not addressable via `/setname` (consistent with `/continue` behaviour from CCR-042).
+  - `src/ccr/bot/handlers/session.py` — update `cmd_sessions` docstring and any user-facing help text that documents `/rename`'s old prefix form.
+  - `tests/test_bot_session_handlers.py` (or wherever `/rename` is exercised — locate by grepping for `cmd_rename` / `_parse_rename_args`) — update existing `/rename` tests to the new no-prefix form (active vs no-active branches). Add tests for `/setname`: (a) renames a single non-chain row; (b) renames all rows in a resume chain sharing one `claude_session_id`; (c) unknown prefix → stable error reply; (d) ambiguous prefix is now expected to match a chain (not an error) — clarify the assertion accordingly; (e) prefix that only matches NULL-`claude_session_id` rows → unknown-prefix error.
+Out of scope:
+  - Auto-naming logic from the first user prompt — unchanged.
+  - The session-listing format — handled by CCR-042.
+Acceptance:
+  - [ ] `/rename <name>` renames the running session; with no running session, replies with the documented error and does not mutate.
+  - [ ] `/rename` with no args (or only whitespace) replies with the usage hint and does not mutate.
+  - [ ] `/setname <claude-id-prefix> <name>` renames every row sharing that `claude_session_id`.
+  - [ ] `/setname` with unknown prefix replies with the documented error and does not mutate.
+  - [ ] `/setname` works without an active session.
+  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [ ] `ruff check src tests` passes.
+  - [ ] `ruff format --check` passes.
+  - [ ] `mypy src` passes.
+Depends on: CCR-042
+Notes:
+  User-stated rationale: `/rename` should target the active session only — if there is no active session, the command does nothing. The off-active case is what `/setname <prefix> <name>` is for; addressable from any state.
+  Hard dep on CCR-042 because both commands must use the same prefix convention (`claude_session_id[:8]`). Landing CCR-043 first would mean `/setname` and `/continue` use different prefix conventions, which is exactly what we are trying to avoid.
+  The "rename all rows in chain" choice keeps `/sessions` visually consistent now that resume chains share one prefix; flag in the BRIEF so a future maintainer who wants per-row naming knows the shape.
+  Mode 1A note for team-lead: skip the architect — one-file scope, additive new handler, semantic change to existing handler; no new abstraction.
+
+### Review log
+  - 2026-05-06 project-manager: filed as CCR-041 follow-up — split rename into active-only `/rename` plus addressable `/setname`
 ---
