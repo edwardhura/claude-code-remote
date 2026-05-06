@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import structlog
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import select
 
 from ccr.auth.pairing import get_owner
 from ccr.claude.state import SessionStatus
@@ -190,10 +190,15 @@ async def import_claude_session(
        warning — the import is NOT aborted.
     3. Look up the owner via :func:`ccr.auth.pairing.get_owner` -> raise
        :class:`NoOwnerError` if ``None``.
-    4. Insert a :class:`Session` row with ``claude_session_id``, ``started_at``,
+    4. SELECT-before-INSERT duplicate guard: query for any existing
+       :class:`Session` row sharing ``claude_session_id`` and raise
+       :class:`DuplicateClaudeSessionError(claude_session_id)` on hit.
+       CCR-041 dropped the DB-side UNIQUE flag on
+       ``ix_sessions_claude_session_id_not_null`` because resume chains
+       legitimately produce multiple rows pointing at the same Claude
+       conversation; the import-time double-write guard now lives here.
+    5. Insert a :class:`Session` row with ``claude_session_id``, ``started_at``,
        ``started_by_tg_user_id=owner.tg_user_id``, ``status="stopped"``.
-    5. On :class:`IntegrityError` from the partial unique index -> roll back,
-       raise :class:`DuplicateClaudeSessionError(claude_session_id)`.
 
     Returns the persisted :class:`Session`.
 
@@ -218,6 +223,12 @@ async def import_claude_session(
         message = "No owner registered. Pair the owner first."
         raise NoOwnerError(message)
 
+    existing = await db.scalar(
+        select(Session).where(Session.claude_session_id == claude_session_id),
+    )
+    if existing is not None:
+        raise DuplicateClaudeSessionError(claude_session_id)
+
     row = Session(
         started_at=started_at,
         status=SessionStatus.STOPPED.value,
@@ -225,11 +236,7 @@ async def import_claude_session(
         claude_session_id=claude_session_id,
     )
     db.add(row)
-    try:
-        await db.commit()
-    except IntegrityError as exc:
-        await db.rollback()
-        raise DuplicateClaudeSessionError(claude_session_id) from exc
+    await db.commit()
     await db.refresh(row)
     return row
 

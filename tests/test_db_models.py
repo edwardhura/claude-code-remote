@@ -248,10 +248,16 @@ async def test_session_round_trips_claude_session_id(
     assert null_row.claude_session_id is None
 
 
-async def test_session_partial_unique_index_on_claude_session_id(
+async def test_session_partial_index_allows_duplicate_claude_session_id(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Two non-NULL duplicates raise; two NULLs are fine."""
+    """CCR-041: ``--resume`` chains share one ``claude_session_id`` across rows.
+
+    The partial index ``ix_sessions_claude_session_id_not_null`` is non-unique
+    (CCR-041) so multiple rows can persist with the same Claude session id.
+    Two NULL rows are still fine. The partial-index predicate is preserved so
+    the index is still useful for ``WHERE claude_session_id = ?`` lookups.
+    """
     async with get_session(session_factory) as session:
         session.add(
             Session(
@@ -260,32 +266,58 @@ async def test_session_partial_unique_index_on_claude_session_id(
                 claude_session_id="dup-id",
             )
         )
+        session.add(
+            Session(
+                started_at=datetime.now(UTC),
+                status="completed",
+                claude_session_id="dup-id",
+            )
+        )
+        session.add(
+            Session(
+                started_at=datetime.now(UTC),
+                status="completed",
+                claude_session_id=None,
+            )
+        )
+        session.add(
+            Session(
+                started_at=datetime.now(UTC),
+                status="completed",
+                claude_session_id=None,
+            )
+        )
 
-    with pytest.raises(IntegrityError):
-        async with get_session(session_factory) as session:
-            session.add(
-                Session(
-                    started_at=datetime.now(UTC),
-                    status="completed",
-                    claude_session_id="dup-id",
+    async with session_factory() as session:
+        rows = list(
+            (
+                await session.scalars(
+                    select(Session).where(Session.claude_session_id == "dup-id"),
                 )
-            )
+            ).all()
+        )
+        assert len(rows) == 2
 
-    async with get_session(session_factory) as session:
-        session.add(
-            Session(
-                started_at=datetime.now(UTC),
-                status="completed",
-                claude_session_id=None,
-            )
+        all_rows = list((await session.scalars(select(Session))).all())
+        assert len(all_rows) == 4
+
+    # The partial index must still exist (non-unique) so resume-time lookups
+    # by ``claude_session_id`` stay indexed. Inspect ``sqlite_master``.
+    async with session_factory() as session:
+        index_rows = list(
+            (
+                await session.execute(
+                    sa.text(
+                        "SELECT name, sql FROM sqlite_master "
+                        "WHERE type='index' AND name='ix_sessions_claude_session_id_not_null'",
+                    ),
+                )
+            ).all()
         )
-        session.add(
-            Session(
-                started_at=datetime.now(UTC),
-                status="completed",
-                claude_session_id=None,
-            )
-        )
+    assert len(index_rows) == 1
+    index_sql = index_rows[0][1] or ""
+    assert "UNIQUE" not in index_sql.upper()
+    assert "CLAUDE_SESSION_ID IS NOT NULL" in index_sql.upper()
 
 
 def test_alembic_round_trips_claude_session_id_migration(tmp_path: Path) -> None:
