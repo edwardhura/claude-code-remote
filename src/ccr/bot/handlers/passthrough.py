@@ -41,15 +41,18 @@ from typing import TYPE_CHECKING
 
 from aiogram import Router
 from aiogram.filters import Command, CommandObject
+from sqlalchemy import select
 
 from ccr.bot.formatting import SAFE_CHUNK
 from ccr.claude.manager import NoActiveSessionError
+from ccr.db.models import PairedUser
 from ccr.utils import format_user_datetime
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from aiogram.types import Message
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from ccr.claude.events import RateLimitEvent
     from ccr.claude.manager import SessionManager
@@ -59,6 +62,21 @@ if TYPE_CHECKING:
 
 WHITELIST: frozenset[str] = frozenset({"model", "compact"})
 BLOCKED_INTERACTIVE: frozenset[str] = frozenset({"mcp", "init"})
+
+# CCR-039: humanise the snake_case codes claude emits on rate_limit_event
+# into a presentation-grade label. Keys are seeded with every code that
+# appears in test fixtures / production today (see tests/test_claude_events.py
+# and tests/test_session_manager.py). Unknown codes fall back to a
+# title-case-with-spaces transform via :func:`_humanise_code` so a new
+# server-side code degrades gracefully rather than rendering raw snake_case.
+RATE_LIMIT_WINDOW_LABELS: dict[str, str] = {
+    "five_hour": "Five hour",
+    "weekly": "Weekly",
+}
+
+OVERAGE_REASON_LABELS: dict[str, str] = {
+    "group_zero_credit_limit": "Group zero credit limit",
+}
 
 _UNKNOWN_USAGE_HINT = (
     "Unknown command. Whitelisted: /new /stop /clear /view /last /preview "
@@ -200,14 +218,33 @@ async def _reply_cost(msg: Message, session_manager: SessionManager) -> None:
     await msg.answer(_render_cost_reply(session_id.hex, usage))
 
 
-def _format_resets_at(epoch_seconds: int | None) -> str:
-    """Render ``epoch_seconds`` as a UTC timestamp + relative delta.
+def _humanise_code(code: str, label_map: dict[str, str]) -> str:
+    """Return a presentation-grade label for ``code``.
+
+    If ``code`` is a key in ``label_map`` the mapped string is returned
+    verbatim. Otherwise the snake_case code is transformed into a
+    title-case-with-spaces fallback (e.g. ``"new_unknown_window"`` →
+    ``"New Unknown Window"``) so a previously-unseen server-side code
+    still renders something readable rather than raw snake_case. The
+    output is plain ASCII for the seeded label set today; callers must
+    still HTML-escape it before interpolating into a ``parse_mode="HTML"``
+    payload because a future label or unknown code could in principle
+    contain ``<`` / ``>`` / ``&``.
+    """
+    if code in label_map:
+        return label_map[code]
+    return code.replace("_", " ").title()
+
+
+def _format_resets_at(epoch_seconds: int | None, user: PairedUser | None) -> str:
+    """Render ``epoch_seconds`` as a localised timestamp + relative delta.
 
     Returns ``"unknown"`` when ``epoch_seconds`` is ``None`` or non-positive
     (claude does not emit zero/negative epochs in practice but the field
     is forward-compat optional). The absolute timestamp is rendered via
-    :func:`format_user_datetime` in ``"full"`` mode (UTC fallback — CCR-039
-    will thread the calling user through). For epochs in the past the
+    :func:`format_user_datetime` in ``"full"`` mode using ``user``'s
+    ``paired_users.timezone`` preference; ``user=None`` or
+    ``user.timezone IS NULL`` fall back to UTC. For epochs in the past the
     timestamp is followed by ``"in the past"`` rather than a negative
     duration. Future epochs render as ``"in Xm Ys"`` for < 1 h and
     ``"in Xh Ym"`` otherwise.
@@ -215,7 +252,7 @@ def _format_resets_at(epoch_seconds: int | None) -> str:
     if epoch_seconds is None or epoch_seconds <= 0:
         return "unknown"
     target = datetime.fromtimestamp(epoch_seconds, tz=UTC)
-    rendered = format_user_datetime(target, None, "full")
+    rendered = format_user_datetime(target, user, "full")
     delta_seconds = int(epoch_seconds - datetime.now(tz=UTC).timestamp())
     if delta_seconds <= 0:
         return f"{rendered} (in the past)"
@@ -228,7 +265,7 @@ def _format_resets_at(epoch_seconds: int | None) -> str:
     return f"{rendered} (in {hours}h {minutes}m)"
 
 
-def _render_usage_reply(rl: RateLimitEvent) -> str:
+def _render_usage_reply(rl: RateLimitEvent, user: PairedUser | None) -> str:
     """Render a rich HTML ``/usage`` reply.
 
     Layout — every interpolated string field HTML-escaped, every field
@@ -237,14 +274,24 @@ def _render_usage_reply(rl: RateLimitEvent) -> str:
 
     .. code-block:: text
 
-        <b>Rate-limit window:</b> {rate_limit_type}
+        <b>Rate-limit window:</b> {humanised_window}
         <b>Status:</b> {status}
-        <b>Resets at:</b> {iso} (in {delta})
-        <b>Overage:</b> {overage_status}{ — overage_disabled_reason }
+        <b>Resets at:</b> {localised_dt} (in {delta})
+        <b>Overage:</b> {overage_status}{ — humanised_reason }
         <b>Using overage:</b> yes|no
 
+    Window codes (``rate_limit_type``) and overage reasons go through
+    :func:`_humanise_code` against :data:`RATE_LIMIT_WINDOW_LABELS` /
+    :data:`OVERAGE_REASON_LABELS` so users see ``"Five hour"`` rather
+    than ``"five_hour"``; unknown codes degrade to a title-case-with-spaces
+    transform.
     ``is_using_overage`` distinguishes ``False`` (renders ``"no"``) from
     ``None`` (line omitted entirely) via an ``is not None`` guard.
+    The "Resets at" timestamp is rendered via
+    :func:`format_user_datetime` in ``"full"`` mode using ``user``'s
+    ``paired_users.timezone`` preference (UTC fallback when ``user`` is
+    ``None`` or the column is ``NULL``); the relative ``(in {delta})``
+    tail follows the formatted datetime.
     Output is truncated to :data:`SAFE_CHUNK` defensively, mirroring
     :func:`_render_cost_reply`.
     """
@@ -253,15 +300,20 @@ def _render_usage_reply(rl: RateLimitEvent) -> str:
         return "Rate-limit info unavailable."
     lines: list[str] = []
     if info.rate_limit_type:
-        lines.append(f"<b>Rate-limit window:</b> {html.escape(info.rate_limit_type)}")
+        humanised_window = _humanise_code(info.rate_limit_type, RATE_LIMIT_WINDOW_LABELS)
+        lines.append(f"<b>Rate-limit window:</b> {html.escape(humanised_window)}")
     if info.status:
         lines.append(f"<b>Status:</b> {html.escape(info.status)}")
     if info.resets_at:
-        lines.append(f"<b>Resets at:</b> {_format_resets_at(info.resets_at)}")
+        lines.append(f"<b>Resets at:</b> {_format_resets_at(info.resets_at, user)}")
     if info.overage_status:
         suffix = ""
         if info.overage_disabled_reason:
-            suffix = f" — {html.escape(info.overage_disabled_reason)}"
+            humanised_reason = _humanise_code(
+                info.overage_disabled_reason,
+                OVERAGE_REASON_LABELS,
+            )
+            suffix = f" — {html.escape(humanised_reason)}"
         lines.append(f"<b>Overage:</b> {html.escape(info.overage_status)}{suffix}")
     if info.is_using_overage is not None:
         lines.append(f"<b>Using overage:</b> {'yes' if info.is_using_overage else 'no'}")
@@ -273,7 +325,32 @@ def _render_usage_reply(rl: RateLimitEvent) -> str:
     return text
 
 
-async def _reply_usage(msg: Message, session_manager: SessionManager) -> None:
+async def _load_paired_user(
+    db_factory: async_sessionmaker[AsyncSession] | None,
+    tg_user_id: int | None,
+) -> PairedUser | None:
+    """Look up the calling :class:`PairedUser` row for timezone-aware rendering.
+
+    Returns ``None`` when ``db_factory`` is missing (test harnesses calling
+    handlers directly without a workflow data injection), when the caller
+    has no ``from_user`` (rare for slash commands but defensive), or when
+    no row matches ``tg_user_id``. ``format_user_datetime`` already handles
+    ``None`` users with a UTC fallback so this never propagates an error.
+    """
+    if db_factory is None or tg_user_id is None:
+        return None
+    async with db_factory() as db:
+        row: PairedUser | None = await db.scalar(
+            select(PairedUser).where(PairedUser.tg_user_id == tg_user_id),
+        )
+        return row
+
+
+async def _reply_usage(
+    msg: Message,
+    session_manager: SessionManager,
+    db_factory: async_sessionmaker[AsyncSession] | None,
+) -> None:
     """Answer ``/usage`` with the most recent rate-limit snapshot.
 
     Three distinct states (per plan §Edge cases 2 + 3):
@@ -282,7 +359,9 @@ async def _reply_usage(msg: Message, session_manager: SessionManager) -> None:
     2. Active session but no ``rate_limit_event`` observed yet →
        ``"No rate-limit data received yet on this session."`` (distinct
        string so users and tests can tell it apart from state 1).
-    3. Active session with a snapshot → :func:`_render_usage_reply`.
+    3. Active session with a snapshot → :func:`_render_usage_reply` with
+       the calling user's :class:`PairedUser` row threaded through so the
+       "Resets at" timestamp is rendered in ``user.timezone`` (CCR-039).
     """
     if not session_manager.is_session_active():
         await msg.answer("No active session.")
@@ -291,7 +370,9 @@ async def _reply_usage(msg: Message, session_manager: SessionManager) -> None:
     if rl is None:
         await msg.answer("No rate-limit data received yet on this session.")
         return
-    await msg.answer(_render_usage_reply(rl))
+    tg_user_id = msg.from_user.id if msg.from_user is not None else None
+    user = await _load_paired_user(db_factory, tg_user_id)
+    await msg.answer(_render_usage_reply(rl, user))
 
 
 @router.message(Command(re.compile(r".+")))
@@ -300,8 +381,16 @@ async def cmd_passthrough(
     command: CommandObject,
     session_manager: SessionManager,
     settings: Settings,
+    db_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> None:
-    """Route any otherwise-unclaimed slash command into one of three branches."""
+    """Route any otherwise-unclaimed slash command into one of three branches.
+
+    ``db_factory`` is injected by aiogram from ``dp["db_factory"]`` in
+    production so ``/usage`` can look up the calling :class:`PairedUser`
+    for timezone-aware rendering. The default ``None`` exists purely so
+    tests calling this handler directly without a DB factory still
+    function — production callers always provide one.
+    """
     name = command.command
     args = command.args or ""
 
@@ -318,7 +407,7 @@ async def cmd_passthrough(
         return
 
     if name == "usage":
-        await _reply_usage(msg, session_manager)
+        await _reply_usage(msg, session_manager, db_factory)
         return
 
     if name in WHITELIST:
@@ -337,4 +426,11 @@ async def cmd_passthrough(
     await msg.answer(_UNKNOWN_USAGE_HINT)
 
 
-__all__ = ["BLOCKED_INTERACTIVE", "WHITELIST", "cmd_passthrough", "router"]
+__all__ = [
+    "BLOCKED_INTERACTIVE",
+    "OVERAGE_REASON_LABELS",
+    "RATE_LIMIT_WINDOW_LABELS",
+    "WHITELIST",
+    "cmd_passthrough",
+    "router",
+]
