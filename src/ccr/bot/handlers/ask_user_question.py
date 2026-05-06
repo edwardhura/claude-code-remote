@@ -34,6 +34,7 @@ import re
 import uuid
 from typing import TYPE_CHECKING
 
+import structlog
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
@@ -61,9 +62,10 @@ _AUQ_PART_COUNT = 4
 _ANSWER_PART_COUNT = 2
 _STALE_ALERT = "Stale prompt"
 _FORWARDED_REPLY = "Forwarded."
-_USAGE_HINT = "Usage: /answer <8-char-id> <text>"
+_USAGE_HINT = "Usage: /answer &lt;8-char-id&gt; &lt;text&gt;"
 
 
+log = structlog.get_logger(__name__)
 router = Router(name="ask_user_question")
 
 
@@ -151,7 +153,10 @@ async def cmd_answer(
     raw = (msg.text or "").removeprefix("/answer").strip()
     parts = raw.split(maxsplit=1)
     if len(parts) != _ANSWER_PART_COUNT or not _ID8_RE.match(parts[0]):
-        await msg.answer(_USAGE_HINT)
+        try:
+            await msg.answer(_USAGE_HINT)
+        except TelegramBadRequest:
+            log.warning("usage_hint_send_failed", exc_info=True)
         return
     id_prefix, body = parts
 

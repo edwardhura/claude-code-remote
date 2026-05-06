@@ -380,7 +380,7 @@ async def test_cmd_answer_malformed_args_no_body_rejected() -> None:
     msg = _make_msg("/answer aaaaaaaa")
     manager = _make_manager()
     await cmd_answer(msg, session_manager=manager)
-    msg.answer.assert_awaited_once_with("Usage: /answer <8-char-id> <text>")
+    msg.answer.assert_awaited_once_with("Usage: /answer &lt;8-char-id&gt; &lt;text&gt;")
     manager.send_tool_result.assert_not_awaited()
 
 
@@ -390,7 +390,7 @@ async def test_cmd_answer_malformed_args_too_short_rejected() -> None:
     msg = _make_msg("/answer XYZ something")
     manager = _make_manager()
     await cmd_answer(msg, session_manager=manager)
-    msg.answer.assert_awaited_once_with("Usage: /answer <8-char-id> <text>")
+    msg.answer.assert_awaited_once_with("Usage: /answer &lt;8-char-id&gt; &lt;text&gt;")
     manager.send_tool_result.assert_not_awaited()
 
 
@@ -404,7 +404,40 @@ async def test_cmd_answer_malformed_args_invalid_chars_rejected() -> None:
     msg = _make_msg("/answer abc!def@ something")
     manager = _make_manager()
     await cmd_answer(msg, session_manager=manager)
-    msg.answer.assert_awaited_once_with("Usage: /answer <8-char-id> <text>")
+    msg.answer.assert_awaited_once_with("Usage: /answer &lt;8-char-id&gt; &lt;text&gt;")
+    manager.send_tool_result.assert_not_awaited()
+
+
+# CCR-038: regression — `/answer` with no args must produce the
+# HTML-escaped usage hint (Telegram's HTML parse mode would otherwise
+# reject ``<8-char-id>`` as an unsupported tag) and must not raise.
+@pytest.mark.asyncio
+async def test_cmd_answer_no_args_renders_html_escaped_usage_hint() -> None:
+    msg = _make_msg("/answer")
+    manager = _make_manager()
+    await cmd_answer(msg, session_manager=manager)
+    sent_text = msg.answer.await_args.args[0]
+    assert "&lt;8-char-id&gt;" in sent_text
+    assert "&lt;text&gt;" in sent_text
+    assert "<8-char-id>" not in sent_text
+    assert "<text>" not in sent_text
+    manager.send_tool_result.assert_not_awaited()
+
+
+# CCR-038: defensive try/except — if Telegram still rejects the static
+# usage-hint payload for any reason, the handler must log and return
+# cleanly rather than bubble TelegramBadRequest into the dispatcher.
+@pytest.mark.asyncio
+async def test_cmd_answer_usage_hint_swallows_telegram_bad_request() -> None:
+    msg = _make_msg("/answer")
+
+    def _raise(*_args: Any, **_kwargs: Any) -> None:
+        raise TelegramBadRequest(method=None, message="boom")  # type: ignore[arg-type]
+
+    msg.answer = AsyncMock(side_effect=_raise)
+    manager = _make_manager()
+    await cmd_answer(msg, session_manager=manager)
+    msg.answer.assert_awaited_once()
     manager.send_tool_result.assert_not_awaited()
 
 

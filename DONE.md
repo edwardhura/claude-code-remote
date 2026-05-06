@@ -1177,3 +1177,36 @@ Notes:
   - 2026-05-06 team-lead: REVIEW FAIL — _RENAME_USAGE_HINT unescaped HTML angle brackets crash /rename hint reply (F1 HIGH); BRIEF wording overstatement (F2 LOW). Re-dispatching python-developer with fix scope.
   - 2026-05-06 team-lead: BRIEF/CONTEXT re-refreshed (fix-loop pass), dispatching reviewer
   - 2026-05-06 team-lead: approved
+
+---
+
+## CCR-038: `/answer` HTML parse-error fix + bot-wide static-string audit [done]
+Phase: n/a (bugfix — chat-bot UX, follow-up to CCR-026)
+Feature: chat-bot
+Files:
+  - `src/ccr/bot/handlers/ask_user_question.py` — at line 64, replace the static `_USAGE_HINT = "Usage: /answer <8-char-id> <text>"` with HTML-escaped placeholders: `Usage: /answer &lt;8-char-id&gt; &lt;text&gt;`. Reuse the `html.escape` pattern already used in `src/ccr/bot/formatting.py:220`.
+  - `src/ccr/bot/handlers/ask_user_question.py` — at the usage-hint reply site (around line 154 in `cmd_answer`), wrap the send with a scoped `try/except TelegramBadRequest` and log via structlog so a single bad string cannot take down the dispatcher. Keep the exception scope narrow — do NOT broaden to `Exception` or `TelegramAPIError`.
+  - `src/ccr/bot/` — audit pass: grep for `msg.answer(...)` / `cb.answer(...)` / `bot.send_message(...)` strings in `src/ccr/bot/` containing raw `<...>` placeholders that aren't escaped. Fix any others found.
+  - `tests/test_bot_ask_user_question.py` — regression test: `/answer` with no args returns the (now HTML-safe) usage hint and does NOT raise. Bonus: a unit test driving the `try/except` path with a simulated `TelegramBadRequest` proves the handler logs and returns cleanly instead of bubbling.
+  - `tests/test_bot_*` — if the audit pass fixes additional sites, add focused regression tests for each.
+Out of scope:
+  - Switching the bot's default `parse_mode` away from HTML.
+  - Moving every static string through a sanitiser helper — only the specific `<...>` placeholder cases.
+  - Refactoring how `_USAGE_HINT`-style constants are defined module-wide.
+Acceptance:
+  - [x] `/answer` with no args replies with the HTML-escaped usage hint (`Usage: /answer &lt;8-char-id&gt; &lt;text&gt;` rendered as `Usage: /answer <8-char-id> <text>` in Telegram) and does NOT raise `TelegramBadRequest`.
+  - [x] Reproducer no longer triggers: typing `/answer` with no args produces a clean reply, not a stack trace into `cmd_answer`.
+  - [x] The static-string audit found no further raw-`<...>` cases (or fixed all that it found — list them in the developer's work summary).
+  - [x] The defensive `try/except TelegramBadRequest` is scoped to the static-string send only; no broader exception catch.
+  - [x] `pytest tests/test_bot_ask_user_question.py` passes.
+  - [x] `pytest --cov=ccr --cov-fail-under=80` passes.
+Depends on: CCR-026
+Notes:
+  Phase n/a — pure bugfix follow-up to CCR-026. Reproducer captured by user: `/answer` with no args triggers `TelegramBadRequest: Bad Request: can't parse entities: Unsupported start tag "8-char-id" at byte offset 15` because the bot's default `parse_mode` is HTML and `<8-char-id>` is parsed as a tag. Stack trace lands at `src/ccr/bot/handlers/ask_user_question.py:154`.
+  Mode 1A note for team-lead: skip the architect — single-line fix + a small audit pass + a defensive try/except. The audit pass is what justifies a ticket vs. a one-line patch.
+
+### Review log
+  - 2026-05-06 main: branch ccr-038-answer-html-escape created, dispatching team-lead
+  - 2026-05-06 team-lead: scope brief issued (no architect), dispatching python-developer
+  - 2026-05-06 team-lead: BRIEF/CONTEXT refreshed from developer report, dispatching reviewer
+  - 2026-05-06 team-lead: approved
