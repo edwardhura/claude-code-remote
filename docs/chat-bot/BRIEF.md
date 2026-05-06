@@ -106,6 +106,7 @@ The aiogram-based Telegram bot. This is the user's primary control surface: pair
 - **SQLite roundtrip strips `tzinfo` from `DateTime(timezone=True)` columns.** Do not assume `Session.started_at.tzinfo is not None` when reading back from the DB. The `format_user_datetime` helper handles this defensively (treats naive input as UTC), but other code paths must remain aware.
 - **`_format_resets_at` in `passthrough.py` still passes `user=None` to `format_user_datetime`** (UTC fallback). Threading the calling `PairedUser` through that path is owned by CCR-039.
 - **Telegram's HTML parse mode treats `<word>` as a tag start.** Any user-facing string sent with `parse_mode="HTML"` containing literal `<` or `>` will raise `TelegramBadRequest`. Use `&lt;`/`&gt;` for static placeholder text or `html.escape()` for dynamic content.
+- **`cmd_answer`'s usage-hint send is wrapped in a narrow `try/except TelegramBadRequest`** (with structlog warning) so a future regression in any static `_USAGE_HINT`-shaped string cannot crash the dispatcher silently. The catch is intentionally narrow — broader exceptions still propagate.
 - **The auto-fill cap (40 chars) is duplicated** as `_SESSION_NAME_MAX_LEN` in both `src/ccr/claude/manager.py` and `src/ccr/bot/handlers/session.py`; the bot module does not import manager-internal constants. If the cap changes, both sites must update.
 - **Auto-fill only fires when `new_session(prompt=...)` is called with a non-empty prompt.** Plain-text input via `manager.send` after a no-arg `/new` does NOT seed the name; that session shows `(unnamed)` until `/rename`.
 - **`_auto_fill_session_name` runs synchronously inside `_db_insert_session`** (extra DB round-trip on session start) — chosen over fire-and-forget so `/sessions` issued immediately after start sees the seeded name. Failures log and degrade to `(unnamed)`.
@@ -117,5 +118,5 @@ The aiogram-based Telegram bot. This is the user's primary control surface: pair
 
 ## Status
 - State: IN PROGRESS
-- Tickets: CCR-006, CCR-008, CCR-009 (gating later removed in CCR-024), CCR-010, CCR-014 (planned), CCR-018, CCR-019, CCR-020, CCR-022, CCR-023, CCR-024, CCR-026, CCR-027 (deferred), CCR-028 (AUQ collision), CCR-030, CCR-031, CCR-032, CCR-033, CCR-034, CCR-035, CCR-036, CCR-037, CCR-038 (planned), CCR-039 (planned), CCR-040 (planned)
-- Last updated: CCR-037 (2026-05-06)
+- Tickets: CCR-006, CCR-008, CCR-009 (gating later removed in CCR-024), CCR-010, CCR-014 (planned), CCR-018, CCR-019, CCR-020, CCR-022, CCR-023, CCR-024, CCR-026, CCR-027 (deferred), CCR-028 (AUQ collision), CCR-030, CCR-031, CCR-032, CCR-033, CCR-034, CCR-035, CCR-036, CCR-037, CCR-038, CCR-039 (planned), CCR-040 (planned)
+- Last updated: CCR-038 (2026-05-06)
