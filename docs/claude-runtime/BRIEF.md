@@ -99,5 +99,5 @@ The subprocess + event infrastructure that every higher-level feature depends on
 
 ## Status
 - State: IN PROGRESS
-- Tickets: CCR-007, CCR-018 (cross-listed UX touch), CCR-024, CCR-025, CCR-028 (relay bridge), CCR-028 (AUQ collision), CCR-029, CCR-030 (SystemInit.skills + accessors), CCR-032 (RateLimitEvent + accessor), CCR-033 (cleanup), CCR-036, CCR-041
+- Tickets: CCR-007, CCR-018 (cross-listed UX touch), CCR-024, CCR-025, CCR-028 (relay bridge), CCR-028 (AUQ collision), CCR-029, CCR-030 (SystemInit.skills + accessors), CCR-032 (RateLimitEvent + accessor), CCR-033 (cleanup), CCR-036, CCR-041, CCR-044
 - Last updated: CCR-041 (2026-05-06)

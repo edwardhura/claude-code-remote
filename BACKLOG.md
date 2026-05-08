@@ -295,34 +295,171 @@ Notes:
   - 2026-05-01 main: marked [blocked] — schema reconciliation work in this ticket is moot (no schema to reconcile to); supersedes filed as CCR-024 (remove dead permission code from CCR-009) and CCR-025 (MCP permission-prompt-tool integration). This ticket stays open as a tracking pin until CCR-025 lands; revisit if upstream Claude `-p` ever exposes a stdout permission channel.
 ---
 
-## CCR-043: `/rename` becomes active-session-only; add `/setname <prefix> <name>` for arbitrary rename [todo]
-Phase: n/a (post-CCR-041 chat-bot UX follow-up)
+## CCR-043: `/rename` rekeyed to `claude_session_id[:8]`; add `/rename current <name>` for active session [todo]
+Phase: n/a (post-CCR-042 chat-bot UX follow-up; part of the claude_session_id-alignment slice)
 Feature: chat-bot
 Files:
-  - `src/ccr/bot/handlers/session.py` — rework `/rename` (around lines 357- and the `_parse_rename_args` helper): drop the `<8-hex-prefix>` argument. New shape is `/rename <new-name>` and it renames whatever session is currently running (the `SessionManager`'s active session). If no session is running, reply with a stable error like `"No active session to rename."` and do not mutate. `/rename` with no args (or only whitespace) replies with the usage hint and does not mutate.
-  - `src/ccr/bot/handlers/session.py` — add new handler `cmd_setname` for `/setname <prefix> <name>` in the same file: takes an 8-hex prefix matched against `claude_session_id` (mirroring the new `/continue` addressing from CCR-042). Renames `Session.name` on every row sharing that `claude_session_id` so the chain stays visually consistent (developer's call: alternative is "most recent row only" — flag the choice in the BRIEF). Works whether or not a session is active. NULL `claude_session_id` rows are not addressable via `/setname` (consistent with `/continue` behaviour from CCR-042).
-  - `src/ccr/bot/handlers/session.py` — update `cmd_sessions` docstring and any user-facing help text that documents `/rename`'s old prefix form.
-  - `tests/test_bot_session_handlers.py` (or wherever `/rename` is exercised — locate by grepping for `cmd_rename` / `_parse_rename_args`) — update existing `/rename` tests to the new no-prefix form (active vs no-active branches). Add tests for `/setname`: (a) renames a single non-chain row; (b) renames all rows in a resume chain sharing one `claude_session_id`; (c) unknown prefix → stable error reply; (d) ambiguous prefix is now expected to match a chain (not an error) — clarify the assertion accordingly; (e) prefix that only matches NULL-`claude_session_id` rows → unknown-prefix error.
+  - `src/ccr/bot/handlers/session.py` — rework `cmd_rename` (around lines 385- and the `_parse_rename_args` helper around line 392-413): the existing two-argument form `/rename <8-hex-prefix> <new-name>` is preserved BUT the prefix is now matched against `claude_session_id[:8]` (mirroring the `/continue` addressing from CCR-042) instead of `str(row.id)[:8]` (the local UUID prefix). Resume-chain rows sharing one `claude_session_id` are all renamed in lockstep so the chain stays visually consistent in `/sessions`. Rows with `claude_session_id IS NULL` are not addressable via `/rename <prefix>` (consistent with `/continue` and `/sessions` from CCR-042 and CCR-044 below).
+  - `src/ccr/bot/handlers/session.py` — add a new branch in `cmd_rename` for the literal token `current` in the prefix slot: `/rename current <new-name>` renames the `SessionManager`'s active session (the one started by the most recent `/new` or `/continue`). Three error states, each with a stable reply string and no mutation:
+    1. **No active session at all** (manager has no current session) → reply `"No active session to rename."`.
+    2. **Active session exists but `claude_session_id IS NULL`** (e.g. status `[idle]` after CCR-044 — session is started but Claude has not yet returned its session id) → reply with a distinct stable error like `"Active session has no claude_session_id yet — try again after it starts."`.
+    3. **Active session is fully running with a non-NULL `claude_session_id`** → look up every row sharing that `claude_session_id` (the chain) and overwrite `Session.name` on all of them (same convention as the prefix branch). Reply with the standard rename-success line.
+  - `src/ccr/bot/handlers/session.py` — update `cmd_sessions` docstring (around lines 268-283) and `cmd_rename` docstring / `_RENAME_USAGE_HINT` text to reflect the new prefix semantics (`claude_session_id[:8]`) and the `current` keyword. The usage hint must HTML-entity-escape any literal `<` / `>` (precedent from CCR-037).
+  - `tests/test_bot_session_handlers.py` (or wherever `/rename` is exercised — locate by grepping for `cmd_rename` / `_parse_rename_args`):
+    - Update existing `/rename <prefix> <name>` tests so the prefix matches `claude_session_id[:8]` rather than `str(row.id)[:8]`.
+    - Test resume-chain rename: multiple rows sharing one `claude_session_id` all get the new name in one `/rename <prefix> <name>` call.
+    - Test prefix that only matches NULL-`claude_session_id` rows → stable unknown-prefix error reply (NULL rows are skipped from prefix matching, as in `/continue`).
+    - Add tests for `/rename current <name>`:
+      - (a) no active session → exact reply `"No active session to rename."`, no DB mutation.
+      - (b) active session with `claude_session_id IS NULL` (i.e. `[idle]` status from CCR-044) → distinct stable reply (developer chooses the exact wording but it MUST differ from the no-active-session reply), no DB mutation.
+      - (c) active session with a non-NULL `claude_session_id` → renames every row sharing that `claude_session_id`; standard success reply.
+    - Test `/rename` with no args / whitespace only → existing usage hint behaviour preserved.
 Out of scope:
   - Auto-naming logic from the first user prompt — unchanged.
-  - The session-listing format — handled by CCR-042.
+  - The session-listing format — handled by CCR-042 / CCR-044.
+  - Status lifecycle changes — handled by CCR-044.
+  - Removing local-UUID references from other bot replies — handled by CCR-045.
 Acceptance:
-  - [ ] `/rename <name>` renames the running session; with no running session, replies with the documented error and does not mutate.
-  - [ ] `/rename` with no args (or only whitespace) replies with the usage hint and does not mutate.
-  - [ ] `/setname <claude-id-prefix> <name>` renames every row sharing that `claude_session_id`.
-  - [ ] `/setname` with unknown prefix replies with the documented error and does not mutate.
-  - [ ] `/setname` works without an active session.
+  - [ ] `/rename <claude-id-prefix> <new-name>` renames every row whose `claude_session_id[:8]` equals the prefix; the local-UUID prefix lookup is removed.
+  - [ ] `/rename <prefix> <new-name>` where the prefix only matches NULL-`claude_session_id` rows replies with the documented unknown-prefix error and does not mutate.
+  - [ ] `/rename current <new-name>` renames the active session's chain when it has a non-NULL `claude_session_id`; standard success reply.
+  - [ ] `/rename current <new-name>` with no active session replies `"No active session to rename."` (verbatim) and does not mutate.
+  - [ ] `/rename current <new-name>` with an active session whose `claude_session_id IS NULL` (status `[idle]` from CCR-044) replies with a distinct stable error (different wording from the no-active-session reply) and does not mutate.
+  - [ ] `/rename` with no args (or only whitespace) replies with the usage hint and does not mutate; the usage hint documents both `<prefix>` and `current` forms with HTML-safe `&lt;`/`&gt;`.
   - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
   - [ ] `ruff check src tests` passes.
   - [ ] `ruff format --check` passes.
   - [ ] `mypy src` passes.
-Depends on: CCR-042
+Depends on: CCR-042, CCR-044
 Notes:
-  User-stated rationale: `/rename` should target the active session only — if there is no active session, the command does nothing. The off-active case is what `/setname <prefix> <name>` is for; addressable from any state.
-  Hard dep on CCR-042 because both commands must use the same prefix convention (`claude_session_id[:8]`). Landing CCR-043 first would mean `/setname` and `/continue` use different prefix conventions, which is exactly what we are trying to avoid.
-  The "rename all rows in chain" choice keeps `/sessions` visually consistent now that resume chains share one prefix; flag in the BRIEF so a future maintainer who wants per-row naming knows the shape.
-  Mode 1A note for team-lead: skip the architect — one-file scope, additive new handler, semantic change to existing handler; no new abstraction.
+  **Reworked in place 2026-05-07** (was originally "drop `/rename`'s prefix arg, add `/setname <prefix> <name>`"). User decision: keep the existing two-argument `/rename <prefix> <name>` shape but rekey the prefix to `claude_session_id[:8]`, AND introduce a `current` keyword in the prefix slot to address the active session. This keeps the surface to a single command while adding the active-session shortcut. The dropped `/setname` design from the original CCR-043 body is preserved nowhere — `/rename current` replaces it.
+  Hard dep on CCR-042 (prefix convention rekeyed onto `claude_session_id`) AND CCR-044 (status `[idle]` is what tells `/rename current` to emit the "no `claude_session_id` yet" error rather than the "no active session" error — the two error states are semantically distinct only once `[idle]` exists as a persisted status).
+  The "rename all rows in chain" choice mirrors what CCR-042 settled for `/continue`: resume chains share one `claude_session_id` prefix, so renaming should follow that same grouping. The current cmd_rename helper `_parse_rename_args` already loads ALL session rows for prefix matching (per the chat-bot BRIEF gotcha); the change is the field it compares against, not the loop shape.
+  Mode 1A note for team-lead: skip the architect — one-file scope, semantic change to existing handler plus a new keyword branch; no new abstraction.
 
 ### Review log
   - 2026-05-06 project-manager: filed as CCR-041 follow-up — split rename into active-only `/rename` plus addressable `/setname`
+  - 2026-05-07 project-manager: reworked in place — dropped `/setname`, kept `/rename <prefix> <name>` rekeyed to `claude_session_id[:8]`, added `/rename current <name>` for active session; depends on CCR-044 for the `[idle]`-status error path
+---
+
+## CCR-044: Persist `[idle]` status; transition to `[running]` on first `claude_session_id`; filter idle rows from `/sessions` and prefix lookups [todo]
+Phase: n/a (post-CCR-042 lifecycle alignment; head of the claude_session_id-alignment slice)
+Feature: claude-runtime
+Files:
+  - `src/ccr/claude/state.py` — keep the in-memory `SessionStatus.IDLE = "idle"` member but update the module docstring: `idle` is now ALSO a valid value for the SQL `Session.status` column (today the docstring says SQL accepts only `running | completed | stopped | crashed` — that is what changes). Document the transition rule: a row is INSERTed as `idle` and flips to `running` when the manager observes the first `claude_session_id` from a `SystemInit` event (or a manual `ccr session save` import — see Notes).
+  - `src/ccr/claude/manager.py` — `SessionManager._db_insert_session` (and any other INSERT path for `Session` rows): write `status = SessionStatus.IDLE` instead of `SessionStatus.RUNNING` on initial insert. The existing `_update_claude_session_id` task (the fire-and-forget one that writes the column from the first `SystemInit` event, per claude-runtime BRIEF) is the right hook for the `idle → running` transition: the same UPDATE that sets `claude_session_id` also flips `status` to `RUNNING`. Keep the existing `_claude_session_id_persisted` single-shot guard semantics; on subsequent `SystemInit` events the UPDATE is a no-op.
+  - `src/ccr/claude/manager.py` — `_db_lookup_resumable_claude_session_id` (around the lines documented in CCR-042): `idle` rows are skipped from prefix matching just like NULL-`claude_session_id` rows are today. This is naturally true if the query already filters on `claude_session_id IS NOT NULL` (idle rows have NULL `claude_session_id` by construction), but encode it explicitly so a future code change that decouples the two conditions does not regress.
+  - `src/ccr/claude/import_session.py` — `import_claude_session` inserts rows with `status="stopped"` today (per the claude-runtime BRIEF invariant); preserve that. The manual `ccr session save <claude-id>` path provides a non-NULL `claude_session_id` at insert time so the row never passes through `idle`. Add a comment at the insert site documenting that `idle` is reserved for sessions whose `claude_session_id` has not yet been assigned (i.e. a fresh `/new` before Claude returns its session id).
+  - `alembic/versions/<NNNN>_add_idle_to_session_status.py` (new migration) — additive migration. SQLite stores `Session.status` as TEXT (no enum constraint at the DB layer per the SessionStatus comment), so the migration body is mostly a doc/no-op for SQLite, but the migration MUST exist as the schema-level record that `idle` is now a valid persisted value (so anyone reading `alembic/versions/` learns the lifecycle change). Backfill plan for pre-existing rows where `claude_session_id IS NULL`: PM decision below — **do NOT backfill to `idle`**. Pre-existing NULL-`claude_session_id` rows are legacy artefacts from before the lifecycle change; they keep their existing terminal status (typically `stopped` / `completed` / `crashed`) and remain non-addressable via `/continue` / `/rename` exactly as today (CCR-042 already settled this). The migration is forward-only for the lifecycle: only NEW sessions go through `idle`. Document this decision in the migration's docstring.
+  - `src/ccr/bot/handlers/session.py` — `cmd_sessions` / `_format_session_row` (around lines 268-360): filter rows with `status == SessionStatus.IDLE` from the listing query. Since the `_NULL_CLAUDE_SESSION_ID_MARKER = "--------"` rendering exists today only because NULL-`claude_session_id` rows could appear in `/sessions`, and after this ticket no NEW NULL rows surface (idle is filtered out, running rows have non-NULL claude_session_id), the marker rendering becomes obsolete for new sessions. **Decision: keep the marker rendering for now** so legacy NULL rows from before this ticket still render coherently — but remove the in-line CCR-042 fix-loop comment that frames the marker as the going-forward shape, and update the `cmd_sessions` docstring to clarify the marker is a legacy-only artefact. (Removing the marker entirely is a follow-up ticket once we are confident no NULL rows remain in production DBs.)
+  - `src/ccr/bot/handlers/session.py` — `cmd_pid` (around line 213-228): the existing branch `if inf.get("status") == SessionStatus.IDLE or inf.get("session_id") is None:` is now reachable as a real persisted state (today `IDLE` is in-memory only). Audit the reply text — it says "no active session" today; the new semantics are "session exists but is idle waiting for Claude". Decision: keep the user-facing reply identical for now (idle is invisible to the user), but verify the test that exercises this branch still asserts the right thing.
+  - `src/ccr/bot/handlers/session.py` — any other reads of `SessionStatus` that today implicitly assume "session row implies running" (`/clear` divider gate, etc.) — audit and update if the new `idle` state would break the assumption. The `/clear` gate is `prior_status != IDLE` today, which is correct for the new semantics (idle clears stay quiet) — no change needed there, but verify under test.
+  - `tests/test_session_manager.py` (or wherever the manager lifecycle is exercised): add cases for (a) a fresh `new_session(...)` insert lands the row with `status == "idle"` and `claude_session_id IS NULL`; (b) on the first `SystemInit` event, the row's `status` flips to `"running"` and `claude_session_id` is populated atomically (single UPDATE); (c) a second `SystemInit` event does NOT re-flip status (idempotent); (d) `_db_lookup_resumable_claude_session_id` skips idle rows from prefix matching (positive: matches a `running` / `completed` / `stopped` row sharing the prefix; negative: a prefix that only matches an idle row → `SessionNotFoundError`).
+  - `tests/test_bot_session_handlers.py` — assert `/sessions` does not list rows where `status == "idle"`. Existing `/sessions` rendering tests for legacy NULL-`claude_session_id` rows (the marker `--------`) stay green because those legacy rows have terminal statuses (`stopped` / `completed` / `crashed`), not `idle`.
+Out of scope:
+  - Removing the `_NULL_CLAUDE_SESSION_ID_MARKER` constant and its `<code>--------</code>` rendering — deferred to a follow-up once NULL rows are confirmed extinct in the field.
+  - Backfilling pre-existing NULL-`claude_session_id` rows.
+  - Chat-output cleanup of local UUIDs (handled by CCR-045).
+  - Rekeying `/stop` / other commands (handled by CCR-046).
+  - `/rename current` semantics (handled by CCR-043 rework).
+Acceptance:
+  - [ ] A fresh `new_session(...)` call inserts a `Session` row with `status = "idle"` and `claude_session_id IS NULL`.
+  - [ ] On the first `SystemInit` event arriving for that session, the row's `status` transitions to `"running"` and `claude_session_id` is populated in the same UPDATE (single round-trip).
+  - [ ] A second / later `SystemInit` event for the same session does NOT re-flip `status` (idempotent, single-shot semantics preserved per CCR-036's `_claude_session_id_persisted` guard).
+  - [ ] `/sessions` does not list rows where `status == "idle"`.
+  - [ ] `_db_lookup_resumable_claude_session_id` skips idle rows from prefix matching: a prefix that matches only an idle row raises `SessionNotFoundError` (consistent with the NULL-`claude_session_id` skip behaviour from CCR-042).
+  - [ ] An additive Alembic migration documenting `idle` as a valid `Session.status` value is added (forward-only; pre-existing NULL-`claude_session_id` rows are NOT backfilled to `idle` and keep their existing terminal status).
+  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [ ] `ruff check src tests` passes.
+  - [ ] `ruff format --check` passes.
+  - [ ] `mypy src` passes.
+Depends on: CCR-036, CCR-041, CCR-042
+Notes:
+  **Head of the claude_session_id-alignment slice.** This ticket changes status semantics that CCR-043 (rework), CCR-045 (chat output cleanup), and CCR-046 (commands rekey + `/stop`) all reference — it must land first. The `/rename current` command (CCR-043 rework) needs `[idle]` to exist as a persisted state to surface its distinct "active session has no claude_session_id yet" error.
+  **Supersedes the marker rendering trajectory from CCR-042.** CCR-042's fix-loop introduced the `--------` marker for NULL-`claude_session_id` rows in `/sessions` because such rows existed (legacy + the brief window between `new_session` insert and the first `SystemInit`). After CCR-044, the brief-window case disappears (idle rows are filtered out of `/sessions` entirely) and only legacy NULL rows surface. The marker rendering is kept for legacy backward-compat but is no longer the going-forward shape — flag this clearly in the BRIEF refresh so the reviewer does not flag the surviving `_NULL_CLAUDE_SESSION_ID_MARKER` constant as a regression. The constant's eventual removal is a separate follow-up once we are confident no NULL rows remain in production DBs (and a manual SQL backfill / row-prune step is documented).
+  **Architect path likely.** This crosses the bot/manager/db boundary, modifies the SessionStatus state machine, requires an Alembic migration, and reshapes a load-bearing invariant from the claude-runtime BRIEF ("`SessionStatus.IDLE` is intentionally absent from `Session.status` SQL writes — the SQL column accepts `running | completed | stopped | crashed` only"). Team-lead Mode 1A should call the architect — small ticket count but high coordination. The architect plan should explicitly call out the BRIEF invariant flip and prescribe how `_update_claude_session_id` is augmented to also flip `status` (single UPDATE statement vs two), and confirm whether the existing `_claude_session_id_persisted` guard suffices or needs a sibling `_status_flipped` guard.
+  Cross-listed BRIEF impact: claude-runtime BRIEF must be updated to remove the "`IDLE` is intentionally absent from SQL writes" invariant and replace it with the new lifecycle. chat-bot BRIEF must be updated to reflect `/sessions` filtering idle rows and the marker rendering being legacy-only.
+
+### Review log
+  - 2026-05-07 project-manager: filed — head of claude_session_id-alignment slice; persist `[idle]` and transition to `[running]` on first claude_session_id; filter idle rows from `/sessions` and prefix lookups
+---
+
+## CCR-045: Remove local-UUID `Session.id` references from bot user-facing replies; replace with pid where useful [todo]
+Phase: n/a (post-CCR-044 chat-bot UX cleanup; part of the claude_session_id-alignment slice)
+Feature: chat-bot
+Files:
+  - `src/ccr/bot/handlers/session.py` — drop the local-UUID id from user-facing reply strings:
+    - `cmd_new` (around line 108): `"Session {_short_id(session_id)} started (pid {pid})."` → `"New session started (pid {pid})."`.
+    - `cmd_continue` (around line 172): `"Session {_short_id(session_id)} resumed (pid {pid})."` → `"Session resumed (pid {pid})."`. (If a chat-only handle is meaningful here, the developer MAY substitute the `claude_session_id[:8]` prefix once it is known — but `cmd_continue` returns before the manager has captured `claude_session_id` for fresh-resume cases, so the simpler "Session resumed (pid {pid})" phrasing is preferred.)
+    - The unnamed handler around line 209 (mirroring `cmd_new` for plain-text first prompts): same treatment as `cmd_new`.
+    - `cmd_pid` (around line 222): the reply renders `inf["session_id"][:8]` today (the local UUID prefix). Replace with the pid only — `f"Session running (pid {pid})."` or equivalent. After CCR-044, an idle session has no claude_session_id to render and the local UUID is internal; pid is the user-visible handle.
+  - `src/ccr/bot/handlers/session.py` — audit `_short_id` (lines 76-77): once the call sites above are rewritten, `_short_id` becomes dead code. Remove it (and any test that exercises it directly) UNLESS another live caller surfaces during the audit; in that case document the surviving caller in the BRIEF refresh.
+  - `src/ccr/bot/handlers/passthrough.py` — `/cost` rendering (`_render_cost_reply` around line 249-273, called from line 302 with `session_id.hex`): the rendered `id8 = html.escape(session_id_hex[:_SESSION_ID_HEX_PREFIX_LEN])` is the local UUID's first 8 hex characters. Replace with `claude_session_id[:8]` if the session has one (look it up via the manager / db), or drop the id slot from the `/cost` reply when no `claude_session_id` is available. Developer's call which fits the `/cost` template best — the user is OK with dropping the id entirely when it cannot be replaced by a meaningful handle. Keep `_SESSION_ID_HEX_PREFIX_LEN` if reused; remove it if not.
+  - `src/ccr/bot/handlers/session.py` — audit `cmd_sessions`'s `_format_started_by` and surrounding rendering for any other local-UUID surfaces; the `<id8>` slot in `_format_session_row` is already `claude_session_id[:8]` (CCR-042) and stays that way — this audit is for any OTHER incidental UUID rendering missed by the grep below.
+  - **Grep canary**: a developer-side grep over `src/ccr/bot/` for `session.id`, `Session.id`, `session_id`, `_short_id`, `.hex[:8]` MUST return only callback-payload encoding sites (`perm:{session_id}:...`, `auq:{session_id}:...` in `keyboards.py` and the parsing logic in `permission.py` / `ask_user_question.py`) and internal log/structlog statements — never user-facing reply strings. The PR description should include the grep output as evidence.
+  - `tests/test_bot_session_handlers.py` (and `tests/test_bot_session.py`) — update reply-string assertions for `cmd_new`, `cmd_continue`, the plain-text first-prompt handler, and `cmd_pid` to match the new pid-based phrasing. Remove tests that asserted on the `_short_id(session_id)` content if any.
+  - `tests/test_bot_passthrough.py` — update `/cost` reply assertions for the new id-slot rendering (or its removal).
+Out of scope:
+  - Status-lifecycle changes (handled by CCR-044).
+  - Command argument rekeying (handled by CCR-046; `/rename` by CCR-043 rework).
+  - Callback data payloads (`perm:`, `auq:`, `cfg:`) — those keep the local-UUID encoding because `session_id` is unambiguous server-side and the callback data is server-controlled, not user-typed.
+  - Internal log lines / structlog statements — those keep the local UUID for debugging.
+  - Web viewer / SSE routes (use `Session.id` UUID via path params; those are not chat-output).
+Acceptance:
+  - [ ] `cmd_new`, `cmd_continue`, the plain-text first-prompt handler, and `cmd_pid` no longer render a local-UUID prefix in their replies; pid is exposed where helpful, otherwise the id reference is dropped entirely.
+  - [ ] `/cost` reply no longer renders a local-UUID prefix; either substitutes `claude_session_id[:8]` (when available) or drops the id slot.
+  - [ ] `_short_id` is removed (or its remaining caller is documented) and the chat-bot BRIEF reflects the change.
+  - [ ] A grep over `src/ccr/bot/` for local-UUID surfacing (`session.id`, `Session.id`, `_short_id`, `.hex[:8]`) returns only callback-payload encoding sites and internal logs — no user-facing reply strings. The PR includes the grep output as evidence.
+  - [ ] All existing reply-string tests are updated to the new phrasing; no test still asserts on `Session {<8-hex>} started/resumed`.
+  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [ ] `ruff check src tests` passes.
+  - [ ] `ruff format --check` passes.
+  - [ ] `mypy src` passes.
+Depends on: CCR-044
+Notes:
+  **Why depends on CCR-044:** CCR-044 changes when `claude_session_id` becomes available (it is NULL during `[idle]`, populated on transition to `[running]`). `cmd_new` and the plain-text first-prompt handler return BEFORE the first `SystemInit` event arrives, so even after CCR-044 they cannot substitute `claude_session_id[:8]` for the local UUID — the right answer there is the pid-based phrasing. Landing this ticket before CCR-044 would not be wrong but would risk reviewers asking "why not use claude_session_id?" without the lifecycle context.
+  Pid is the Claude subprocess pid, already exposed via `manager.pid` / `inf["pid"]` (used in `cmd_new` today). It is a stable user-visible handle for the active subprocess.
+  Mode 1A note for team-lead: skip the architect — stylistic + grep-and-replace across handlers + snapshot test updates; no new abstraction. Reviewer focus: the grep canary, plus confirming the callback-payload sites are NOT touched.
+
+### Review log
+  - 2026-05-07 project-manager: filed — chat-output cleanup, drop local-UUID from user-facing replies, replace with pid where useful
+---
+
+## CCR-046: Rekey `/stop` and remaining session-reference commands to `claude_session_id[:8]`; audit residual surfaces [todo]
+Phase: n/a (post-CCR-044 chat-bot command alignment; part of the claude_session_id-alignment slice)
+Feature: chat-bot
+Files:
+  - `src/ccr/bot/handlers/session.py` — `cmd_stop` (around line 112-130): today `/stop` takes no argument and stops whatever the manager's active session is (single-session invariant). The user wants it to "work the same with claude session id" — interpreted as: `/stop` continues to work with no argument (stops the active session), AND optionally accepts a `<claude-id-prefix>` argument that targets a row by its `claude_session_id[:8]`. If the prefix matches the currently-running session, stop it; if the prefix matches a NON-active session, the reply is a stable "session is not the active session" error (we do not stop arbitrary historical rows — they are already stopped). If the prefix matches no row, stable unknown-prefix error. With CCR-044's `[idle]` lifecycle, `/stop` on the active session works whether the session is idle or running.
+    - Alternative interpretation if developer/team-lead disagrees: the no-arg `/stop` is unchanged and "rekey to claude_session_id" is a no-op for `/stop` because it never accepted an argument. In that case, the ticket's `/stop` work reduces to confirming no local-UUID surfaces leak in the reply strings (cross-checked with CCR-045) and documenting in the BRIEF that `/stop` is single-session-invariant-only. **Flag the choice in the developer's BRIEF update note so team-lead can record it.**
+  - `src/ccr/bot/handlers/session.py` — audit ALL remaining bot commands for session-reference arguments and confirm each is rekeyed onto `claude_session_id[:8]` or explicitly does not take a session reference. Today's command list per chat-bot BRIEF: `/start`, `/new`, `/stop`, `/clear`, `/who`, `/pid`, `/sessions`, `/continue`, `/rename`, `/answer`, `/agents`, `/skills`, `/cost`, `/usage`, `/config`, `/model`, `/compact`, plus the `/mcp` / `/init` redirects. Per-command audit checklist:
+    - `/continue <prefix>` — rekeyed in CCR-042 (done, no work).
+    - `/sessions` — listing rekeyed in CCR-042 (done, no work).
+    - `/rename <prefix> <new-name>` and `/rename current <new-name>` — handled by CCR-043 rework.
+    - `/answer <id8> <text>` — `<id8>` is the AskUserQuestion `tool_use_id` prefix, NOT a session reference. No change. Document in the BRIEF that this id8 is intentionally a different namespace.
+    - `/start`, `/new`, `/clear`, `/who`, `/pid`, `/agents`, `/skills`, `/cost`, `/usage`, `/config`, `/model`, `/compact` — none currently take a session-reference argument. Confirm and document.
+    - `/stop` — see above.
+    - The list of any other command that takes a session reference must be enumerated and either rekeyed in this ticket or split into a follow-up ticket with a clear rationale.
+  - `tests/test_bot_session_handlers.py` (and `tests/test_bot_session.py`) — add `/stop` tests for the chosen semantics: (a) no-arg `/stop` continues to work (active session, both `[idle]` and `[running]` states from CCR-044); (b) IF the developer/team-lead chooses the prefix-arg variant: `/stop <claude-id-prefix>` matching the active session stops it, matching a non-active row replies with a stable error, matching no row replies with a stable unknown-prefix error.
+Out of scope:
+  - Status-lifecycle changes (handled by CCR-044).
+  - Chat-output cleanup (handled by CCR-045).
+  - `/rename` rework (handled by CCR-043 rework).
+  - Web viewer / SSE routes (use `Session.id` UUID via path params; those are not chat command surfaces).
+Acceptance:
+  - [ ] `/stop` audit completed and documented: either the no-arg form is preserved as-is (with a BRIEF entry noting `/stop` is single-session-invariant-only and takes no session reference), or `/stop <claude-id-prefix>` is added with the prefix matched against `claude_session_id[:8]` and the three reply branches above implemented.
+  - [ ] No-arg `/stop` continues to work and stops the active session in both `[idle]` and `[running]` states (CCR-044 lifecycle).
+  - [ ] An audit of every bot command listed in the chat-bot BRIEF is documented in the developer's BRIEF update note: each command is either rekeyed onto `claude_session_id[:8]` already (or in this ticket), or explicitly noted as taking no session reference, or split into a follow-up ticket.
+  - [ ] No bot command (other than `/answer`, whose id8 is a `tool_use_id` not a session reference) accepts a local-UUID prefix as an argument anywhere.
+  - [ ] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [ ] `ruff check src tests` passes.
+  - [ ] `ruff format --check` passes.
+  - [ ] `mypy src` passes.
+Depends on: CCR-044
+Notes:
+  **Why depends on CCR-044:** the `[idle]` lifecycle state changes what "active session" means for `/stop` (today an idle session is not in the DB; after CCR-044 it is). The audit and tests for `/stop` need that lifecycle settled.
+  **Why no dep on CCR-042:** CCR-042 already rekeyed `/continue` and `/sessions`; this ticket extends the same pattern to anything left over. The audit step is the load-bearing deliverable — the user wants confidence that EVERY command surface is aligned, not just `/stop`.
+  Mode 1A note for team-lead: skip the architect — small scope, primarily an audit + a single-handler change. The audit's output (the documented per-command list in the dev report) is what the BRIEF refresh consumes. Reviewer focus: the audit is complete and any "split into a follow-up ticket" decision is supported by clear reasoning rather than a punt.
+
+### Review log
+  - 2026-05-07 project-manager: filed — `/stop` rekey + audit residual session-reference surfaces; user explicitly called out `/stop` and asked for confidence that all commands are aligned
 ---
