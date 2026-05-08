@@ -165,9 +165,10 @@ class FakeManager:
 # --------------------------------------------------------------------------- #
 
 
-async def test_cmd_new_starts_session_and_replies_with_short_id_and_pid(
+async def test_cmd_new_starts_session_and_replies_with_pid(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    """CCR-045: ``/new`` reply exposes pid only; the local-UUID prefix is dropped."""
     manager = FakeManager(pid=4242)
 
     async def _fake_new_session(*, prompt: str | None, started_by_tg_user_id: int) -> uuid.UUID:
@@ -183,7 +184,9 @@ async def test_cmd_new_starts_session_and_replies_with_short_id_and_pid(
     manager.new_session.assert_awaited_once_with(prompt=None, started_by_tg_user_id=42)
     msg.answer.assert_awaited_once()
     reply = msg.answer.await_args.args[0]
-    assert reply == "Session 11111111 started (pid 4242)."
+    assert reply == "New session started (pid 4242)."
+    # Local-UUID prefix MUST NOT appear in the reply.
+    assert "11111111" not in reply
     assert re.search(r"\(pid \d+\)", reply) is not None
 
 
@@ -251,8 +254,10 @@ async def test_cmd_clear_stops_then_starts_fresh(
     manager.new_session.assert_awaited_once_with(prompt=None, started_by_tg_user_id=7)
     msg.answer.assert_awaited_once()
     reply = msg.answer.await_args.args[0]
-    assert "started" in reply
+    # CCR-045: ``/clear`` mirrors ``/new`` — pid only, no UUID prefix.
+    assert reply == "New session started (pid 9999)."
     assert re.search(r"\(pid \d+\)", reply) is not None
+    assert "11111111" not in reply
 
     assert bot_mock.send_message.await_count == 2
     sent_chat_ids = {call.args[0] for call in bot_mock.send_message.await_args_list}
@@ -362,7 +367,8 @@ async def test_cmd_pid_idle_returns_no_active_session() -> None:
     msg.answer.assert_awaited_once_with("No active session.")
 
 
-async def test_cmd_pid_active_returns_session_pid_and_uptime() -> None:
+async def test_cmd_pid_active_returns_pid_and_uptime() -> None:
+    """CCR-045: ``/pid`` reply exposes pid + uptime; the local-UUID prefix is dropped."""
     started_at = datetime.now(UTC)
     manager = FakeManager(
         status=SessionStatus.RUNNING,
@@ -376,8 +382,9 @@ async def test_cmd_pid_active_returns_session_pid_and_uptime() -> None:
 
     msg.answer.assert_awaited_once()
     reply = msg.answer.await_args.args[0]
-    assert re.match(r"^Session [0-9a-f]{8} · pid \d+ · running \d", reply) is not None
-    assert "abcdef01" in reply
+    assert re.match(r"^Session running · pid \d+ · uptime \d", reply) is not None
+    # Local-UUID 8-hex prefix MUST NOT appear in the reply.
+    assert "abcdef01" not in reply
     assert "12345" in reply
 
 
@@ -389,7 +396,7 @@ async def test_cmd_pid_active_uptime_minutes_format() -> None:
     await cmd_pid(msg, session_manager=manager)
 
     reply = msg.answer.await_args.args[0]
-    assert re.search(r"running \d+m \d+s$", reply) is not None
+    assert re.search(r"uptime \d+m \d+s$", reply) is not None
 
 
 # --------------------------------------------------------------------------- #

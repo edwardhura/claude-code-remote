@@ -87,7 +87,6 @@ _AGENTS_LIBRARY_GLOB_REL = ".claude/agents"
 _EMPTY_PLACEHOLDER = "(none)"
 _DEFAULT_MODEL_VALUE = "inherit"
 
-_SESSION_ID_HEX_PREFIX_LEN = 8
 _ONE_MINUTE_MS = 60_000
 _SECONDS_PER_MINUTE = 60
 _SECONDS_PER_HOUR = 3600
@@ -246,15 +245,14 @@ def _format_elapsed(elapsed_ms: int) -> str:
     return f"{minutes}m {seconds}s"
 
 
-def _render_cost_reply(session_id_hex: str, usage: SessionUsage) -> str:
+def _render_cost_reply(usage: SessionUsage) -> str:
     """Render a rich HTML ``/cost`` reply.
 
-    Layout — seven lines (eight when ``total_cost_usd > 0``), every
+    Layout — six lines (seven when ``total_cost_usd > 0``), every
     interpolated value HTML-escaped:
 
     .. code-block:: text
 
-        <b>Session:</b> {id8}
         <b>Turns:</b> {n}
         <b>Input tokens:</b> {n}
         <b>Output tokens:</b> {n}
@@ -265,13 +263,17 @@ def _render_cost_reply(session_id_hex: str, usage: SessionUsage) -> str:
 
     The cost line is included only when ``total_cost_usd > 0`` so users on
     a subscription plan (where Claude reports ``0.0``) do not see a stray
-    ``$0.0000``. Output is truncated to :data:`SAFE_CHUNK` characters so a
-    pathological ``Session:`` value cannot blow past Telegram's 4096 cap;
-    the layout itself is well under the cap, the truncation is defensive.
+    ``$0.0000``. Output is truncated to :data:`SAFE_CHUNK` characters
+    defensively; the layout itself is well under the cap.
+
+    CCR-045: the ``<b>Session:</b> {id8}`` line was removed. The local-row
+    UUID is internal (see CCR-045 in the chat-bot BRIEF), and the live
+    ``claude_session_id`` is not addressable from this layer without a DB
+    lookup; ``/cost`` is a per-session-snapshot command that fires only
+    when a subprocess is held, so the implicit "this session" is
+    unambiguous from context.
     """
-    id8 = html.escape(session_id_hex[:_SESSION_ID_HEX_PREFIX_LEN])
     lines = [
-        f"<b>Session:</b> {id8}",
         f"<b>Turns:</b> {usage.num_turns}",
         f"<b>Input tokens:</b> {usage.input_tokens}",
         f"<b>Output tokens:</b> {usage.output_tokens}",
@@ -299,7 +301,7 @@ async def _reply_cost(msg: Message, session_manager: SessionManager) -> None:
     if usage is None or session_id is None:
         await msg.answer("No active session.")
         return
-    await msg.answer(_render_cost_reply(session_id.hex, usage))
+    await msg.answer(_render_cost_reply(usage))
 
 
 def _humanise_code(code: str, label_map: dict[str, str]) -> str:

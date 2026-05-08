@@ -83,10 +83,6 @@ _RENAME_IDLE_ACTIVE_SESSION_REPLY = (
 )
 
 
-def _short_id(session_id: object) -> str:
-    return str(session_id)[:8]
-
-
 def _format_uptime(started_at: datetime) -> str:
     """Render uptime as ``"{N}s"`` for <60s and ``"{m}m {s}s"`` otherwise."""
     delta = datetime.now(UTC) - started_at
@@ -106,7 +102,7 @@ async def cmd_new(
     if msg.from_user is None:
         return
     try:
-        session_id = await session_manager.new_session(
+        await session_manager.new_session(
             prompt=None,
             started_by_tg_user_id=msg.from_user.id,
         )
@@ -115,7 +111,7 @@ async def cmd_new(
         return
     inf = await session_manager.info()
     pid = inf.get("pid")
-    await msg.answer(f"Session {_short_id(session_id)} started (pid {pid}).")
+    await msg.answer(f"New session started (pid {pid}).")
 
 
 @router.message(Command("stop"))
@@ -159,7 +155,7 @@ async def cmd_continue(
         return
 
     try:
-        session_id = await session_manager.continue_session(
+        await session_manager.continue_session(
             started_by_tg_user_id=msg.from_user.id,
             session_id_prefix=session_id_prefix,
         )
@@ -179,7 +175,7 @@ async def cmd_continue(
         return
     inf = await session_manager.info()
     pid = inf.get("pid")
-    await msg.answer(f"Session {_short_id(session_id)} resumed (pid {pid}).")
+    await msg.answer(f"Session resumed (pid {pid}).")
 
 
 @router.message(Command("clear"))
@@ -207,7 +203,7 @@ async def cmd_clear(
             await broadcast_paired(msg.bot, db, _DIVIDER_MESSAGE)
 
     try:
-        session_id = await session_manager.new_session(
+        await session_manager.new_session(
             prompt=None,
             started_by_tg_user_id=msg.from_user.id,
         )
@@ -216,7 +212,7 @@ async def cmd_clear(
         return
     inf = await session_manager.info()
     pid = inf.get("pid")
-    await msg.answer(f"Session {_short_id(session_id)} started (pid {pid}).")
+    await msg.answer(f"New session started (pid {pid}).")
 
 
 @router.message(Command("pid"))
@@ -224,7 +220,12 @@ async def cmd_pid(
     msg: Message,
     session_manager: SessionManager,
 ) -> None:
-    """Reply with the current session id, subprocess pid, and uptime.
+    """Reply with the subprocess pid and uptime for the active session.
+
+    CCR-045: the local-UUID 8-hex prefix was dropped from the reply —
+    the local ``Session.id`` is internal, and `/pid` is by definition
+    a single-active-session command, so the implicit "this session"
+    is unambiguous.
 
     CCR-044: the "No active session." branch covers two cases that look
     identical from the user's perspective:
@@ -244,11 +245,13 @@ async def cmd_pid(
     if inf.get("status") == SessionStatus.IDLE or inf.get("session_id") is None:
         await msg.answer("No active session.")
         return
-    id8 = str(inf.get("session_id"))[:8]
     pid = inf.get("pid")
     started_at = inf.get("started_at")
     uptime = _format_uptime(started_at) if isinstance(started_at, datetime) else "?"
-    await msg.answer(f"Session {id8} · pid {pid} · running {uptime}")
+    # CCR-045: drop the local-UUID 8-hex prefix; pid is the user-visible
+    # handle for the active subprocess. The local ``Session.id`` is
+    # internal — see CCR-045 in the chat-bot BRIEF.
+    await msg.answer(f"Session running · pid {pid} · uptime {uptime}")
 
 
 @router.message(Command("who"))
@@ -374,9 +377,9 @@ def _format_session_row(
         # CCR-042: render the 8-hex prefix of ``claude_session_id`` so the
         # listing stays compact and the prefix matches the one ``/continue``
         # accepts. ``claude_session_id`` is stored as a Python ``str``
-        # (UUID-formatted) per CCR-036 — slice with ``[:8]``, NOT
-        # ``.hex[:8]`` (the latter is only valid for the local
-        # ``uuid.UUID`` ``Session.id``).
+        # (UUID-formatted) per CCR-036 — slice the str directly with
+        # ``[:8]``; the ``uuid.UUID`` ``.hex`` accessor only applies to
+        # the internal ``Session.id`` UUID, which is no longer surfaced.
         session_id_label = html.escape(row.claude_session_id[:8])
     else:
         # CCR-042 fix-loop: rows with ``claude_session_id IS NULL`` are not

@@ -205,7 +205,13 @@ async def test_model_with_args_passes_args_through(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_cost_renders_rich_reply_from_session_usage(tmp_path: Path) -> None:
-    """``/cost`` answers locally with HTML labels for every aggregated field."""
+    """``/cost`` answers locally with HTML labels for every aggregated field.
+
+    CCR-045: the ``Session:`` line was dropped — the local-row UUID is
+    internal and the live ``claude_session_id`` is not addressable from
+    this layer; ``/cost`` is a per-session-snapshot command so the
+    implicit "this session" is unambiguous from context.
+    """
     session_id = uuid.UUID("d562aef3-12ea-435b-a588-9aa4d8b39a29")
     usage = SessionUsage(
         input_tokens=12,
@@ -231,8 +237,9 @@ async def test_cost_renders_rich_reply_from_session_usage(tmp_path: Path) -> Non
     # /cost is no longer in WHITELIST — must NOT call send_slash.
     manager.send_slash.assert_not_awaited()
     text = _captured_text(msg)
-    # First eight hex chars of the UUID are surfaced as the session id.
-    assert "<b>Session:</b> d562aef3" in text
+    # CCR-045: the ``Session:`` line is gone. Local-UUID 8-hex prefix MUST NOT appear.
+    assert "Session:" not in text
+    assert "d562aef3" not in text
     assert "<b>Turns:</b> 2" in text
     assert "<b>Input tokens:</b> 12" in text
     assert "<b>Output tokens:</b> 158" in text
@@ -289,23 +296,20 @@ async def test_cost_omits_cost_line_when_total_cost_is_zero(tmp_path: Path) -> N
     assert "<b>Output tokens:</b> 15" in text
 
 
-def test_render_cost_reply_html_escapes_session_id() -> None:
-    """Defensive: ``_render_cost_reply`` escapes its session-id input.
+def test_render_cost_reply_no_longer_renders_session_id_slot() -> None:
+    """CCR-045: ``_render_cost_reply`` dropped the ``Session:`` line entirely.
 
-    UUIDs in production are always 32 hex chars, so this codepath is
-    unreachable in real life. The test exists so a future refactor that
-    swaps :class:`uuid.UUID` for a stringly-typed id still emits safe
-    HTML — every interpolated value passes through ``html.escape``.
+    The function no longer accepts a session-id argument, so a regression
+    that re-introduces a UUID prefix into the rich reply (the surface
+    CCR-045 just removed) would break this signature-shape assertion.
     """
     from ccr.bot.handlers.passthrough import _render_cost_reply
 
-    text = _render_cost_reply(
-        "<bad&id>extra-padding-here",
-        SessionUsage(num_turns=0, elapsed_ms=0),
-    )
-    assert "&lt;bad&amp;id" in text
-    # Raw metacharacters must not leak.
-    assert "<bad&id>" not in text
+    text = _render_cost_reply(SessionUsage(num_turns=0, elapsed_ms=0))
+    assert "Session:" not in text
+    # The other slots still render — sanity-check the function still works.
+    assert "Turns" in text
+    assert "Elapsed" in text
 
 
 @pytest.mark.asyncio

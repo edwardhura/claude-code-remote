@@ -8,7 +8,6 @@ a real Telegram bot.
 
 from __future__ import annotations
 
-import re
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -116,7 +115,7 @@ class FakeManager:
 async def test_cmd_continue_happy_path_replies_resumed(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The happy path replies ``"Session <id8> resumed (pid <N>)."``."""
+    """CCR-045: the happy path replies ``"Session resumed (pid <N>)."`` — pid only, no UUID."""
     manager = FakeManager(pid=4242)
     msg = _make_message(user_id=42)
 
@@ -128,8 +127,9 @@ async def test_cmd_continue_happy_path_replies_resumed(
     )
     msg.answer.assert_awaited_once()
     reply = msg.answer.await_args.args[0]
-    assert re.match(r"^Session [0-9a-f]{8} resumed \(pid \d+\)\.$", reply) is not None
-    assert reply == "Session 11111111 resumed (pid 4242)."
+    assert reply == "Session resumed (pid 4242)."
+    # Local-UUID 8-hex prefix MUST NOT appear in the reply.
+    assert "11111111" not in reply
 
 
 async def test_cmd_continue_already_running_replies_canned_string(
@@ -202,7 +202,10 @@ async def test_cmd_continue_with_valid_prefix_calls_manager_with_prefix(
     )
     msg.answer.assert_awaited_once()
     reply = msg.answer.await_args.args[0]
-    assert reply == "Session 11111111 resumed (pid 4242)."
+    # CCR-045: pid only; the 8-hex prefix passed in does NOT echo back as a label.
+    assert reply == "Session resumed (pid 4242)."
+    assert "11111111" not in reply
+    assert "76581b99" not in reply
 
 
 async def test_cmd_continue_with_invalid_format_replies_canned_string_no_manager_call(
