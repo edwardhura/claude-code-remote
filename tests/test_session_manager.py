@@ -181,6 +181,11 @@ async def test_lifecycle_idle_to_running_to_completed(
     assert (await manager.status()) == SessionStatus.IDLE
 
     session_id = await manager.new_session(prompt=None, started_by_tg_user_id=42)
+    # CCR-044: ``new_session`` returns with ``_status=IDLE``; the in-memory
+    # flip to ``RUNNING`` happens in ``_update_claude_session_id`` after
+    # the first ``SystemInit`` event lands. Wait for the running bus
+    # publish before asserting the status transition.
+    await _drain_status(bus, SessionStatus.RUNNING)
     assert (await manager.status()) == SessionStatus.RUNNING
 
     await asyncio.wait_for(task, timeout=5.0)
@@ -711,7 +716,12 @@ async def test_continue_session_inserts_new_row_with_running_status(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``continue_session`` inserts a NEW row; the prior row is unchanged."""
+    """``continue_session`` inserts a NEW row; the prior row is unchanged.
+
+    CCR-044: the new row is inserted ``status='idle'`` and flips to
+    ``'running'`` only when the first ``SystemInit`` event lands. We wait
+    for the bus running publish before asserting the status transition.
+    """
     import uuid as _uuid_mod
     from datetime import UTC as _UTC
     from datetime import datetime as _dt_mod
@@ -726,9 +736,12 @@ async def test_continue_session_inserts_new_row_with_running_status(
     )
 
     # Slow the producer so we can observe RUNNING before the script
-    # finishes and the row flips to COMPLETED.
+    # finishes and the row flips to COMPLETED. CCR-044: the SystemInit
+    # event MUST carry a non-empty ``session_id`` for
+    # ``_update_claude_session_id`` to fire and flip ``status`` from
+    # ``idle`` to ``running`` — without it the row stays ``idle``.
     events = [
-        {"type": "system", "subtype": "init"},
+        {"type": "system", "subtype": "init", "session_id": "fake-init"},
         {"type": "result", "subtype": "success"},
     ]
     script = _write_script(tmp_path, events)
@@ -740,7 +753,10 @@ async def test_continue_session_inserts_new_row_with_running_status(
     new_id = await manager.continue_session(started_by_tg_user_id=99)
     assert new_id != prior_id
 
-    # Inspect the row immediately after creation: it should be RUNNING.
+    # CCR-044: wait for SystemInit to land before reading status — until
+    # then the row is ``idle``.
+    await _drain_status(bus, SessionStatus.RUNNING, timeout=5.0)
+
     async with session_factory() as db:
         row = await db.scalar(select(Session).where(Session.id == new_id))
     assert row is not None
@@ -923,6 +939,307 @@ async def test_system_init_persists_claude_session_id(
         row = await db.scalar(select(Session).where(Session.id == session_id))
     assert row is not None
     assert row.claude_session_id == "abc-123"
+
+
+# --------------------------------------------------------------------------- #
+# CCR-044: idle status is persisted; flips to running on first SystemInit.
+# --------------------------------------------------------------------------- #
+
+
+async def test_new_session_inserts_idle_status(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh ``new_session`` lands a row at ``status='idle'`` with NULL claude id.
+
+    The idle window covers the brief gap between ``_db_insert_session``
+    and the first ``SystemInit`` event. We delay the fake claude
+    aggressively so the row's pre-SystemInit state is observable from
+    the test thread.
+    """
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "abc-123"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    # 2-second per-line delay keeps the row idle long enough for the
+    # SELECT below.
+    _set_fake_env(monkeypatch, script=script, delay_ms=2000)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    session_id = await manager.new_session(prompt=None, started_by_tg_user_id=42)
+
+    async with session_factory() as db:
+        row = await db.scalar(select(Session).where(Session.id == session_id))
+    assert row is not None
+    assert row.status == SessionStatus.IDLE.value
+    assert row.claude_session_id is None
+
+    await manager.shutdown()
+
+
+async def test_system_init_flips_idle_to_running_atomically(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single SELECT after SystemInit observes both writes — single UPDATE.
+
+    The implementation writes ``claude_session_id`` and flips
+    ``status='running'`` on the same loaded row before a single
+    ``db.commit()``; one round-trip after the SystemInit-driven RUNNING
+    bus event observes both mutations.
+    """
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "abc-systeminit"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script, delay_ms=200)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    session_id = await manager.new_session(prompt=None, started_by_tg_user_id=42)
+
+    await _drain_status(bus, SessionStatus.RUNNING, timeout=5.0)
+
+    async with session_factory() as db:
+        row = await db.scalar(select(Session).where(Session.id == session_id))
+    assert row is not None
+    assert row.status == SessionStatus.RUNNING.value
+    assert row.claude_session_id == "abc-systeminit"
+
+    await manager.shutdown()
+
+
+async def test_second_system_init_is_noop(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two ``SystemInit`` events in one stream: second is a no-op via the single-shot guard.
+
+    The single-shot ``_claude_session_id_persisted`` flag ensures the
+    second SystemInit never schedules another ``_update_claude_session_id``;
+    ``claude_session_id`` keeps the first value, status stays running.
+    """
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "abc"},
+        {"type": "system", "subtype": "init", "session_id": "xyz"},
+        {"type": "result", "subtype": "success"},
+    ]
+    script = _write_script(tmp_path, events)
+    _set_fake_env(monkeypatch, script=script)
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    session_id = await manager.new_session(prompt=None, started_by_tg_user_id=42)
+    await _drain_status(bus, SessionStatus.COMPLETED, timeout=5.0)
+    await manager.shutdown()
+
+    async with session_factory() as db:
+        row = await db.scalar(select(Session).where(Session.id == session_id))
+    assert row is not None
+    assert row.claude_session_id == "abc"
+    # End-of-test status is the terminal one (``completed``); the
+    # important invariant is that the second SystemInit did not regress
+    # ``claude_session_id`` back to ``"xyz"``.
+
+
+async def test_update_claude_session_id_skips_status_flip_on_non_idle_row(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The defensive ``WHERE status='idle'`` guard skips the flip on advanced rows.
+
+    Models the cross-restart re-delivery case: a row was reconciled to
+    ``crashed`` between INSERT and the first ``SystemInit``. The
+    ``_update_claude_session_id`` writes ``claude_session_id`` (column
+    update is unconditional) but leaves ``status`` alone (row-state
+    guard fires).
+    """
+    import uuid as _uuid_mod
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt_mod
+
+    crashed_id = _uuid_mod.UUID("44444444-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    async with session_factory() as db:
+        db.add(
+            Session(
+                id=crashed_id,
+                started_at=_dt_mod(2026, 5, 8, 9, 0, 0, tzinfo=_UTC),
+                status=SessionStatus.CRASHED.value,
+                started_by_tg_user_id=42,
+                first_prompt=None,
+                claude_session_id=None,
+            ),
+        )
+        await db.commit()
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    await manager._update_claude_session_id(crashed_id, "redelivered-id")  # noqa: SLF001
+
+    async with session_factory() as db:
+        row = await db.scalar(select(Session).where(Session.id == crashed_id))
+    assert row is not None
+    assert row.claude_session_id == "redelivered-id"
+    assert row.status == SessionStatus.CRASHED.value
+
+
+async def test_db_lookup_resumable_skips_idle_rows(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Idle rows are excluded by ``_RESUMABLE_STATUSES`` even if claude_session_id is set.
+
+    Defensive case: an idle row with a non-NULL ``claude_session_id``
+    should still be skipped from prefix matching. Resumable status
+    membership (``completed`` / ``stopped``) is the gate; the
+    ``claude_session_id IS NOT NULL`` predicate is parallel by
+    construction (idle rows have NULL claude id) but not the gate.
+    """
+    import uuid as _uuid_mod
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt_mod
+
+    base = _dt_mod(2026, 5, 8, 10, 0, 0, tzinfo=_UTC)
+    idle_id = _uuid_mod.UUID("aaaa1111-1111-1111-1111-111111111111")
+    completed_id = _uuid_mod.UUID("bbbb2222-2222-2222-2222-222222222222")
+    stopped_id = _uuid_mod.UUID("cccc3333-3333-3333-3333-333333333333")
+    idle_claude_id = "deadbeef-aaaa-bbbb-cccc-ddddddddeeee"
+
+    async with session_factory() as db:
+        # Idle row with a (defensively) non-NULL claude_session_id —
+        # tests that the resumable filter, not the NULL filter, is what
+        # excludes it.
+        db.add(
+            Session(
+                id=idle_id,
+                started_at=base,
+                status=SessionStatus.IDLE.value,
+                started_by_tg_user_id=42,
+                first_prompt=None,
+                claude_session_id=idle_claude_id,
+            ),
+        )
+        db.add(
+            Session(
+                id=completed_id,
+                started_at=base.replace(hour=11),
+                status=SessionStatus.COMPLETED.value,
+                started_by_tg_user_id=42,
+                first_prompt=None,
+                claude_session_id="completed-claude-id",
+            ),
+        )
+        db.add(
+            Session(
+                id=stopped_id,
+                started_at=base.replace(hour=12),
+                status=SessionStatus.STOPPED.value,
+                started_by_tg_user_id=42,
+                first_prompt=None,
+                claude_session_id="stopped-claude-id",
+            ),
+        )
+        await db.commit()
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    # No-prefix path returns the most-recent resumable id (stopped, since
+    # it has the latest started_at), never the idle row's claude id.
+    no_prefix = await manager._db_lookup_resumable_claude_session_id(  # noqa: SLF001
+        session_id_prefix=None,
+    )
+    assert no_prefix == "stopped-claude-id"
+
+    # Prefix path that matches ONLY the idle row's claude id raises
+    # SessionNotFoundError — idle is excluded.
+    with pytest.raises(SessionNotFoundError):
+        await manager._db_lookup_resumable_claude_session_id(  # noqa: SLF001
+            session_id_prefix=idle_claude_id[:8],
+        )
+
+
+async def test_reconcile_orphans_sweeps_idle_rows(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """``reconcile_orphans`` flips orphaned idle rows to crashed alongside running rows.
+
+    Pre-CCR-044 only ``status='running'`` rows were swept. After CCR-044
+    a fresh ``new_session`` may leave a row at ``status='idle'`` if the
+    bot dies between INSERT and the first SystemInit; the sweep now
+    cleans those up too.
+    """
+    import uuid as _uuid_mod
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt_mod
+
+    idle_id = _uuid_mod.UUID("eeeeeeee-1111-2222-3333-444444444444")
+    async with session_factory() as db:
+        db.add(
+            Session(
+                id=idle_id,
+                started_at=_dt_mod(2026, 5, 8, 13, 0, 0, tzinfo=_UTC),
+                status=SessionStatus.IDLE.value,
+                started_by_tg_user_id=42,
+                first_prompt=None,
+                claude_session_id=None,
+            ),
+        )
+        await db.commit()
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    count = await manager.reconcile_orphans()
+    assert count == 1
+
+    async with session_factory() as db:
+        row = await db.scalar(select(Session).where(Session.id == idle_id))
+    assert row is not None
+    assert row.status == SessionStatus.CRASHED.value
+    assert row.exit_reason == "bot restart while initialising"
+    assert row.ended_at is not None
+
+
+async def test_session_status_idle_blocks_db_finalize_call(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """``_db_finalize_session(status=IDLE)`` raises ``ValueError``.
+
+    The guard is defensive: finalize must always land a terminal status.
+    Pre-CCR-044 the same guard existed; CCR-044 keeps it because the
+    semantic ("never finalize with a transient status") is unchanged
+    even though ``IDLE`` is now persisted at the row level.
+    """
+    import uuid as _uuid_mod
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt_mod
+
+    bus = EventBus()
+    manager = SessionManager(bus=bus, db_factory=session_factory, settings=settings)
+
+    with pytest.raises(ValueError, match="finalize must be called with a terminal status"):
+        await manager._db_finalize_session(  # noqa: SLF001
+            session_id=_uuid_mod.UUID("ffff0000-0000-0000-0000-000000000000"),
+            status=SessionStatus.IDLE,
+            ended_at=_dt_mod(2026, 5, 8, 14, 0, 0, tzinfo=_UTC),
+            exit_reason="should-not-write",
+        )
 
 
 async def test_continue_session_uses_claude_session_id_resume(
