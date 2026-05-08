@@ -1500,4 +1500,49 @@ Notes:
   - 2026-05-08 main: branch ccr-043-rename-rekey-current created, dispatching team-lead
   - 2026-05-08 team-lead: scope brief issued (no architect), dispatching python-developer
   - 2026-05-08 team-lead: BRIEF/CONTEXT refreshed, dispatching reviewer
+---
+
+## CCR-045: Remove local-UUID `Session.id` references from bot user-facing replies; replace with pid where useful [done]
+Phase: n/a (post-CCR-044 chat-bot UX cleanup; part of the claude_session_id-alignment slice)
+Feature: chat-bot
+Files:
+  - `src/ccr/bot/handlers/session.py` — drop the local-UUID id from user-facing reply strings:
+    - `cmd_new` (around line 108): `"Session {_short_id(session_id)} started (pid {pid})."` → `"New session started (pid {pid})."`.
+    - `cmd_continue` (around line 172): `"Session {_short_id(session_id)} resumed (pid {pid})."` → `"Session resumed (pid {pid})."`. (If a chat-only handle is meaningful here, the developer MAY substitute the `claude_session_id[:8]` prefix once it is known — but `cmd_continue` returns before the manager has captured `claude_session_id` for fresh-resume cases, so the simpler "Session resumed (pid {pid})" phrasing is preferred.)
+    - The unnamed handler around line 209 (mirroring `cmd_new` for plain-text first prompts): same treatment as `cmd_new`.
+    - `cmd_pid` (around line 222): the reply renders `inf["session_id"][:8]` today (the local UUID prefix). Replace with the pid only — `f"Session running (pid {pid})."` or equivalent. After CCR-044, an idle session has no claude_session_id to render and the local UUID is internal; pid is the user-visible handle.
+  - `src/ccr/bot/handlers/session.py` — audit `_short_id` (lines 76-77): once the call sites above are rewritten, `_short_id` becomes dead code. Remove it (and any test that exercises it directly) UNLESS another live caller surfaces during the audit; in that case document the surviving caller in the BRIEF refresh.
+  - `src/ccr/bot/handlers/passthrough.py` — `/cost` rendering (`_render_cost_reply` around line 249-273, called from line 302 with `session_id.hex`): the rendered `id8 = html.escape(session_id_hex[:_SESSION_ID_HEX_PREFIX_LEN])` is the local UUID's first 8 hex characters. Replace with `claude_session_id[:8]` if the session has one (look it up via the manager / db), or drop the id slot from the `/cost` reply when no `claude_session_id` is available. Developer's call which fits the `/cost` template best — the user is OK with dropping the id entirely when it cannot be replaced by a meaningful handle. Keep `_SESSION_ID_HEX_PREFIX_LEN` if reused; remove it if not.
+  - `src/ccr/bot/handlers/session.py` — audit `cmd_sessions`'s `_format_started_by` and surrounding rendering for any other local-UUID surfaces; the `<id8>` slot in `_format_session_row` is already `claude_session_id[:8]` (CCR-042) and stays that way — this audit is for any OTHER incidental UUID rendering missed by the grep below.
+  - **Grep canary**: a developer-side grep over `src/ccr/bot/` for `session.id`, `Session.id`, `session_id`, `_short_id`, `.hex[:8]` MUST return only callback-payload encoding sites (`perm:{session_id}:...`, `auq:{session_id}:...` in `keyboards.py` and the parsing logic in `permission.py` / `ask_user_question.py`) and internal log/structlog statements — never user-facing reply strings. The PR description should include the grep output as evidence.
+  - `tests/test_bot_session_handlers.py` (and `tests/test_bot_session.py`) — update reply-string assertions for `cmd_new`, `cmd_continue`, the plain-text first-prompt handler, and `cmd_pid` to match the new pid-based phrasing. Remove tests that asserted on the `_short_id(session_id)` content if any.
+  - `tests/test_bot_passthrough.py` — update `/cost` reply assertions for the new id-slot rendering (or its removal).
+Out of scope:
+  - Status-lifecycle changes (handled by CCR-044).
+  - Command argument rekeying (handled by CCR-046; `/rename` by CCR-043 rework).
+  - Callback data payloads (`perm:`, `auq:`, `cfg:`) — those keep the local-UUID encoding because `session_id` is unambiguous server-side and the callback data is server-controlled, not user-typed.
+  - Internal log lines / structlog statements — those keep the local UUID for debugging.
+  - Web viewer / SSE routes (use `Session.id` UUID via path params; those are not chat-output).
+Acceptance:
+  - [x] `cmd_new`, `cmd_continue`, the plain-text first-prompt handler, and `cmd_pid` no longer render a local-UUID prefix in their replies; pid is exposed where helpful, otherwise the id reference is dropped entirely.
+  - [x] `/cost` reply no longer renders a local-UUID prefix; either substitutes `claude_session_id[:8]` (when available) or drops the id slot.
+  - [x] `_short_id` is removed (or its remaining caller is documented) and the chat-bot BRIEF reflects the change.
+  - [x] A grep over `src/ccr/bot/` for local-UUID surfacing (`session.id`, `Session.id`, `_short_id`, `.hex[:8]`) returns only callback-payload encoding sites and internal logs — no user-facing reply strings. The PR includes the grep output as evidence.
+  - [x] All existing reply-string tests are updated to the new phrasing; no test still asserts on `Session {<8-hex>} started/resumed`.
+  - [x] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [x] `ruff check src tests` passes.
+  - [x] `ruff format --check` passes.
+  - [x] `mypy src` passes.
+Depends on: CCR-044
+Notes:
+  **Why depends on CCR-044:** CCR-044 changes when `claude_session_id` becomes available (it is NULL during `[idle]`, populated on transition to `[running]`). `cmd_new` and the plain-text first-prompt handler return BEFORE the first `SystemInit` event arrives, so even after CCR-044 they cannot substitute `claude_session_id[:8]` for the local UUID — the right answer there is the pid-based phrasing. Landing this ticket before CCR-044 would not be wrong but would risk reviewers asking "why not use claude_session_id?" without the lifecycle context.
+  Pid is the Claude subprocess pid, already exposed via `manager.pid` / `inf["pid"]` (used in `cmd_new` today). It is a stable user-visible handle for the active subprocess.
+  Mode 1A note for team-lead: skip the architect — stylistic + grep-and-replace across handlers + snapshot test updates; no new abstraction. Reviewer focus: the grep canary, plus confirming the callback-payload sites are NOT touched.
+
+### Review log
+  - 2026-05-07 project-manager: filed — chat-output cleanup, drop local-UUID from user-facing replies, replace with pid where useful
+  - 2026-05-08 main: branch ccr-045-pid-in-replies created, dispatching team-lead
+  - 2026-05-08 team-lead: scope brief issued (no architect), dispatching python-developer
+  - 2026-05-08 team-lead: BRIEF/CONTEXT refreshed, dispatching reviewer
+  - 2026-05-08 team-lead: approved
   - 2026-05-08 team-lead: approved with two LOW findings noted; F2 (BRIEF drift — "ambiguous-prefix" in cmd_rename entry) fixed inline; F1 (dead constant _RENAME_AMBIGUOUS_REPLY in session.py:72) deferred — non-blocking, follow-up cleanup welcome in CCR-045 or a standalone micro-ticket
