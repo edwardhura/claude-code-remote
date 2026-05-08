@@ -437,7 +437,7 @@ async def test_unknown_command_returns_usage(tmp_path: Path) -> None:
 
     manager.send_slash.assert_not_awaited()
     msg.answer.assert_awaited_once_with(
-        "Unknown command. Whitelisted: /new /stop /clear /view /last /preview "
+        "Unknown command. Whitelisted: /new /stop /view /last /preview "
         "/cost /usage /model /compact /who /agents /skills /config /rename.",
     )
 

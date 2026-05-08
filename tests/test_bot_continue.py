@@ -138,14 +138,14 @@ async def test_cmd_continue_already_running_replies_canned_string(
     """``SessionAlreadyRunningError`` produces the documented canned string verbatim."""
     manager = FakeManager()
     manager.continue_session.side_effect = SessionAlreadyRunningError(
-        "Session already running. /stop first or /clear to start fresh.",
+        "Session already running. /stop first or /new to start fresh.",
     )
     msg = _make_message()
 
     await cmd_continue(msg, session_manager=manager, db_factory=session_factory)
 
     msg.answer.assert_awaited_once_with(
-        "Session already running. /stop first or /clear to start fresh.",
+        "Session already running. /stop first or /new to start fresh.",
     )
 
 

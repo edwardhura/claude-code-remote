@@ -79,7 +79,7 @@ OVERAGE_REASON_LABELS: dict[str, str] = {
 }
 
 _UNKNOWN_USAGE_HINT = (
-    "Unknown command. Whitelisted: /new /stop /clear /view /last /preview "
+    "Unknown command. Whitelisted: /new /stop /view /last /preview "
     "/cost /usage /model /compact /who /agents /skills /config /rename."
 )
 
