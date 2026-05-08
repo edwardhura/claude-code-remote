@@ -975,7 +975,11 @@ async def test_cmd_sessions_html_escapes_name_with_special_chars(
 async def test_cmd_rename_overwrites_null_name(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    # CCR-043: prefix is matched against ``claude_session_id[:8]``, not the
+    # local-row UUID prefix. Seed both so the prefix in the message
+    # corresponds to the Claude id.
     sid = uuid.UUID("11112222-3333-4444-5555-666677778888")
+    cid = "deadbeef-1111-2222-3333-444455556666"
     await _seed_session(
         session_factory,
         session_id=sid,
@@ -983,14 +987,16 @@ async def test_cmd_rename_overwrites_null_name(
         status="completed",
         first_prompt="hello",
         name=None,
+        claude_session_id=cid,
     )
+    manager = FakeManager(status=SessionStatus.IDLE)
 
-    msg = _make_message(text="/rename 11112222 New label", user_id=42)
-    await cmd_rename(msg, db_factory=session_factory)
+    msg = _make_message(text="/rename deadbeef New label", user_id=42)
+    await cmd_rename(msg, session_manager=manager, db_factory=session_factory)
 
     msg.answer.assert_awaited_once()
     reply = msg.answer.await_args.args[0]
-    assert "11112222" in reply
+    assert "deadbeef" in reply
     assert "New label" in reply
 
     async with session_factory() as db:
@@ -1004,6 +1010,7 @@ async def test_cmd_rename_overwrites_existing_name(
 ) -> None:
     """``/rename`` overwrites a non-NULL value (manual rename always wins)."""
     sid = uuid.UUID("aaaa1111-2222-3333-4444-555566667777")
+    cid = "feedface-1111-2222-3333-444455556666"
     await _seed_session(
         session_factory,
         session_id=sid,
@@ -1011,10 +1018,12 @@ async def test_cmd_rename_overwrites_existing_name(
         status="completed",
         first_prompt="hello",
         name="old name",
+        claude_session_id=cid,
     )
+    manager = FakeManager(status=SessionStatus.IDLE)
 
-    msg = _make_message(text="/rename aaaa1111 brand new", user_id=42)
-    await cmd_rename(msg, db_factory=session_factory)
+    msg = _make_message(text="/rename feedface brand new", user_id=42)
+    await cmd_rename(msg, session_manager=manager, db_factory=session_factory)
 
     async with session_factory() as db:
         row = await db.scalar(select(Session).where(Session.id == sid))
@@ -1027,11 +1036,19 @@ def test_cmd_rename_usage_hint_is_html_safe() -> None:
     assert ">" not in _RENAME_USAGE_HINT
 
 
+def test_cmd_rename_usage_hint_documents_both_forms() -> None:
+    """CCR-043: the usage hint must document both the prefix and ``current`` forms."""
+    assert "&lt;8-hex-prefix&gt;" in _RENAME_USAGE_HINT
+    assert "&lt;name&gt;" in _RENAME_USAGE_HINT
+    assert "current" in _RENAME_USAGE_HINT
+
+
 async def test_cmd_rename_no_args_returns_usage_hint(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    manager = FakeManager(status=SessionStatus.IDLE)
     msg = _make_message(text="/rename", user_id=42)
-    await cmd_rename(msg, db_factory=session_factory)
+    await cmd_rename(msg, session_manager=manager, db_factory=session_factory)
 
     msg.answer.assert_awaited_once()
     reply = msg.answer.await_args.args[0]
@@ -1041,8 +1058,9 @@ async def test_cmd_rename_no_args_returns_usage_hint(
 async def test_cmd_rename_only_prefix_returns_usage_hint(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    manager = FakeManager(status=SessionStatus.IDLE)
     msg = _make_message(text="/rename 11112222", user_id=42)
-    await cmd_rename(msg, db_factory=session_factory)
+    await cmd_rename(msg, session_manager=manager, db_factory=session_factory)
 
     msg.answer.assert_awaited_once()
     reply = msg.answer.await_args.args[0]
@@ -1052,8 +1070,9 @@ async def test_cmd_rename_only_prefix_returns_usage_hint(
 async def test_cmd_rename_blank_name_returns_usage_hint(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    manager = FakeManager(status=SessionStatus.IDLE)
     msg = _make_message(text="/rename 11112222    ", user_id=42)
-    await cmd_rename(msg, db_factory=session_factory)
+    await cmd_rename(msg, session_manager=manager, db_factory=session_factory)
 
     msg.answer.assert_awaited_once()
     reply = msg.answer.await_args.args[0]
@@ -1064,16 +1083,19 @@ async def test_cmd_rename_unknown_prefix_returns_error(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     sid = uuid.UUID("aabbccdd-1111-2222-3333-444455556666")
+    cid = "abcdef00-1111-2222-3333-444455556666"
     await _seed_session(
         session_factory,
         session_id=sid,
         started_at=datetime(2026, 5, 6, 15, 0, 0, tzinfo=UTC),
         status="completed",
         first_prompt="x",
+        claude_session_id=cid,
     )
+    manager = FakeManager(status=SessionStatus.IDLE)
 
     msg = _make_message(text="/rename deadbeef whatever", user_id=42)
-    await cmd_rename(msg, db_factory=session_factory)
+    await cmd_rename(msg, session_manager=manager, db_factory=session_factory)
 
     msg.answer.assert_awaited_once()
     reply = msg.answer.await_args.args[0]
@@ -1085,8 +1107,9 @@ async def test_cmd_rename_invalid_prefix_returns_usage_hint(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """A prefix that is not 8 hex chars returns the usage hint, no DB hit."""
+    manager = FakeManager(status=SessionStatus.IDLE)
     msg = _make_message(text="/rename ZZZZZZZZ name", user_id=42)
-    await cmd_rename(msg, db_factory=session_factory)
+    await cmd_rename(msg, session_manager=manager, db_factory=session_factory)
 
     msg.answer.assert_awaited_once()
     reply = msg.answer.await_args.args[0]
@@ -1097,20 +1120,248 @@ async def test_cmd_rename_truncates_long_name_to_40_chars(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     sid = uuid.UUID("ccccdddd-1111-2222-3333-444455556666")
+    cid = "cafef00d-1111-2222-3333-444455556666"
     await _seed_session(
         session_factory,
         session_id=sid,
         started_at=datetime(2026, 5, 6, 15, 30, 0, tzinfo=UTC),
         status="completed",
         first_prompt="x",
+        claude_session_id=cid,
     )
+    manager = FakeManager(status=SessionStatus.IDLE)
     long_name = "x" * 80
 
-    msg = _make_message(text=f"/rename ccccdddd {long_name}", user_id=42)
-    await cmd_rename(msg, db_factory=session_factory)
+    msg = _make_message(text=f"/rename cafef00d {long_name}", user_id=42)
+    await cmd_rename(msg, session_manager=manager, db_factory=session_factory)
 
     async with session_factory() as db:
         row = await db.scalar(select(Session).where(Session.id == sid))
     assert row is not None
     assert row.name is not None
     assert len(row.name) <= 40
+
+
+async def test_cmd_rename_resume_chain_renames_all_rows(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """CCR-043: a prefix that matches multiple rows in a resume chain
+    (rows sharing one ``claude_session_id``) renames every row in the
+    chain in one commit so the ``/sessions`` listing stays consistent.
+    """
+    shared_cid = "fedcba98-7777-8888-9999-aaaabbbbcccc"
+    older_id = uuid.UUID("11110000-0000-0000-0000-000000000001")
+    newer_id = uuid.UUID("22220000-0000-0000-0000-000000000002")
+    await _seed_session(
+        session_factory,
+        session_id=older_id,
+        started_at=datetime(2026, 5, 6, 9, 0, 0, tzinfo=UTC),
+        status="completed",
+        first_prompt="first",
+        name="first-name",
+        claude_session_id=shared_cid,
+    )
+    await _seed_session(
+        session_factory,
+        session_id=newer_id,
+        started_at=datetime(2026, 5, 6, 10, 0, 0, tzinfo=UTC),
+        status="completed",
+        first_prompt="resumed",
+        name="second-name",
+        claude_session_id=shared_cid,
+    )
+    manager = FakeManager(status=SessionStatus.IDLE)
+
+    msg = _make_message(text="/rename fedcba98 newname", user_id=42)
+    await cmd_rename(msg, session_manager=manager, db_factory=session_factory)
+
+    async with session_factory() as db:
+        older = await db.scalar(select(Session).where(Session.id == older_id))
+        newer = await db.scalar(select(Session).where(Session.id == newer_id))
+    assert older is not None
+    assert newer is not None
+    assert older.name == "newname"
+    assert newer.name == "newname"
+
+
+async def test_cmd_rename_skips_null_claude_session_id_rows(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """CCR-043: rows with NULL ``claude_session_id`` are excluded from
+    prefix matching. A request whose prefix happens to equal the local
+    UUID prefix of a NULL row must NOT mutate the row — it returns the
+    unknown-prefix error instead.
+    """
+    sid = uuid.UUID("abcdef01-1111-2222-3333-444444444444")
+    await _seed_session(
+        session_factory,
+        session_id=sid,
+        started_at=datetime(2026, 5, 6, 11, 0, 0, tzinfo=UTC),
+        status="completed",
+        first_prompt="legacy",
+        name="legacy-name",
+        claude_session_id=None,
+    )
+    manager = FakeManager(status=SessionStatus.IDLE)
+
+    # The prefix matches the local UUID's first 8 chars — under the old
+    # CCR-037 behaviour that would have matched. CCR-043 excludes NULL
+    # rows, so the call returns the unknown-prefix error.
+    msg = _make_message(text="/rename abcdef01 newname", user_id=42)
+    await cmd_rename(msg, session_manager=manager, db_factory=session_factory)
+
+    msg.answer.assert_awaited_once()
+    reply = msg.answer.await_args.args[0]
+    assert "No session found" in reply
+    assert "abcdef01" in reply
+
+    async with session_factory() as db:
+        row = await db.scalar(select(Session).where(Session.id == sid))
+    assert row is not None
+    assert row.name == "legacy-name"
+
+
+async def test_cmd_rename_current_no_active_session_replies_no_active(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """CCR-043: ``/rename current`` with no subprocess held replies with
+    the exact ``"No active session to rename."`` string and does not mutate.
+    """
+    sid = uuid.UUID("11112222-3333-4444-5555-666677778888")
+    await _seed_session(
+        session_factory,
+        session_id=sid,
+        started_at=datetime(2026, 5, 6, 14, 0, 0, tzinfo=UTC),
+        status="completed",
+        first_prompt="hello",
+        name="old",
+        claude_session_id="deadbeef-1111-2222-3333-444455556666",
+    )
+    # FakeManager defaults to IDLE with all-None info() snapshot.
+    manager = FakeManager(status=SessionStatus.IDLE)
+    msg = _make_message(text="/rename current newname", user_id=42)
+
+    await cmd_rename(msg, session_manager=manager, db_factory=session_factory)
+
+    msg.answer.assert_awaited_once_with("No active session to rename.")
+
+    async with session_factory() as db:
+        row = await db.scalar(select(Session).where(Session.id == sid))
+    assert row is not None
+    assert row.name == "old"
+
+
+async def test_cmd_rename_current_idle_active_session_replies_distinct_error(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """CCR-043: ``/rename current`` during the CCR-044 ``[idle]`` window
+    (subprocess held but ``SystemInit`` not yet fired) replies with a
+    distinct error string — explicitly NOT ``"No active session to rename."``
+    — and does not mutate.
+    """
+    sid = uuid.UUID("11112222-3333-4444-5555-666677778888")
+    await _seed_session(
+        session_factory,
+        session_id=sid,
+        started_at=datetime(2026, 5, 6, 14, 0, 0, tzinfo=UTC),
+        status="idle",
+        first_prompt=None,
+        name="old",
+        claude_session_id=None,
+    )
+    # IDLE + non-None session_id mimics the CCR-044 idle window.
+    manager = FakeManager(
+        status=SessionStatus.IDLE,
+        pid=1234,
+        session_id=sid,
+    )
+    # Override info() to return the idle-window snapshot regardless of the
+    # default IDLE all-None branch.
+    started_at = datetime.now(UTC)
+
+    async def _idle_window_info() -> dict[str, object]:
+        return {
+            "session_id": sid,
+            "pid": 1234,
+            "started_at": started_at,
+            "status": SessionStatus.IDLE,
+        }
+
+    manager.info = _idle_window_info  # type: ignore[method-assign]
+    msg = _make_message(text="/rename current newname", user_id=42)
+
+    await cmd_rename(msg, session_manager=manager, db_factory=session_factory)
+
+    msg.answer.assert_awaited_once()
+    reply = msg.answer.await_args.args[0]
+    assert reply != "No active session to rename."
+    assert "claude_session_id" in reply or "yet" in reply
+
+    async with session_factory() as db:
+        row = await db.scalar(select(Session).where(Session.id == sid))
+    assert row is not None
+    assert row.name == "old"
+
+
+async def test_cmd_rename_current_running_renames_chain(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """CCR-043: ``/rename current`` with a running session and a populated
+    ``claude_session_id`` renames every row sharing that id (resume chain).
+    """
+    shared_cid = "fedcba98-7777-8888-9999-aaaabbbbcccc"
+    older_id = uuid.UUID("11110000-0000-0000-0000-000000000001")
+    newer_id = uuid.UUID("22220000-0000-0000-0000-000000000002")
+    await _seed_session(
+        session_factory,
+        session_id=older_id,
+        started_at=datetime(2026, 5, 6, 9, 0, 0, tzinfo=UTC),
+        status="completed",
+        first_prompt="first",
+        name="first-name",
+        claude_session_id=shared_cid,
+    )
+    await _seed_session(
+        session_factory,
+        session_id=newer_id,
+        started_at=datetime(2026, 5, 6, 10, 0, 0, tzinfo=UTC),
+        status="running",
+        first_prompt="resumed",
+        name="second-name",
+        claude_session_id=shared_cid,
+    )
+    manager = FakeManager(
+        status=SessionStatus.RUNNING,
+        pid=1234,
+        session_id=newer_id,
+    )
+
+    msg = _make_message(text="/rename current the chain", user_id=42)
+    await cmd_rename(msg, session_manager=manager, db_factory=session_factory)
+
+    msg.answer.assert_awaited_once()
+    reply = msg.answer.await_args.args[0]
+    assert "renamed to" in reply
+    assert "the chain" in reply
+    assert "fedcba98" in reply
+
+    async with session_factory() as db:
+        older = await db.scalar(select(Session).where(Session.id == older_id))
+        newer = await db.scalar(select(Session).where(Session.id == newer_id))
+    assert older is not None
+    assert newer is not None
+    assert older.name == "the chain"
+    assert newer.name == "the chain"
+
+
+async def test_cmd_rename_current_no_name_returns_usage_hint(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """CCR-043: ``/rename current`` without a name returns the usage hint."""
+    manager = FakeManager(status=SessionStatus.IDLE)
+    msg = _make_message(text="/rename current", user_id=42)
+    await cmd_rename(msg, session_manager=manager, db_factory=session_factory)
+
+    msg.answer.assert_awaited_once()
+    reply = msg.answer.await_args.args[0]
+    assert reply.startswith("Usage: /rename")

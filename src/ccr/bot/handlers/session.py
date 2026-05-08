@@ -65,11 +65,21 @@ _DIVIDER_MESSAGE = "— — — new session — — —"
 _SESSION_NAME_MAX_LEN = 40
 
 _RENAME_USAGE_HINT = (
-    "Usage: /rename &lt;8-hex-prefix&gt; &lt;name&gt;. "
+    "Usage: /rename &lt;8-hex-prefix&gt; &lt;name&gt; "
+    "or /rename current &lt;name&gt;. "
     "Example: /rename 76581b99 Refactor pairing flow."
 )
 _RENAME_AMBIGUOUS_REPLY = (
     "Multiple sessions match that prefix. Pass a longer prefix or use /sessions to disambiguate."
+)
+_RENAME_NO_ACTIVE_SESSION_REPLY = "No active session to rename."
+# CCR-043: distinct from ``_RENAME_NO_ACTIVE_SESSION_REPLY`` so callers can
+# tell the two pre-mutation error states apart. The CCR-044 ``[idle]``
+# lifecycle window is the only path that lands here: a subprocess is held
+# but ``SystemInit`` has not yet fired, so the row exists with
+# ``claude_session_id IS NULL`` and there is nothing addressable to rename.
+_RENAME_IDLE_ACTIVE_SESSION_REPLY = (
+    "Active session has no claude_session_id yet — try again after it starts."
 )
 
 
@@ -418,18 +428,49 @@ def _format_started_by(
 @router.message(Command("rename"))
 async def cmd_rename(
     msg: Message,
+    session_manager: SessionManager,
     db_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Manually rename a session: ``/rename <8-hex-prefix> <name>``.
+    """Manually rename a session.
 
-    The prefix is matched against the first 8 hex characters of
-    ``Session.id`` (mirroring ``/continue``'s prefix lookup). The new name
-    is truncated to ``_SESSION_NAME_MAX_LEN`` characters and overwrites
-    whatever ``Session.name`` previously held (NULL or another value) —
-    manual rename always wins. Empty / missing args, an unknown prefix,
-    and an ambiguous prefix each return a stable, non-mutating reply.
+    Two forms are accepted:
+
+    * ``/rename <8-hex-prefix> <name>`` — prefix is matched against the
+      first 8 hex characters of ``Session.claude_session_id`` (CCR-043,
+      same convention ``/continue`` uses since CCR-042). Rows where
+      ``claude_session_id IS NULL`` are skipped from prefix matching;
+      they are not addressable. When the prefix matches a resume chain
+      (multiple ``Session`` rows sharing one ``claude_session_id`` per
+      CCR-041), every row in the chain is renamed in one commit so the
+      ``/sessions`` listing stays consistent.
+    * ``/rename current <name>`` — renames the active session's chain.
+      ``current`` is detected before the 8-hex regex check so the literal
+      keyword is never rejected as a malformed prefix. The active session
+      is read from :meth:`SessionManager.info`. Two pre-mutation error
+      states reply with distinct strings: no subprocess at all
+      (``"No active session to rename."``) versus a subprocess held in
+      the CCR-044 ``[idle]`` window where ``claude_session_id`` has not
+      yet been populated (the idle-state reply is deliberately different
+      so callers can tell the two situations apart).
+
+    The new name is truncated to ``_SESSION_NAME_MAX_LEN`` characters and
+    overwrites whatever ``Session.name`` previously held (NULL or another
+    value) — manual rename always wins. Empty / missing args, an invalid
+    prefix, an unknown prefix, an all-NULL match set, and the two
+    ``current`` error states each return a stable, non-mutating reply.
     """
     if msg.from_user is None or msg.text is None:
+        return
+
+    raw_args = msg.text.removeprefix("/rename").strip()
+    parts = raw_args.split(maxsplit=1)
+    if parts and parts[0] == "current":
+        await _handle_rename_current(
+            msg,
+            session_manager=session_manager,
+            db_factory=db_factory,
+            raw_name=parts[1] if len(parts) > 1 else "",
+        )
         return
 
     parsed = _parse_rename_args(msg.text)
@@ -451,19 +492,90 @@ async def cmd_rename(
                 select(Session).order_by(Session.started_at.desc()),
             )
         ).all()
-        matches = [row for row in rows if str(row.id)[:8] == prefix]
+        # CCR-043: skip rows with NULL ``claude_session_id`` *before* the
+        # ``[:8]`` slice — slicing ``None`` raises ``TypeError``. NULL rows
+        # are not addressable via the prefix surface (mirrors
+        # ``_db_lookup_resumable_claude_session_id``'s skip rule), so they
+        # never participate in prefix matching.
+        matches = [
+            row
+            for row in rows
+            if row.claude_session_id is not None and row.claude_session_id[:8] == prefix
+        ]
         if not matches:
             await msg.answer(f"No session found with id {html.escape(prefix)}.")
             return
-        if len(matches) > 1:
-            await msg.answer(_RENAME_AMBIGUOUS_REPLY)
-            return
-        row = matches[0]
-        row.name = new_name
+        # CCR-043: every row sharing the matched ``claude_session_id``
+        # gets renamed (resume-chain rename completeness — all rows in
+        # the chain show the same prefix in ``/sessions``, so renaming
+        # only one would silently desync the listing).
+        target_claude_id = matches[0].claude_session_id
+        chain = [row for row in rows if row.claude_session_id == target_claude_id]
+        for row in chain:
+            row.name = new_name
         await db.commit()
 
     await msg.answer(
         f"Session <code>{prefix}</code> renamed to {html.escape(new_name)}.",
+    )
+
+
+async def _handle_rename_current(
+    msg: Message,
+    *,
+    session_manager: SessionManager,
+    db_factory: async_sessionmaker[AsyncSession],
+    raw_name: str,
+) -> None:
+    """``/rename current <name>`` branch — rename the active session's chain.
+
+    See :func:`cmd_rename` for the two-error-state contract; the strings
+    ``_RENAME_NO_ACTIVE_SESSION_REPLY`` and
+    ``_RENAME_IDLE_ACTIVE_SESSION_REPLY`` MUST stay distinct so callers
+    can distinguish "nothing held" from "held but pre-SystemInit".
+    """
+    new_name = _truncate_session_name_for_rename(raw_name)
+    if not new_name:
+        await msg.answer(_RENAME_USAGE_HINT)
+        return
+
+    inf = await session_manager.info()
+    if inf.get("session_id") is None:
+        await msg.answer(_RENAME_NO_ACTIVE_SESSION_REPLY)
+        return
+    if inf.get("status") == SessionStatus.IDLE:
+        # CCR-044 [idle] window: subprocess held but ``SystemInit`` has
+        # not fired yet. ``claude_session_id`` is NULL on the live row;
+        # rename has nothing to target.
+        await msg.answer(_RENAME_IDLE_ACTIVE_SESSION_REPLY)
+        return
+
+    local_session_id = inf.get("session_id")
+    async with db_factory() as db:
+        active_row = await db.scalar(
+            select(Session).where(Session.id == local_session_id),
+        )
+        if active_row is None or active_row.claude_session_id is None:
+            # Defensive: the manager reports a non-idle, non-NULL-id
+            # session but the DB row is missing or its
+            # ``claude_session_id`` is NULL. Treat as the idle case (the
+            # intent — "no claude id to address") rather than mutating
+            # nothing silently.
+            await msg.answer(_RENAME_IDLE_ACTIVE_SESSION_REPLY)
+            return
+        target_claude_id = active_row.claude_session_id
+        chain_rows = (
+            await db.scalars(
+                select(Session).where(Session.claude_session_id == target_claude_id),
+            )
+        ).all()
+        for row in chain_rows:
+            row.name = new_name
+        await db.commit()
+
+    prefix = target_claude_id[:8]
+    await msg.answer(
+        f"Session <code>{html.escape(prefix)}</code> renamed to {html.escape(new_name)}.",
     )
 
 
