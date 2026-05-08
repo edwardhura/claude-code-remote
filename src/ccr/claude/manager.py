@@ -356,7 +356,11 @@ class SessionManager:
             self._proc = proc
             self._session_id = session_id
             self._log = session_log
-            self._status = SessionStatus.RUNNING
+            # CCR-044: in-memory status mirrors the DB. The row is inserted
+            # ``idle`` and ``_update_claude_session_id`` flips this to
+            # ``RUNNING`` (and publishes the ``session.status`` event) when
+            # the first ``SystemInit`` event lands.
+            self._status = SessionStatus.IDLE
             self._stop_requested = False
             self._saw_result_success = False
             self._claude_session_id_persisted = False
@@ -388,15 +392,6 @@ class SessionManager:
                 name=f"claude-exit-{session_id}",
             )
 
-            await self._bus.publish(
-                "session.status",
-                {
-                    "session_id": session_id,
-                    "status": SessionStatus.RUNNING,
-                    "ts": now,
-                },
-            )
-
             if prompt:
                 try:
                     await asyncio.wait_for(
@@ -409,8 +404,16 @@ class SessionManager:
                         session_id=str(session_id),
                     )
                 # The subprocess may have crashed during init; only send if
-                # we still hold a running process.
-                if self._proc is proc and self._status == SessionStatus.RUNNING:
+                # we still hold a running process. CCR-044: ``self._status``
+                # may still be ``IDLE`` here when ``_init_event.wait()``
+                # returns — the SystemInit handler sets ``_init_event``
+                # synchronously and only schedules the ``_update_claude_session_id``
+                # task that flips ``_status`` to ``RUNNING``. We treat
+                # ``IDLE`` and ``RUNNING`` as equivalent here ("subprocess
+                # held, init observed") and exclude only the terminal
+                # statuses where the subprocess has demonstrably exited.
+                live_statuses = (SessionStatus.IDLE, SessionStatus.RUNNING)
+                if self._proc is proc and self._status in live_statuses:
                     try:
                         await proc.send_user_turn(prompt)
                     except RuntimeError as exc:
@@ -486,7 +489,12 @@ class SessionManager:
             self._proc = proc
             self._session_id = session_id
             self._log = session_log
-            self._status = SessionStatus.RUNNING
+            # CCR-044: same lifecycle as ``new_session`` — the row is
+            # inserted ``idle`` and ``_update_claude_session_id`` flips
+            # both DB ``status`` and in-memory ``_status`` to ``RUNNING``
+            # (and publishes ``session.status``) when the first
+            # ``SystemInit`` event lands.
+            self._status = SessionStatus.IDLE
             self._stop_requested = False
             self._saw_result_success = False
             self._claude_session_id_persisted = False
@@ -518,15 +526,6 @@ class SessionManager:
                 name=f"claude-exit-{session_id}",
             )
 
-            await self._bus.publish(
-                "session.status",
-                {
-                    "session_id": session_id,
-                    "status": SessionStatus.RUNNING,
-                    "ts": now,
-                },
-            )
-
             return session_id
 
     async def send(self, prompt: str) -> None:
@@ -542,7 +541,7 @@ class SessionManager:
         await self.send(prompt)
 
     async def reconcile_orphans(self) -> int:
-        """Mark every DB row stuck in ``status='running'`` as ``crashed``.
+        """Mark every DB row stuck in ``status='running'`` or ``'idle'`` as ``crashed``.
 
         On bot crash / kill the child Claude subprocess dies with the parent
         but the :class:`Session` row stays ``status='running'`` forever
@@ -550,19 +549,27 @@ class SessionManager:
         lies about live sessions — call this once during startup to repair
         the lie.
 
-        Returns the number of rows reconciled. Idempotent: a second call on
-        an already-clean DB returns ``0``. Logs one structured line per row
-        so operators can audit the cleanup.
+        CCR-044: the same posture applies to ``status='idle'`` rows — these
+        are sessions that ``_db_insert_session`` wrote but whose first
+        ``SystemInit`` event never landed (process crashed during init, or
+        between INSERT and SystemInit). Without this sweep an idle row
+        sits in the DB invisible to ``/sessions`` (filtered) and to
+        ``/continue`` (no ``claude_session_id``) and never finalizes; the
+        sweep flips it to ``crashed`` so the DB stays self-cleaning.
+
+        Returns the number of rows reconciled (running + idle). Idempotent:
+        a second call on an already-clean DB returns ``0``. Logs one
+        structured line per row so operators can audit the cleanup.
         """
         reconciled = 0
         now = datetime.now(UTC)
         async with self._db_factory() as db:
-            rows = (
+            running_rows = (
                 await db.scalars(
                     select(Session).where(Session.status == SessionStatus.RUNNING.value),
                 )
             ).all()
-            for row in rows:
+            for row in running_rows:
                 row.status = SessionStatus.CRASHED.value
                 row.exit_reason = "bot restart"
                 row.ended_at = now
@@ -570,6 +577,23 @@ class SessionManager:
                     "session_manager.orphan_reconciled",
                     session_id=str(row.id),
                     started_at=str(row.started_at),
+                    prior_status=SessionStatus.RUNNING.value,
+                )
+                reconciled += 1
+            idle_rows = (
+                await db.scalars(
+                    select(Session).where(Session.status == SessionStatus.IDLE.value),
+                )
+            ).all()
+            for row in idle_rows:
+                row.status = SessionStatus.CRASHED.value
+                row.exit_reason = "bot restart while initialising"
+                row.ended_at = now
+                log.info(
+                    "session_manager.orphan_reconciled",
+                    session_id=str(row.id),
+                    started_at=str(row.started_at),
+                    prior_status=SessionStatus.IDLE.value,
                 )
                 reconciled += 1
             if reconciled:
@@ -1065,20 +1089,38 @@ class SessionManager:
         session_id: uuid.UUID,
         claude_session_id: str,
     ) -> None:
-        """Fire-and-forget single-shot persistence of Claude's ``session_id``.
+        """Persist Claude's session id AND flip status ``idle`` -> ``running``.
 
-        Mirrors :meth:`_update_last_event_at`: opens a fresh DB session via
-        ``self._db_factory()``, loads the row, sets ``claude_session_id``, and
-        commits. Failures are logged via :func:`log.exception` and never
-        re-raised — losing this write is non-fatal (``/continue`` will fall
-        back to ``NoPriorSessionError`` for that row, same as a legacy NULL).
+        Single-UPDATE atomic: the same row write sets ``claude_session_id``
+        and advances ``status`` from ``idle`` to ``running``. Defensive
+        in-Python guard: if the row's status has already advanced past
+        ``idle`` (e.g. orphan-reconciled to ``crashed`` after a process
+        restart between INSERT and the first ``SystemInit``), only
+        ``claude_session_id`` is set; ``status`` is left alone. The
+        ``session.status: running`` bus publish is fired AFTER the commit
+        succeeds AND outside the ``async with`` block so subscribers never
+        observe ``running`` while the SQL row is still ``idle``.
+
+        The in-memory ``self._status`` is also flipped to ``RUNNING`` after
+        the publish — but only when the manager still owns the same session
+        and is still in ``IDLE`` (race guard for a teardown that beat us
+        here).
+
+        Failures are logged via :func:`log.exception` and never re-raised —
+        losing this write is non-fatal (``/continue`` will skip the NULL
+        row on the no-prefix path; the row is also filtered out of
+        ``/sessions``).
         """
+        publish_running = False
         try:
             async with self._db_factory() as db:
                 row = await db.scalar(select(Session).where(Session.id == session_id))
                 if row is None:
                     return
                 row.claude_session_id = claude_session_id
+                if row.status == SessionStatus.IDLE.value:
+                    row.status = SessionStatus.RUNNING.value
+                    publish_running = True
                 await db.commit()
         except Exception:
             log.exception(
@@ -1086,6 +1128,18 @@ class SessionManager:
                 session_id=str(session_id),
                 claude_session_id=claude_session_id,
             )
+            return
+        if publish_running:
+            await self._bus.publish(
+                "session.status",
+                {
+                    "session_id": session_id,
+                    "status": SessionStatus.RUNNING,
+                    "ts": datetime.now(UTC),
+                },
+            )
+            if self._session_id == session_id and self._status == SessionStatus.IDLE:
+                self._status = SessionStatus.RUNNING
 
     async def _await_exit(self) -> None:
         """Wait for the subprocess to exit; decide final status."""
@@ -1184,10 +1238,14 @@ class SessionManager:
             truncated_prompt = None
         try:
             async with self._db_factory() as db:
+                # CCR-044: rows are inserted ``idle`` with
+                # ``claude_session_id IS NULL``; ``_update_claude_session_id``
+                # flips them to ``running`` in a single atomic UPDATE on the
+                # first observed ``SystemInit`` event.
                 row = Session(
                     id=session_id,
                     started_at=started_at,
-                    status=SessionStatus.RUNNING.value,
+                    status=SessionStatus.IDLE.value,
                     started_by_tg_user_id=started_by_tg_user_id,
                     first_prompt=truncated_prompt,
                 )
@@ -1264,6 +1322,13 @@ class SessionManager:
         ``claude_session_id`` is stored as a Python ``str`` (UUID-formatted)
         per CCR-036, so the slice is ``value[:8]`` — do NOT call ``.hex[:8]``
         (that is only valid for the local ``uuid.UUID`` ``Session.id``).
+
+        CCR-044: ``idle`` rows are excluded by the ``_RESUMABLE_STATUSES``
+        filter, not by the ``claude_session_id IS NOT NULL`` predicate;
+        both conditions hold in parallel by construction (an ``idle`` row
+        has ``claude_session_id IS NULL`` because the SystemInit-driven
+        UPDATE that populates the column is the same UPDATE that flips
+        ``status`` away from ``idle``).
         """
         async with self._db_factory() as db:
             rows = (
@@ -1296,8 +1361,16 @@ class SessionManager:
         ended_at: datetime,
         exit_reason: str | None,
     ) -> None:
-        if status == SessionStatus.IDLE:  # pragma: no cover — guard
-            message = "IDLE is in-memory only and must not be written to Session.status."
+        # CCR-044: ``finalize`` writes ``ended_at`` + ``exit_reason`` and
+        # always lands a terminal status. ``IDLE`` is a transient lifecycle
+        # state — it is written by ``_db_insert_session`` and overwritten
+        # by ``_update_claude_session_id`` (-> ``running``), then
+        # eventually replaced with a terminal status here. Calling
+        # ``_db_finalize_session`` with ``IDLE`` is a programming error;
+        # ``reconcile_orphans`` is the right place to convert orphaned
+        # idle rows into ``crashed``.
+        if status == SessionStatus.IDLE:
+            message = "finalize must be called with a terminal status, never idle."
             raise ValueError(message)
         try:
             async with self._db_factory() as db:

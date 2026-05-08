@@ -214,7 +214,22 @@ async def cmd_pid(
     msg: Message,
     session_manager: SessionManager,
 ) -> None:
-    """Reply with the current session id, subprocess pid, and uptime."""
+    """Reply with the current session id, subprocess pid, and uptime.
+
+    CCR-044: the "No active session." branch covers two cases that look
+    identical from the user's perspective:
+
+    1. No subprocess is held — ``info()`` returns ``status=IDLE`` with
+       every other field ``None``.
+    2. A subprocess is held but ``SystemInit`` has not yet fired —
+       ``info()`` returns ``status=IDLE`` with a non-``None`` ``session_id``
+       / ``pid`` / ``started_at``.
+
+    Both reach the same reply because Claude is not yet usable from the
+    user's perspective in case (2); presenting it as "running" would be
+    misleading. CCR-043's ``/rename current`` is the only command that
+    distinguishes the two states.
+    """
     inf = await session_manager.info()
     if inf.get("status") == SessionStatus.IDLE or inf.get("session_id") is None:
         await msg.answer("No active session.")
@@ -295,6 +310,12 @@ async def cmd_sessions(
     Replies with the stable empty-state string ``"(no sessions)"`` when the
     DB has no rows. The body is chunked through :func:`chunk_text` so very
     long listings stay below Telegram's 4096-char limit.
+
+    CCR-044: rows with ``status='idle'`` are filtered out at the SQL layer
+    — they have not yet acquired a ``claude_session_id`` and are not
+    addressable via ``/continue`` / ``/rename``. The filter sits in the
+    ``WHERE`` clause so ``_SESSIONS_LIMIT=20`` continues to bound 20
+    displayed rows, never "20 candidates of which some get skipped".
     """
     user: PairedUser | None = None
     async with db_factory() as db:
@@ -306,7 +327,10 @@ async def cmd_sessions(
             ).first()
         rows = (
             await db.scalars(
-                select(Session).order_by(Session.started_at.desc()).limit(_SESSIONS_LIMIT),
+                select(Session)
+                .where(Session.status != SessionStatus.IDLE.value)
+                .order_by(Session.started_at.desc())
+                .limit(_SESSIONS_LIMIT),
             )
         ).all()
         starter_ids = {
@@ -352,6 +376,16 @@ def _format_session_row(
         # cannot resolve. This is the alignment invariant: every 8-hex
         # prefix shown is matchable; the marker is the only "non-prefix"
         # value the slot can hold.
+        #
+        # CCR-044: this marker is now a legacy-only artefact. Going-forward
+        # ``/new`` rows are inserted ``status='idle'`` and remain idle until
+        # ``_update_claude_session_id`` lands a non-NULL ``claude_session_id``
+        # in the same UPDATE that flips ``status`` to ``'running'``; the
+        # ``cmd_sessions`` query filter excludes ``idle`` rows entirely. The
+        # only NULL rows that reach this branch are pre-CCR-044 legacy
+        # rows whose terminal status is ``stopped`` / ``completed`` /
+        # ``crashed`` and whose ``_update_claude_session_id`` write never
+        # landed before the row finalised.
         session_id_label = _NULL_CLAUDE_SESSION_ID_MARKER
     status = html.escape(row.status)
     name_display = _UNNAMED_PLACEHOLDER if row.name is None else html.escape(row.name)

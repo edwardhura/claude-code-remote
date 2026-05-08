@@ -94,8 +94,16 @@ class Session(Base):
 
     Events are NOT stored here — they live as JSONL under
     ``data/logs/<session_id>.jsonl``. ``last_event_at`` powers viewer "stuck"
-    detection; ``status`` is a string enum {`running`, `completed`,
-    `stopped`, `crashed`}.
+    detection; ``status`` is a string enum
+    {`idle`, `running`, `completed`, `stopped`, `crashed`}.
+
+    Lifecycle (CCR-044): a fresh ``/new`` inserts ``status='idle'`` with
+    ``claude_session_id IS NULL``; the same fire-and-forget task that
+    persists ``claude_session_id`` from the first ``SystemInit`` event flips
+    ``status`` to ``'running'`` in one atomic UPDATE. ``_db_finalize_session``
+    and ``reconcile_orphans`` write the terminal states. Imports (via
+    :func:`ccr.claude.import_session.import_claude_session`) bypass ``idle``
+    and insert directly with ``status='stopped'``.
     """
 
     __tablename__ = "sessions"

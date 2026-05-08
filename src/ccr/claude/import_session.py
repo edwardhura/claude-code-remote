@@ -229,6 +229,10 @@ async def import_claude_session(
     if existing is not None:
         raise DuplicateClaudeSessionError(claude_session_id)
 
+    # CCR-044: imported sessions never pass through ``idle`` — they arrive
+    # with a non-NULL ``claude_session_id`` and a known terminal lifetime,
+    # so they go straight to ``stopped``. ``idle`` is reserved for fresh
+    # ``/new`` rows whose Claude id is still unknown.
     row = Session(
         started_at=started_at,
         status=SessionStatus.STOPPED.value,
