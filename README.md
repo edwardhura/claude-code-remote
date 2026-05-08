@@ -18,11 +18,13 @@ Only paired users can run any of these except `/start`. Plain text (no leading `
 | --- | --- |
 | `/new` | Start a fresh Claude session (no initial prompt). |
 | `/stop` | Stop the active session. Idempotent on idle. |
-| `/continue [<id8>]` | Resume the most recent finished session, or the one whose id starts with the 8-hex prefix. |
+| `/continue [<id8>]` | Resume the most recent finished session, or the one whose `claude_session_id[:8]` matches the prefix shown in `/sessions`. |
 | `/clear` | Stop the active session, post a "new session" divider, then start a fresh one. |
 | `/pid` | Show the active session's id, OS pid, and uptime. |
-| `/sessions` | List the most recent 20 sessions (newest first). |
-| `/answer <id8> <text>` | Reply to a free-text `AskUserQuestion` by 8-hex prefix. Inline-button questions are answered by tapping. |
+| `/sessions` | List the most recent 20 sessions (newest first). Sessions still initialising (`[idle]` — no `claude_session_id` yet) are filtered out. |
+| `/rename <id8> <name>` | Rename the session whose `claude_session_id[:8]` matches the prefix. When the prefix matches a resume chain, every row in the chain is renamed in one commit. |
+| `/rename current <name>` | Rename the active session's chain without typing the prefix. Replies with a stable error if no session is active or the active session is still in `[idle]`. |
+| `/answer <id8> <text>` | Reply to a free-text `AskUserQuestion` by 8-hex prefix (the question's `tool_use_id`, not a session id). Inline-button questions are answered by tapping. |
 
 ### Pairing
 
