@@ -6,7 +6,7 @@ Self-hosted Telegram bot that turns your phone into a remote control for a local
 
 Pre-release. The architecture and phased build plan live in [`claude-code-remote-plan.md`](claude-code-remote-plan.md). The active ticket queue is in [`BACKLOG.md`](BACKLOG.md); finished and closed tickets archive to [`DONE.md`](DONE.md).
 
-The chat-bot loop is functional today: pairing, session lifecycle (`/new`, `/stop`, `/clear`, `/continue`), structured event broadcast, MCP-driven inline permission prompts, AskUserQuestion replies, slash-command passthrough, and `/cost` / `/usage` summaries. The web viewer, the localhost preview proxy, and the `/view` / `/last` / `/preview` URL-minting commands are scoped in CCR-012 – CCR-015 and not yet implemented.
+The chat-bot loop is functional today: pairing, session lifecycle (`/new`, `/stop`, `/continue`), structured event broadcast, MCP-driven inline permission prompts, AskUserQuestion replies, slash-command passthrough, and `/cost` / `/usage` summaries. The web viewer, the localhost preview proxy, and the `/view` / `/last` / `/preview` URL-minting commands are scoped in CCR-012 – CCR-015 and not yet implemented.
 
 ## Bot commands
 
@@ -16,10 +16,9 @@ Only paired users can run any of these except `/start`. Plain text (no leading `
 
 | Command | Effect |
 | --- | --- |
-| `/new` | Start a fresh Claude session (no initial prompt). |
+| `/new` | Start a fresh Claude session (no initial prompt). If a session is running, stop it, broadcast a "— — — new session — — —" divider to all paired chats, then start fresh; idle clears stay quiet (no divider). |
 | `/stop` | Stop the active session. Idempotent on idle. |
 | `/continue [<id8>]` | Resume the most recent finished session, or the one whose `claude_session_id[:8]` matches the prefix shown in `/sessions`. |
-| `/clear` | Stop the active session, post a "new session" divider, then start a fresh one. |
 | `/pid` | Show the active session's id, OS pid, and uptime. |
 | `/sessions` | List the most recent 20 sessions (newest first). Sessions still initialising (`[idle]` — no `claude_session_id` yet) are filtered out. |
 | `/rename <id8> <name>` | Rename the session whose `claude_session_id[:8]` matches the prefix. When the prefix matches a resume chain, every row in the chain is renamed in one commit. |

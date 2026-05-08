@@ -1,4 +1,4 @@
-"""Session lifecycle handlers — `/new`, `/stop`, `/clear`, `/who`, plain text.
+"""Session lifecycle handlers — `/new`, `/stop`, `/who`, plain text.
 
 The :class:`SessionManager` and the DB factory are passed in via aiogram
 workflow data (``dp["session_manager"] = ...`` etc.) so handlers stay free
@@ -96,11 +96,29 @@ def _format_uptime(started_at: datetime) -> str:
 async def cmd_new(
     msg: Message,
     session_manager: SessionManager,
-    db_factory: async_sessionmaker[AsyncSession],  # noqa: ARG001 — kept for parity with siblings
+    db_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Start a fresh Claude session with no initial prompt."""
+    """Start a fresh Claude session with no initial prompt.
+
+    CCR-047: ``/clear`` collapsed into ``/new``. When a running session is
+    being replaced, broadcast a ``— — — new session — — —`` divider to all
+    paired chats so the boundary is visible. The broadcast is gated on
+    ``prior_status != IDLE`` (read before :meth:`SessionManager.stop`) so a
+    ``/new`` from a clean state does not drop a misleading boundary into
+    chat. The explicit stop+broadcast happens before
+    :meth:`SessionManager.new_session` so the new session's first events
+    land *after* the divider in chat order.
+    """
     if msg.from_user is None:
         return
+
+    prior_status = await session_manager.status()
+    if prior_status != SessionStatus.IDLE:
+        await session_manager.stop()
+        if msg.bot is not None:
+            async with db_factory() as db:
+                await broadcast_paired(msg.bot, db, _DIVIDER_MESSAGE)
+
     try:
         await session_manager.new_session(
             prompt=None,
@@ -121,12 +139,24 @@ async def cmd_stop(
 ) -> None:
     """Stop the active session, or report idle when there's nothing to stop.
 
-    :meth:`SessionManager.stop` is itself idempotent (no-op on idle), so we
-    look up the status before calling so we can produce the documented
-    "No active session." reply on the idle path.
+    CCR-046: ``/stop`` is intentionally no-arg. The single-session invariant
+    means there is at most one active session globally, and non-active
+    sessions are already stopped — a hypothetical ``/stop <prefix>`` arg
+    would always either target the active session (redundant with the
+    no-arg form) or return "already stopped" noise. ``claude_session_id``
+    rekeying is therefore a no-op for ``/stop``: there is no session-
+    reference argument to rekey. See the BRIEF for the audit table.
+
+    With CCR-044's ``[idle]`` lifecycle, ``/stop`` must work whether the
+    active subprocess is still in the pre-``SystemInit`` ``[idle]`` window
+    or has reached ``[running]``. The discriminator for "is there a
+    subprocess to stop" is :func:`SessionManager.info`'s ``session_id``
+    field — non-``None`` means the manager holds a subprocess. We do NOT
+    use ``status() == IDLE`` here because after CCR-044 that is also true
+    in the held-but-pre-init window.
     """
-    status = await session_manager.status()
-    if status == SessionStatus.IDLE:
+    inf = await session_manager.info()
+    if inf.get("session_id") is None:
         await msg.answer("No active session.")
         return
     await session_manager.stop()
@@ -176,43 +206,6 @@ async def cmd_continue(
     inf = await session_manager.info()
     pid = inf.get("pid")
     await msg.answer(f"Session resumed (pid {pid}).")
-
-
-@router.message(Command("clear"))
-async def cmd_clear(
-    msg: Message,
-    session_manager: SessionManager,
-    db_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    """Stop any running session, post a divider, then start a fresh empty one.
-
-    The divider broadcast is gated on ``prior_status != IDLE`` (read before
-    :meth:`SessionManager.stop`) so a ``/clear`` from a clean state does not
-    drop a misleading "new session" boundary into chat with nothing above it.
-    The broadcast is sent before :meth:`SessionManager.new_session` so the new
-    session's first events land *after* the divider in chat order.
-    """
-    if msg.from_user is None:
-        return
-
-    prior_status = await session_manager.status()
-    await session_manager.stop()
-
-    if prior_status != SessionStatus.IDLE and msg.bot is not None:
-        async with db_factory() as db:
-            await broadcast_paired(msg.bot, db, _DIVIDER_MESSAGE)
-
-    try:
-        await session_manager.new_session(
-            prompt=None,
-            started_by_tg_user_id=msg.from_user.id,
-        )
-    except SessionError as exc:
-        await msg.answer(html.escape(str(exc)))
-        return
-    inf = await session_manager.info()
-    pid = inf.get("pid")
-    await msg.answer(f"New session started (pid {pid}).")
 
 
 @router.message(Command("pid"))

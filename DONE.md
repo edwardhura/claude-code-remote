@@ -1545,4 +1545,80 @@ Notes:
   - 2026-05-08 team-lead: scope brief issued (no architect), dispatching python-developer
   - 2026-05-08 team-lead: BRIEF/CONTEXT refreshed, dispatching reviewer
   - 2026-05-08 team-lead: approved
+
+---
+
+## CCR-046: Rekey `/stop` and remaining session-reference commands to `claude_session_id[:8]`; audit residual surfaces [done]
+Phase: n/a (post-CCR-044 chat-bot command alignment; part of the claude_session_id-alignment slice)
+Feature: chat-bot
+Files:
+  - `src/ccr/bot/handlers/session.py` — `cmd_stop` (around line 112-130): today `/stop` takes no argument and stops whatever the manager's active session is (single-session invariant). The user wants it to "work the same with claude session id" — interpreted as: `/stop` continues to work with no argument (stops the active session), AND optionally accepts a `<claude-id-prefix>` argument that targets a row by its `claude_session_id[:8]`. If the prefix matches the currently-running session, stop it; if the prefix matches a NON-active session, the reply is a stable "session is not the active session" error (we do not stop arbitrary historical rows — they are already stopped). If the prefix matches no row, stable unknown-prefix error. With CCR-044's `[idle]` lifecycle, `/stop` on the active session works whether the session is idle or running.
+    - Alternative interpretation if developer/team-lead disagrees: the no-arg `/stop` is unchanged and "rekey to claude_session_id" is a no-op for `/stop` because it never accepted an argument. In that case, the ticket's `/stop` work reduces to confirming no local-UUID surfaces leak in the reply strings (cross-checked with CCR-045) and documenting in the BRIEF that `/stop` is single-session-invariant-only. **Flag the choice in the developer's BRIEF update note so team-lead can record it.**
+  - `src/ccr/bot/handlers/session.py` — audit ALL remaining bot commands for session-reference arguments and confirm each is rekeyed onto `claude_session_id[:8]` or explicitly does not take a session reference. Today's command list per chat-bot BRIEF: `/start`, `/new`, `/stop`, `/clear`, `/who`, `/pid`, `/sessions`, `/continue`, `/rename`, `/answer`, `/agents`, `/skills`, `/cost`, `/usage`, `/config`, `/model`, `/compact`, plus the `/mcp` / `/init` redirects. Per-command audit checklist:
+    - `/continue <prefix>` — rekeyed in CCR-042 (done, no work).
+    - `/sessions` — listing rekeyed in CCR-042 (done, no work).
+    - `/rename <prefix> <new-name>` and `/rename current <new-name>` — handled by CCR-043 rework.
+    - `/answer <id8> <text>` — `<id8>` is the AskUserQuestion `tool_use_id` prefix, NOT a session reference. No change. Document in the BRIEF that this id8 is intentionally a different namespace.
+    - `/start`, `/new`, `/clear`, `/who`, `/pid`, `/agents`, `/skills`, `/cost`, `/usage`, `/config`, `/model`, `/compact` — none currently take a session-reference argument. Confirm and document.
+    - `/stop` — see above.
+    - The list of any other command that takes a session reference must be enumerated and either rekeyed in this ticket or split into a follow-up ticket with a clear rationale.
+  - `tests/test_bot_session_handlers.py` (and `tests/test_bot_session.py`) — add `/stop` tests for the chosen semantics: (a) no-arg `/stop` continues to work (active session, both `[idle]` and `[running]` states from CCR-044); (b) IF the developer/team-lead chooses the prefix-arg variant: `/stop <claude-id-prefix>` matching the active session stops it, matching a non-active row replies with a stable error, matching no row replies with a stable unknown-prefix error.
+Out of scope:
+  - Status-lifecycle changes (handled by CCR-044).
+  - Chat-output cleanup (handled by CCR-045).
+  - `/rename` rework (handled by CCR-043 rework).
+  - Web viewer / SSE routes (use `Session.id` UUID via path params; those are not chat command surfaces).
+Acceptance:
+  - [x] `/stop` audit completed and documented: either the no-arg form is preserved as-is (with a BRIEF entry noting `/stop` is single-session-invariant-only and takes no session reference), or `/stop <claude-id-prefix>` is added with the prefix matched against `claude_session_id[:8]` and the three reply branches above implemented.
+  - [x] No-arg `/stop` continues to work and stops the active session in both `[idle]` and `[running]` states (CCR-044 lifecycle).
+  - [x] An audit of every bot command listed in the chat-bot BRIEF is documented in the developer's BRIEF update note: each command is either rekeyed onto `claude_session_id[:8]` already (or in this ticket), or explicitly noted as taking no session reference, or split into a follow-up ticket.
+  - [x] No bot command (other than `/answer`, whose id8 is a `tool_use_id` not a session reference) accepts a local-UUID prefix as an argument anywhere.
+  - [x] `pytest --cov=ccr --cov-fail-under=80` passes.
+  - [x] `ruff check src tests` passes.
+  - [x] `ruff format --check` passes.
+  - [x] `mypy src` passes.
+Depends on: CCR-044
+Notes:
+  **Why depends on CCR-044:** the `[idle]` lifecycle state changes what "active session" means for `/stop` (today an idle session is not in the DB; after CCR-044 it is). The audit and tests for `/stop` need that lifecycle settled.
+  **Why no dep on CCR-042:** CCR-042 already rekeyed `/continue` and `/sessions`; this ticket extends the same pattern to anything left over. The audit step is the load-bearing deliverable — the user wants confidence that EVERY command surface is aligned, not just `/stop`.
+  Mode 1A note for team-lead: skip the architect — small scope, primarily an audit + a single-handler change. The audit's output (the documented per-command list in the dev report) is what the BRIEF refresh consumes. Reviewer focus: the audit is complete and any "split into a follow-up ticket" decision is supported by clear reasoning rather than a punt.
+
+### Review log
+  - 2026-05-07 project-manager: filed — `/stop` rekey + audit residual session-reference surfaces; user explicitly called out `/stop` and asked for confidence that all commands are aligned
+  - 2026-05-08 main: branch ccr-046-stop-audit created, dispatching team-lead
+  - 2026-05-08 team-lead: scope brief issued (no architect), dispatching python-developer
+  - 2026-05-08 team-lead: BRIEF/CONTEXT refreshed, dispatching reviewer
+  - 2026-05-08 team-lead: approved
   - 2026-05-08 team-lead: approved with two LOW findings noted; F2 (BRIEF drift — "ambiguous-prefix" in cmd_rename entry) fixed inline; F1 (dead constant _RENAME_AMBIGUOUS_REPLY in session.py:72) deferred — non-blocking, follow-up cleanup welcome in CCR-045 or a standalone micro-ticket
+
+---
+
+## CCR-047: Collapse /clear into /new (drop /clear; /new now owns the divider broadcast) [done]
+Phase: n/a (post-CCR-046 chat-bot UX cleanup; user-driven during CCR-046 PR review)
+Feature: chat-bot
+Files:
+  - `src/ccr/bot/handlers/session.py` — drop `cmd_clear`; fold its divider-broadcast logic (gated on `prior_status != IDLE`) into `cmd_new`. Module docstring updated.
+  - `src/ccr/bot/handlers/passthrough.py` — drop `/clear` from `_UNKNOWN_USAGE_HINT` whitelist string.
+  - `tests/test_bot_session.py` — drop `cmd_clear` import; migrate four `test_cmd_clear_*` tests onto `cmd_new` (`test_cmd_new_running_stops_then_starts_fresh_with_divider`, `test_cmd_new_idle_skips_divider`, `test_cmd_new_swallows_broadcast_failures`, `test_cmd_new_no_paired_users_with_chat_id_completes`).
+  - `tests/test_bot_passthrough.py` — update `test_unknown_command_returns_usage` expected string.
+  - `README.md` — drop `/clear` from intro paragraph and from the Session-control command table; expand `/new` row to record the new divider behaviour.
+  - `docs/chat-bot/BRIEF.md` — Public surface drops `cmd_clear`; key invariant rephrased to `/new` divider; subtleties + commands-list strike `/clear`; CCR-046 audit table marks `/clear` as REMOVED.
+  - `docs/chat-bot/CONTEXT.md` — Files entry rewritten without `/clear`; change-history entry appended.
+Out of scope:
+  - Telegram bot menu registration (we don't currently register a `BotCommand` set; nothing to change).
+  - Any change to `/new`'s behaviour when no session is running (still silent, no divider).
+Acceptance:
+  - [x] `cmd_clear` removed from `src/ccr/bot/handlers/session.py`; `/clear` no longer registered as a Telegram command.
+  - [x] `cmd_new` posts the `— — — new session — — —` divider to all paired chats when `prior_status != IDLE`, and stays silent when `prior_status == IDLE`.
+  - [x] All four prior `cmd_clear` test scenarios are migrated onto `cmd_new` and assert the same expected behaviour.
+  - [x] Whitelist hint in `_UNKNOWN_USAGE_HINT` no longer mentions `/clear`.
+  - [x] README + BRIEF + CONTEXT all updated; no remaining `/clear` mentions in user-facing docs (`grep -rn "/clear" README.md docs/chat-bot/` returns 0 matches).
+  - [x] `pytest --cov=ccr --cov-fail-under=80` passes (505/505, 89.38%).
+  - [x] `ruff check src tests`, `ruff format --check`, `mypy src` all clean.
+Depends on: CCR-046
+Notes:
+  Filed and shipped during the CCR-046 PR review. The user observed (and prior code confirmed) that `/new` and `/clear` had identical subprocess effects — both silently stopped any running session and started a fresh one — and the only difference was the chat divider. Collapsing them removes a duplicate command surface and simplifies the user mental model. Bundled into the CCR-046 PR as a second commit on the same branch (`ccr-046-stop-audit`) per user request.
+
+### Review log
+  - 2026-05-09 main: filed and implemented inline during CCR-046 PR review per user request; bundled as a second commit on the same branch
+  - 2026-05-09 main: closed — pytest 505 passed, 89.38% coverage; ruff/mypy clean; user explicitly authorised bundling into CCR-046 PR

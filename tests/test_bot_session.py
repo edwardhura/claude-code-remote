@@ -28,7 +28,6 @@ from ccr.auth.pairing import approve, create_code
 from ccr.bot.handlers.session import (
     _DIVIDER_MESSAGE,
     _RENAME_USAGE_HINT,
-    cmd_clear,
     cmd_new,
     cmd_pid,
     cmd_rename,
@@ -118,7 +117,16 @@ _DEFAULT_SESSION_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
 
 
 class FakeManager:
-    """Stub :class:`SessionManager` exposing only the surface the handlers use."""
+    """Stub :class:`SessionManager` exposing only the surface the handlers use.
+
+    The default ``subprocess_held`` mirrors the legacy "subprocess held iff
+    status != IDLE" coupling — every existing call site gets the same
+    behaviour as before. Pass ``subprocess_held=True`` together with
+    ``status=SessionStatus.IDLE`` to model the CCR-044 ``[idle]`` window
+    where ``new_session`` has acquired a subprocess but ``SystemInit`` has
+    not yet fired (so :meth:`info` returns a non-``None`` ``session_id``
+    while ``status`` is still ``IDLE``).
+    """
 
     def __init__(
         self,
@@ -127,11 +135,15 @@ class FakeManager:
         pid: int | None = 4242,
         started_at: datetime | None = None,
         session_id: uuid.UUID = _DEFAULT_SESSION_ID,
+        subprocess_held: bool | None = None,
     ) -> None:
         self._status = status
         self._pid = pid
         self._session_id = session_id
         self._started_at = started_at if started_at is not None else datetime.now(UTC)
+        self._subprocess_held = (
+            subprocess_held if subprocess_held is not None else status != SessionStatus.IDLE
+        )
         self.new_session = AsyncMock()
         self.send = AsyncMock()
         self.stop = AsyncMock()
@@ -142,7 +154,7 @@ class FakeManager:
         return self._status
 
     async def info(self) -> dict[str, object]:
-        if self._status == SessionStatus.IDLE:
+        if not self._subprocess_held:
             return {
                 "session_id": None,
                 "pid": None,
@@ -158,6 +170,8 @@ class FakeManager:
 
     def set_status(self, status: SessionStatus) -> None:
         self._status = status
+        if status != SessionStatus.IDLE:
+            self._subprocess_held = True
 
 
 # --------------------------------------------------------------------------- #
@@ -208,7 +222,14 @@ async def test_cmd_new_reports_session_error(
 # --------------------------------------------------------------------------- #
 
 
-async def test_cmd_stop_on_idle_replies_no_active_session() -> None:
+async def test_cmd_stop_on_idle_no_subprocess_replies_no_active_session() -> None:
+    """No-arg ``/stop`` with no subprocess held → "No active session." reply.
+
+    CCR-046: the discriminator for "is there a subprocess to stop" is
+    :meth:`SessionManager.info`'s ``session_id`` field, not ``status()``.
+    Here ``subprocess_held=False`` → ``info()['session_id'] is None`` →
+    the no-active-session branch.
+    """
     manager = FakeManager(status=SessionStatus.IDLE)
     msg = _make_message(text="/stop")
 
@@ -216,6 +237,27 @@ async def test_cmd_stop_on_idle_replies_no_active_session() -> None:
 
     manager.stop.assert_not_called()
     msg.answer.assert_awaited_once_with("No active session.")
+
+
+async def test_cmd_stop_in_idle_window_with_subprocess_held_stops_session() -> None:
+    """CCR-046 + CCR-044: ``/stop`` works in the pre-``SystemInit`` ``[idle]`` window.
+
+    A subprocess is held (``info()['session_id']`` is not ``None``) but the
+    in-memory status is still ``IDLE`` because ``SystemInit`` has not fired
+    yet. The handler must stop the subprocess — using ``status() == IDLE``
+    as the no-active-session discriminator (the pre-CCR-046 logic) would
+    incorrectly skip ``stop()`` and reply "No active session."
+    """
+    manager = FakeManager(
+        status=SessionStatus.IDLE,
+        subprocess_held=True,
+    )
+    msg = _make_message(text="/stop")
+
+    await cmd_stop(msg, session_manager=manager)
+
+    manager.stop.assert_awaited_once_with()
+    msg.answer.assert_awaited_once_with("Session stopped.")
 
 
 async def test_cmd_stop_on_running_calls_stop_and_replies() -> None:
@@ -229,13 +271,15 @@ async def test_cmd_stop_on_running_calls_stop_and_replies() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# /clear
+# /new — divider behaviour (CCR-047: /clear collapsed into /new)
 # --------------------------------------------------------------------------- #
 
 
-async def test_cmd_clear_stops_then_starts_fresh(
+async def test_cmd_new_running_stops_then_starts_fresh_with_divider(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    """CCR-047: ``/new`` over a running session stops it, posts the divider,
+    then starts fresh."""
     manager = FakeManager(status=SessionStatus.RUNNING, pid=9999)
     await _seed_paired_user(
         session_factory,
@@ -246,15 +290,14 @@ async def test_cmd_clear_stops_then_starts_fresh(
     await _seed_paired_user(session_factory, tg_user_id=2, last_chat_id=1002)
     bot_mock = AsyncMock()
     bot_mock.send_message = AsyncMock()
-    msg = _make_message(text="/clear", user_id=7, bot=bot_mock)
+    msg = _make_message(text="/new", user_id=7, bot=bot_mock)
 
-    await cmd_clear(msg, session_manager=manager, db_factory=session_factory)
+    await cmd_new(msg, session_manager=manager, db_factory=session_factory)
 
     manager.stop.assert_awaited_once_with()
     manager.new_session.assert_awaited_once_with(prompt=None, started_by_tg_user_id=7)
     msg.answer.assert_awaited_once()
     reply = msg.answer.await_args.args[0]
-    # CCR-045: ``/clear`` mirrors ``/new`` — pid only, no UUID prefix.
     assert reply == "New session started (pid 9999)."
     assert re.search(r"\(pid \d+\)", reply) is not None
     assert "11111111" not in reply
@@ -266,9 +309,10 @@ async def test_cmd_clear_stops_then_starts_fresh(
         assert call.args[1] == _DIVIDER_MESSAGE
 
 
-async def test_cmd_clear_idle_skips_divider(
+async def test_cmd_new_idle_skips_divider(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    """CCR-047: ``/new`` from a clean (IDLE) state posts no divider."""
     manager = FakeManager(status=SessionStatus.IDLE)
     await _seed_paired_user(
         session_factory,
@@ -287,20 +331,22 @@ async def test_cmd_clear_idle_skips_divider(
 
     bot_mock = AsyncMock()
     bot_mock.send_message = AsyncMock()
-    msg = _make_message(text="/clear", user_id=7, bot=bot_mock)
+    msg = _make_message(text="/new", user_id=7, bot=bot_mock)
 
-    await cmd_clear(msg, session_manager=manager, db_factory=session_factory)
+    await cmd_new(msg, session_manager=manager, db_factory=session_factory)
 
     bot_mock.send_message.assert_not_awaited()
+    manager.stop.assert_not_awaited()
     manager.new_session.assert_awaited_once_with(prompt=None, started_by_tg_user_id=7)
     msg.answer.assert_awaited_once()
     reply = msg.answer.await_args.args[0]
     assert "started" in reply
 
 
-async def test_cmd_clear_swallows_broadcast_failures(
+async def test_cmd_new_swallows_broadcast_failures(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    """CCR-047: a paired user with a broken chat does not break the divider broadcast."""
     manager = FakeManager(status=SessionStatus.RUNNING, pid=4321)
     await _seed_paired_user(
         session_factory,
@@ -317,9 +363,9 @@ async def test_cmd_clear_swallows_broadcast_failures(
 
     bot_mock = AsyncMock()
     bot_mock.send_message = AsyncMock(side_effect=_send)
-    msg = _make_message(text="/clear", user_id=7, bot=bot_mock)
+    msg = _make_message(text="/new", user_id=7, bot=bot_mock)
 
-    await cmd_clear(msg, session_manager=manager, db_factory=session_factory)
+    await cmd_new(msg, session_manager=manager, db_factory=session_factory)
 
     assert bot_mock.send_message.await_count == 2
     sent_chat_ids = [call.args[0] for call in bot_mock.send_message.await_args_list]
@@ -330,9 +376,10 @@ async def test_cmd_clear_swallows_broadcast_failures(
     assert "started" in reply
 
 
-async def test_cmd_clear_no_paired_users_with_chat_id_completes(
+async def test_cmd_new_no_paired_users_with_chat_id_completes(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    """CCR-047: paired user without ``last_chat_id`` → divider is suppressed for them, /new still completes."""
     manager = FakeManager(status=SessionStatus.RUNNING, pid=5555)
     await _seed_paired_user(
         session_factory,
@@ -342,9 +389,9 @@ async def test_cmd_clear_no_paired_users_with_chat_id_completes(
     )
     bot_mock = AsyncMock()
     bot_mock.send_message = AsyncMock()
-    msg = _make_message(text="/clear", user_id=7, bot=bot_mock)
+    msg = _make_message(text="/new", user_id=7, bot=bot_mock)
 
-    await cmd_clear(msg, session_manager=manager, db_factory=session_factory)
+    await cmd_new(msg, session_manager=manager, db_factory=session_factory)
 
     bot_mock.send_message.assert_not_awaited()
     manager.new_session.assert_awaited_once_with(prompt=None, started_by_tg_user_id=7)

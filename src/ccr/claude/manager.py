@@ -439,7 +439,7 @@ class SessionManager:
         vanishingly rare 8-hex collision).
 
         Refuses to silently replace a running session — caller must
-        ``/stop`` or ``/clear`` first. Mints a fresh local UUID and inserts
+        ``/stop`` or ``/new`` first. Mints a fresh local UUID and inserts
         a new :class:`Session` row; spawns a fresh :class:`ClaudeProcess`
         with ``--resume <claude_session_id>`` so Claude Code restores the
         exact conversation captured on the foreign session_id channel.
@@ -458,7 +458,7 @@ class SessionManager:
         """
         async with self._session_lock:
             if self._proc is not None:
-                message = "Session already running. /stop first or /clear to start fresh."
+                message = "Session already running. /stop first or /new to start fresh."
                 raise SessionAlreadyRunningError(message)
 
             claude_session_id = await self._db_lookup_resumable_claude_session_id(

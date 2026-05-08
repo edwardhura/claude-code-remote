@@ -640,7 +640,7 @@ async def test_continue_session_while_running_raises(
 
     with pytest.raises(SessionAlreadyRunningError) as ei:
         await manager.continue_session(started_by_tg_user_id=42)
-    assert str(ei.value) == "Session already running. /stop first or /clear to start fresh."
+    assert str(ei.value) == "Session already running. /stop first or /new to start fresh."
 
     await manager.stop()
 
