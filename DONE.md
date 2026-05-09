@@ -1622,3 +1622,34 @@ Notes:
 ### Review log
   - 2026-05-09 main: filed and implemented inline during CCR-046 PR review per user request; bundled as a second commit on the same branch
   - 2026-05-09 main: closed — pytest 505 passed, 89.38% coverage; ruff/mypy clean; user explicitly authorised bundling into CCR-046 PR
+
+---
+
+## CCR-011: JWT signed-URL token module [done]
+Phase: 10
+Feature: auth
+Files:
+  - `src/ccr/auth/tokens.py`:
+    - `class TokenKind(StrEnum): VIEWER = "viewer"; PREVIEW = "preview"`
+    - `def mint(kind: TokenKind, tg_user_id: int, payload: dict, settings: Settings) -> str`
+    - `def verify(token: str, settings: Settings) -> VerifiedToken` (raises `TokenError`)
+    - `def verify_kind(token, settings, expected: TokenKind) -> VerifiedToken`
+    - Claims: `sub=tg_user_id`, `kind`, `payload`, `iat`, `exp`, `jti`
+  - `tests/test_tokens.py` — mint then verify; expired token rejected (TTL = 1800 default); tampered signature rejected; wrong kind rejected.
+Out of scope:
+  - HTTP layer (next phase).
+Acceptance:
+  - [x] `pytest tests/test_tokens.py` passes.
+  - [x] A test asserts a token minted at T=0 with TTL=1800 fails verification at T=1801.
+  - [x] A token with `kind=viewer` fails `verify_kind(..., PREVIEW)` with a clear error.
+  - [x] A test asserts the JWT payload includes `sub`, `kind`, `iat`, `exp`, `jti`.
+Depends on: CCR-003
+Notes:
+  HS256 signing with `JWT_SECRET` from settings (≥ 32 chars enforced in CCR-003). Payload is encoded as inner JSON (e.g. `{"port": 3000}` for preview). Tests use manual `now` injection (`leeway=0`). No DB writes — tokens are stateless. This module is consumed by Phase 11 (web auth handoff) and Phase 13 (`/view`/`/last`/`/preview` URL minting in the bot).
+
+### Review log
+  - 2026-05-01 project-manager: reordered — chat-bot iteration prioritized
+  - 2026-05-09 main: branch ccr-011-jwt-tokens created, dispatching team-lead
+  - 2026-05-09 team-lead: scope brief issued (no architect), dispatching python-developer
+  - 2026-05-09 team-lead: BRIEF/CONTEXT refreshed, dispatching reviewer
+  - 2026-05-09 team-lead: approved
