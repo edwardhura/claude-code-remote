@@ -11,20 +11,28 @@ Owner-controlled pairing and JWT minting. The bot's `/start` and the console REP
 - Pairing codes are 8-char hex with a 5× collision retry on insert; a code is single-use and expires (`used_at IS NULL` + TTL window).
 - All write paths (`approve`, `revoke`, `invite`) commit inline. Read paths (`list_paired`, `list_pending`, `is_paired`, `is_owner`) only read.
 - Soft-revoke: `revoke()` sets `revoked_at`; `is_paired` / `is_owner` filter on `revoked_at IS NULL`.
+- JWT algorithm is locked to HS256 in both directions; `verify` passes `algorithms=["HS256"]` explicitly so `alg: "none"` and asymmetric variants are rejected (with a covering test).
+- Tokens are fully stateless — no DB read or write on `mint` or `verify`. Rotating `JWT_SECRET` invalidates all outstanding tokens at most one TTL window later, by design.
+- Six claims are always emitted: `sub` (str of `tg_user_id`), `kind` (`viewer`/`preview`), `payload` (JSON-string of the dict), `iat`, `exp` (= `iat + token_ttl_seconds`), `jti` (`uuid4`). `verify` rejects tokens missing any of them, with a non-coercible `sub`, with an unknown `kind`, with a non-object `payload`, or with an empty `jti`.
 
 ## Public surface
 - `src/ccr/auth/__init__.py` — re-exports the public pairing + allowlist surface.
 - `src/ccr/auth/pairing.py` — pure async pairing operations: `create_code`, `list_pending`, `list_paired`, `get_owner`, `approve`, `revoke`, `invite`. Functions take an `AsyncSession` first. Domain errors `PairingError`, `CannotRevokeOwnerError`.
 - `src/ccr/auth/allowlist.py` — predicates `is_paired(session, tg_user_id)`, `is_owner(session, tg_user_id)`; both filter on `revoked_at IS NULL`.
 - `src/ccr/cli.py` — wires `pair {list, pending, approve, revoke, invite}` subcommands; opens a fresh `AsyncSession` per command via `Settings()` + `create_engine_from_settings`. Output strings are pinned by tests: `"(empty)"`, `"Approved Telegram user <id> (owner|paired)"`, `"Cannot revoke owner."`.
-- (Planned, CCR-011) `src/ccr/auth/tokens.py` — JWT mint / verify with two `kind`s (`viewer`, `preview`); 30-min TTL; HS256 with secret from `Settings.JWT_SECRET`; `verify_kind(token, kind)` enforces `kind` claim. The web layer consumes this; python-developer owns the file, web-developer reads it.
+- `src/ccr/auth/tokens.py` — JWT mint/verify (HS256, stateless, default 30-min TTL via `Settings.token_ttl_seconds`). Exports `TokenKind` (`viewer`/`preview`), `TokenError`, `VerifiedToken` (frozen dataclass: `kind`, `tg_user_id`, `payload`, `jti`), `mint(kind, tg_user_id, payload, settings, *, _now=None) -> str`, `verify(token, settings) -> VerifiedToken`, `verify_kind(token, settings, expected) -> VerifiedToken`.
+- `src/ccr/auth/__init__.py` — re-exports added for `TokenError`, `TokenKind`, `VerifiedToken`, `mint`, `verify`, `verify_kind` (alphabetised in `__all__` alongside existing pairing/allowlist exports).
 
 ## Subtleties / gotchas
 - The 8-char hex space is small (16⁸ ≈ 4.3B) — collision retry is a real path; tests cover it.
 - `approve` / `revoke` / `invite` commit inline; if a caller has a wrapping transaction, double-commit will raise.
 - `invite` is idempotent: re-inviting an already-paired user no-ops gracefully, returning the existing row.
 - Console REPL and the bot's `/start` flow share the *same* pairing functions — output strings differ but the DB transitions are identical.
-- (Planned, CCR-011) Two JWT kinds are stateless and 30-min TTL. Preview tokens carry `payload.port` which the proxy must check against the URL port — port-mismatch must reject. Never accept `algorithm="none"`. `verify_kind` is what consumers should call, not the bare `verify`.
+- Two JWT kinds are stateless and 30-min TTL. Preview tokens carry `payload.port` which the proxy must check against the URL port — port-mismatch must reject. Never accept `algorithm="none"`. `verify_kind` is what consumers should call, not the bare `verify`.
+- The `payload` claim is the JSON-string of the dict (`json.dumps(payload)`), not a nested JWT object claim. `verify` decodes it back to a dict and rejects non-object decodes (arrays / scalars). Callers should keep `payload` JSON-serializable; non-string-keyed dicts will fail at `mint` time.
+- `mint` accepts a private `_now: int | None = None` keyword as a test seam. Production code must not pass it.
+- `tokens.time` (module-attribute import of `time`) is the seam for expiry tests — `monkeypatch.setattr(tokens.time, "time", ...)` works; switching to `from time import time` would break that.
+- `verify_kind` is what consumers (web `/auth`, proxy port-check, bot `/view`/`/last`/`/preview` URL minters) should call — the bare `verify` does not enforce that the token kind matches the route's expectation.
 
 ## Cross-feature relations
 - depends on: core (`ccr.db.models`, `ccr.db.engine`, `ccr.config.Settings`).
@@ -33,4 +41,4 @@ Owner-controlled pairing and JWT minting. The bot's `/start` and the console REP
 ## Status
 - State: IN PROGRESS
 - Tickets: CCR-004, CCR-011
-- Last updated: CCR-004 (2026-04-26)
+- Last updated: CCR-011 (2026-05-09)

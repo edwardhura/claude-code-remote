@@ -49,32 +49,6 @@ Notes:
 ### Review log
 ---
 
-## CCR-011: JWT signed-URL token module [todo]
-Phase: 10
-Feature: auth
-Files:
-  - `src/ccr/auth/tokens.py`:
-    - `class TokenKind(StrEnum): VIEWER = "viewer"; PREVIEW = "preview"`
-    - `def mint(kind: TokenKind, tg_user_id: int, payload: dict, settings: Settings) -> str`
-    - `def verify(token: str, settings: Settings) -> VerifiedToken` (raises `TokenError`)
-    - `def verify_kind(token, settings, expected: TokenKind) -> VerifiedToken`
-    - Claims: `sub=tg_user_id`, `kind`, `payload`, `iat`, `exp`, `jti`
-  - `tests/test_tokens.py` — mint then verify; expired token rejected (TTL = 1800 default); tampered signature rejected; wrong kind rejected.
-Out of scope:
-  - HTTP layer (next phase).
-Acceptance:
-  - [ ] `pytest tests/test_tokens.py` passes.
-  - [ ] A test asserts a token minted at T=0 with TTL=1800 fails verification at T=1801.
-  - [ ] A token with `kind=viewer` fails `verify_kind(..., PREVIEW)` with a clear error.
-  - [ ] A test asserts the JWT payload includes `sub`, `kind`, `iat`, `exp`, `jti`.
-Depends on: CCR-003
-Notes:
-  HS256 signing with `JWT_SECRET` from settings (≥ 32 chars enforced in CCR-003). Payload is encoded as inner JSON (e.g. `{"port": 3000}` for preview). Tests use manual `now` injection (`leeway=0`). No DB writes — tokens are stateless. This module is consumed by Phase 11 (web auth handoff) and Phase 13 (`/view`/`/last`/`/preview` URL minting in the bot).
-
-### Review log
-  - 2026-05-01 project-manager: reordered — chat-bot iteration prioritized
----
-
 ## CCR-012: Web server, auth handoff, sessions REST + SSE [todo]
 Phase: 11
 Feature: web-viewer

@@ -19,10 +19,21 @@ from ccr.auth.pairing import (
     list_pending,
     revoke,
 )
+from ccr.auth.tokens import (
+    TokenError,
+    TokenKind,
+    VerifiedToken,
+    mint,
+    verify,
+    verify_kind,
+)
 
 __all__ = [
     "CannotRevokeOwnerError",
     "PairingError",
+    "TokenError",
+    "TokenKind",
+    "VerifiedToken",
     "approve",
     "create_code",
     "get_owner",
@@ -31,5 +42,8 @@ __all__ = [
     "is_paired",
     "list_paired",
     "list_pending",
+    "mint",
     "revoke",
+    "verify",
+    "verify_kind",
 ]
