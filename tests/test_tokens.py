@@ -21,13 +21,11 @@ VALID_SECRET = "x" * 64
 
 @pytest.fixture
 def settings() -> Settings:
-    return Settings.model_validate(
-        {
-            "TELEGRAM_BOT_TOKEN": "123:abc",
-            "PUBLIC_URL": "https://example.com",
-            "JWT_SECRET": VALID_SECRET,
-            "TOKEN_TTL_SECONDS": 1800,
-        },
+    return Settings(
+        telegram_bot_token="123:abc",  # type: ignore[arg-type]
+        public_url="https://example.com",  # type: ignore[arg-type]
+        jwt_secret=VALID_SECRET,  # type: ignore[arg-type]
+        token_ttl_seconds=1800,
     )
 
 
